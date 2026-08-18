@@ -4,7 +4,7 @@ import { ApiService } from '../../services/api';
 import { useTeacherWorkspace } from '../../context/TeacherWorkspaceContext';
 import { TeacherSyncBadge } from './TeacherSyncBadge';
 import { getSurahByNo, getSurahNameFormatted, validateAyah, formatCurrentProgress } from '../../utils/quran';
-import { formatSessionOptionLabel, sortSessionConfigs } from '../../utils/sessionFormatter';
+import { formatSessionOptionLabel, sortSessionConfigs, isFinalEvaluationSession as checkIsFinalEvaluationSession } from '../../utils/sessionFormatter';
 import { SessionSummaryCard } from '../common/SessionSummaryCard';
 import {
   BookOpen, CheckCircle2, Save,
@@ -168,12 +168,8 @@ export const SessionAssessment: React.FC<SessionAssessmentProps> = ({
   }, [availableSessionConfigs, selectedSessionConfigId]);
 
   const isFinalEvaluationSession = useMemo(() => {
-    if (!selectedSessionConfig) return false;
-    if (selectedSessionConfig.session_type === 'FINAL_EVALUATION') return true;
-    // Temporary backward-compatible fallback only if session_type is missing
-    if (!selectedSessionConfig.session_type && selectedSessionConfig.session_no === 5) return true;
-    return false;
-  }, [selectedSessionConfig]);
+    return checkIsFinalEvaluationSession(selectedSessionConfig, availableSessionConfigs);
+  }, [selectedSessionConfig, availableSessionConfigs]);
 
   const [savingPresensi, setSavingPresensi] = useState<boolean>(false);
 
@@ -900,7 +896,7 @@ export const SessionAssessment: React.FC<SessionAssessmentProps> = ({
               ) : (
                 availableSessionConfigs.map(sc => (
                   <option key={sc.session_config_id} value={sc.session_config_id}>
-                    {formatSessionOptionLabel(sc, eventDays)}
+                    {formatSessionOptionLabel(sc, eventDays, false, availableSessionConfigs)}
                   </option>
                 ))
               )}
@@ -909,7 +905,11 @@ export const SessionAssessment: React.FC<SessionAssessmentProps> = ({
             {/* Compact Session Summary Context */}
             {selectedSessionConfig && (
               <div className="mt-2.5">
-                <SessionSummaryCard sessionConfig={selectedSessionConfig} eventDays={eventDays} />
+                <SessionSummaryCard
+                  sessionConfig={selectedSessionConfig}
+                  eventDays={eventDays}
+                  allSessionConfigs={availableSessionConfigs}
+                />
               </div>
             )}
           </div>

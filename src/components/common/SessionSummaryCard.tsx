@@ -6,6 +6,7 @@ import { Calendar, Clock, BookMarked } from 'lucide-react';
 interface SessionSummaryCardProps {
   sessionConfig: SessionConfig | null;
   eventDays?: EventDay[];
+  allSessionConfigs?: SessionConfig[];
   className?: string;
   variant?: 'compact' | 'badge' | 'detailed';
 }
@@ -13,12 +14,17 @@ interface SessionSummaryCardProps {
 export const SessionSummaryCard: React.FC<SessionSummaryCardProps> = ({
   sessionConfig,
   eventDays,
+  allSessionConfigs,
   className = '',
   variant = 'compact'
 }) => {
   if (!sessionConfig) return null;
 
-  const { dayName, sessionTime, sessionName, isFinalEvaluation } = getSessionSummaryDetails(sessionConfig, eventDays);
+  const { dayName, sessionTime, sessionName, isFinalEvaluation } = getSessionSummaryDetails(
+    sessionConfig,
+    eventDays,
+    allSessionConfigs
+  );
 
   if (variant === 'badge') {
     return (

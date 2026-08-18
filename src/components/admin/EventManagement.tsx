@@ -1,6 +1,7 @@
 import React, { useState, useEffect, useMemo } from 'react';
 import { ApiService } from '../../services/api';
 import { Event, EventDay, SessionGroup, SessionConfig, User } from '../../types';
+import { isFinalEvaluationSession } from '../../utils/sessionFormatter';
 import { LoadingButton } from '../common/LoadingButton';
 import {
   Calendar, CheckCircle2, Save, Plus, Edit2, Trash2,
@@ -1202,7 +1203,7 @@ export const EventManagement: React.FC<EventManagementProps> = ({ currentUser })
                                     <span className="px-2 py-0.5 bg-blue-50 text-blue-700 font-black text-xs rounded border border-blue-200">
                                       Sesi {sc.session_no}
                                     </span>
-                                    {sc.session_type === 'FINAL_EVALUATION' && (
+                                    {isFinalEvaluationSession(sc, sessionConfigs) && (
                                       <span className="px-2 py-0.5 bg-purple-100 text-purple-800 font-extrabold text-[10px] rounded border border-purple-200 uppercase tracking-wider">
                                         Evaluasi Akhir
                                       </span>

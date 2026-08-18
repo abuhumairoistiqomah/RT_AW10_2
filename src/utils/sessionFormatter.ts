@@ -48,6 +48,67 @@ export function formatSessionTimeRange(startTime?: string, endTime?: string): st
 }
 
 /**
+ * Helper to determine if a session config is active.
+ * Handles boolean, string ('TRUE'/'FALSE'), number (1/0) representations.
+ */
+export function isSessionActive(active: any): boolean {
+  if (active === false || active === 'FALSE' || active === 'false' || active === 0 || active === '0') {
+    return false;
+  }
+  return true;
+}
+
+/**
+ * Authoritative Business Rule:
+ * The FINAL EVALUATION session is ALWAYS the LAST ACTIVE session
+ * available for the student's / halaqah's Session Group (event_id + session_group_id).
+ *
+ * Filter: active === TRUE
+ * Highest: session_no
+ *
+ * Example:
+ * Group A (1, 2, 3, 4, 5) -> Session 5 = Final Evaluation
+ * Group B (1, 2, 3, 4) -> Session 4 = Final Evaluation
+ * Group C (1, 2, 3, 4, 5, 6, 7) -> Session 7 = Final Evaluation
+ */
+export function isFinalEvaluationSession(
+  selectedSession?: SessionConfig | null,
+  availableSessionConfigs?: SessionConfig[]
+): boolean {
+  if (!selectedSession) return false;
+  if (!isSessionActive(selectedSession.active)) return false;
+
+  if (!availableSessionConfigs || availableSessionConfigs.length === 0) {
+    // If no session configs list is provided, fallback to session_type if explicitly set
+    return selectedSession.session_type === 'FINAL_EVALUATION';
+  }
+
+  // Filter sessions in the SAME event_id and session_group_id that are active
+  const sameGroupSessions = availableSessionConfigs.filter(s => {
+    if (!s) return false;
+    if (!isSessionActive(s.active)) return false;
+
+    if (selectedSession.event_id && s.event_id && selectedSession.event_id !== s.event_id) {
+      return false;
+    }
+    if (selectedSession.session_group_id && s.session_group_id && selectedSession.session_group_id !== s.session_group_id) {
+      return false;
+    }
+    return true;
+  });
+
+  if (sameGroupSessions.length === 0) {
+    return selectedSession.session_type === 'FINAL_EVALUATION';
+  }
+
+  const maxSessionNo = Math.max(
+    ...sameGroupSessions.map(s => Number(s.session_no) || 0)
+  );
+
+  return Number(selectedSession.session_no) === maxSessionNo && maxSessionNo > 0;
+}
+
+/**
  * Standard Desktop / Tablet Session Option Label:
  * Regular: {day_name} • Sesi {session_no} • {start_time}–{end_time}
  * Final Evaluation: {day_name} • Sesi {session_no} • Evaluasi Akhir • {start_time}–{end_time}
@@ -58,11 +119,12 @@ export function formatSessionTimeRange(startTime?: string, endTime?: string): st
 export function formatSessionOptionLabel(
   sc: SessionConfig,
   eventDays?: EventDay[],
-  includeSecondaryName = false
+  includeSecondaryName = false,
+  allConfigs?: SessionConfig[]
 ): string {
   const dayName = getSessionDayLabel(sc.event_day_id, eventDays);
   const timeRange = formatSessionTimeRange(sc.start_time, sc.end_time);
-  const isFinalEval = sc.session_type === 'FINAL_EVALUATION';
+  const isFinalEval = isFinalEvaluationSession(sc, allConfigs);
   
   const timePart = timeRange ? ` • ${timeRange}` : '';
   const evalPart = isFinalEval ? ' • Evaluasi Akhir' : '';
@@ -86,7 +148,8 @@ export function formatSessionOptionLabel(
  */
 export function getMobileSessionDisplay(
   sc: SessionConfig,
-  eventDays?: EventDay[]
+  eventDays?: EventDay[],
+  allConfigs?: SessionConfig[]
 ): {
   primary: string; // e.g. "Kamis • Sesi 4" or "Jumat • Sesi 5 • Evaluasi Akhir"
   time: string;    // e.g. "08:00–09:00"
@@ -95,7 +158,7 @@ export function getMobileSessionDisplay(
 } {
   const dayName = getSessionDayLabel(sc.event_day_id, eventDays);
   const time = formatSessionTimeRange(sc.start_time, sc.end_time);
-  const isFinalEvaluation = sc.session_type === 'FINAL_EVALUATION';
+  const isFinalEvaluation = isFinalEvaluationSession(sc, allConfigs);
   const primary = isFinalEvaluation 
     ? `${dayName} • Sesi ${sc.session_no} • Evaluasi Akhir`
     : `${dayName} • Sesi ${sc.session_no}`;
@@ -120,7 +183,8 @@ export function getMobileSessionDisplay(
  */
 export function getSessionSummaryDetails(
   sc: SessionConfig,
-  eventDays?: EventDay[]
+  eventDays?: EventDay[],
+  allConfigs?: SessionConfig[]
 ): {
   dayName: string;
   sessionTime: string;
@@ -129,7 +193,7 @@ export function getSessionSummaryDetails(
 } {
   const dayName = getSessionDayLabel(sc.event_day_id, eventDays);
   const time = formatSessionTimeRange(sc.start_time, sc.end_time);
-  const isFinalEvaluation = sc.session_type === 'FINAL_EVALUATION';
+  const isFinalEvaluation = isFinalEvaluationSession(sc, allConfigs);
   
   let sessionTime = `Sesi ${sc.session_no}`;
   if (isFinalEvaluation) {

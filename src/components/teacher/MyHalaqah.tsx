@@ -3,7 +3,7 @@ import { User, AttendanceStatus, EventDay } from '../../types';
 import { useTeacherWorkspace } from '../../context/TeacherWorkspaceContext';
 import { TeacherSyncBadge } from './TeacherSyncBadge';
 import { ApiService } from '../../services/api';
-import { formatSessionOptionLabel, sortSessionConfigs } from '../../utils/sessionFormatter';
+import { formatSessionOptionLabel, sortSessionConfigs, isFinalEvaluationSession as checkIsFinalEvaluationSession } from '../../utils/sessionFormatter';
 import { SessionSummaryCard } from '../common/SessionSummaryCard';
 import {
   Users, BookOpen, CheckCircle2, ChevronRight,
@@ -78,7 +78,9 @@ export const MyHalaqah: React.FC<MyHalaqahProps> = ({ currentUser, onNavigateToA
     return sessionConfigs.find(sc => sc.session_config_id === selectedSessionId) || null;
   }, [sessionConfigs, selectedSessionId]);
 
-  const isFinalEvaluationSession = selectedSessionConfig?.session_type === 'FINAL_EVALUATION';
+  const isFinalEvaluationSession = useMemo(() => {
+    return checkIsFinalEvaluationSession(selectedSessionConfig, sessionConfigs);
+  }, [selectedSessionConfig, sessionConfigs]);
 
   // Assessments for current selected session
   const sessionAssessmentsMap = useMemo(() => {
@@ -329,7 +331,7 @@ export const MyHalaqah: React.FC<MyHalaqahProps> = ({ currentUser, onNavigateToA
             <span>Guru: <strong className="text-white">{halaqah.teacher_name}</strong></span>
             <span>&bull;</span>
             <span>Kapasitas: <strong className="text-white">{students.length}</strong> Siswa</span>
-            {sessionConfigs.some(sc => sc.session_type === 'FINAL_EVALUATION') && (
+            {sessionConfigs.some(sc => checkIsFinalEvaluationSession(sc, sessionConfigs)) && (
               <>
                 <span>&bull;</span>
                 <span className="inline-flex items-center gap-1.5 px-2 py-0.5 rounded bg-purple-900/60 border border-purple-700 text-purple-200 font-semibold text-xs">
@@ -421,7 +423,7 @@ export const MyHalaqah: React.FC<MyHalaqahProps> = ({ currentUser, onNavigateToA
                 >
                   {sessionConfigs.map(sc => (
                     <option key={sc.session_config_id} value={sc.session_config_id}>
-                      {formatSessionOptionLabel(sc, eventDays)}
+                      {formatSessionOptionLabel(sc, eventDays, false, sessionConfigs)}
                     </option>
                   ))}
                 </select>
@@ -450,7 +452,11 @@ export const MyHalaqah: React.FC<MyHalaqahProps> = ({ currentUser, onNavigateToA
           {/* Compact Session Summary Context */}
           {selectedSessionConfig && (
             <div className="pt-2 border-t border-slate-200/70">
-              <SessionSummaryCard sessionConfig={selectedSessionConfig} eventDays={eventDays} />
+              <SessionSummaryCard
+                sessionConfig={selectedSessionConfig}
+                eventDays={eventDays}
+                allSessionConfigs={sessionConfigs}
+              />
             </div>
           )}
 
