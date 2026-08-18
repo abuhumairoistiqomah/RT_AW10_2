@@ -17,13 +17,16 @@ import { Administration } from './components/admin/Administration';
 import { DatabaseConnectionModal } from './components/admin/DatabaseConnectionModal';
 import { LoginModal } from './components/auth/LoginModal';
 import { TeacherWorkspaceProvider } from './context/TeacherWorkspaceContext';
+import { SchoolLogo } from './components/common/SchoolLogo';
 import {
   BarChart3, Search, Users, Calendar, BookOpen, UserCheck,
   TrendingUp, Settings, Layers, Menu, X, Shield,
-  Activity, CheckCircle2, ShieldAlert, Database, Wifi, LogOut
+  Activity, CheckCircle2, ShieldAlert, Database, Wifi, LogOut,
+  Loader2, LogIn
 } from 'lucide-react';
 
 export default function App() {
+  const [isCheckingInitialAuth, setIsCheckingInitialAuth] = useState<boolean>(true);
   const [currentUser, setCurrentUser] = useState<User | null>(() => ApiService.getStoredUser());
   const [currentRole, setCurrentRole] = useState<UserRole | 'PUBLIC'>('PUBLIC');
   const [activeTab, setActiveTab] = useState<string>('student-progress');
@@ -34,9 +37,7 @@ export default function App() {
   const [assessmentNavState, setAssessmentNavState] = useState<{ studentId?: string; sessionNo?: number }>({});
   const [evaluationNavState, setEvaluationNavState] = useState<{ studentId?: string; sessionConfigId?: string }>({});
   const [sidebarOpen, setSidebarOpen] = useState<boolean>(false);
-  const [authStatus, setAuthStatus] = useState<'VALID' | 'INVALID' | 'CHECKING' | 'GUEST'>(() => {
-    return ApiService.getAuthToken() ? 'CHECKING' : 'GUEST';
-  });
+  const [authStatus, setAuthStatus] = useState<'VALID' | 'INVALID' | 'CHECKING' | 'GUEST'>('CHECKING');
   const [dbStatus, setDbStatus] = useState<{ connected: boolean; message: string }>({
     connected: false,
     message: 'Memeriksa database...'
@@ -44,26 +45,71 @@ export default function App() {
 
   // Startup Session Verification (Persistent Authentication Store)
   useEffect(() => {
-    const token = ApiService.getAuthToken();
-    if (token) {
-      setAuthStatus('CHECKING');
-      ApiService.validateSession().then(res => {
-        if (res.valid && res.user) {
-          setCurrentUser(res.user);
-          setAuthStatus('VALID');
-        } else {
-          setCurrentUser(null);
-          setCurrentRole('PUBLIC');
-          setActiveTab('student-progress');
-          setAuthStatus('INVALID');
+    const initAuth = async () => {
+      const token = ApiService.getAuthToken();
+      if (token) {
+        setAuthStatus('CHECKING');
+        try {
+          const res = await ApiService.validateSession();
+          if (res && res.valid && res.user) {
+            setCurrentUser(res.user);
+            setCurrentRole(res.user.role);
+            setAuthStatus('VALID');
+            setIsLoginOpen(false);
+            if (res.user.role === 'TEACHER') {
+              setActiveTab('my-halaqah');
+            } else if (res.user.role === 'ADMIN' || res.user.role === 'COORDINATOR') {
+              setActiveTab('admin-dashboard');
+            } else {
+              setActiveTab('student-progress');
+            }
+          } else {
+            // Invalid / revoked session -> clear local state and show login
+            ApiService.setAuthToken('');
+            ApiService.setStoredUser(null);
+            setCurrentUser(null);
+            setCurrentRole('PUBLIC');
+            setActiveTab('student-progress');
+            setAuthStatus('INVALID');
+            setIsLoginOpen(true);
+          }
+        } catch {
+          // Check if there is an offline cached user
+          const storedUser = ApiService.getStoredUser();
+          if (storedUser) {
+            setCurrentUser(storedUser);
+            setCurrentRole(storedUser.role);
+            setAuthStatus('VALID');
+            setIsLoginOpen(false);
+            if (storedUser.role === 'TEACHER') {
+              setActiveTab('my-halaqah');
+            } else if (storedUser.role === 'ADMIN' || storedUser.role === 'COORDINATOR') {
+              setActiveTab('admin-dashboard');
+            }
+          } else {
+            ApiService.setAuthToken('');
+            ApiService.setStoredUser(null);
+            setCurrentUser(null);
+            setCurrentRole('PUBLIC');
+            setActiveTab('student-progress');
+            setAuthStatus('INVALID');
+            setIsLoginOpen(true);
+          }
+        } finally {
+          setIsCheckingInitialAuth(false);
         }
-      }).catch(() => {
-        // Keep offline cached user if temporary network issue, do not abruptly logout
-        setAuthStatus('VALID');
-      });
-    } else {
-      setAuthStatus('GUEST');
-    }
+      } else {
+        // No saved session -> Show LOGIN page immediately
+        setCurrentUser(null);
+        setCurrentRole('PUBLIC');
+        setActiveTab('student-progress');
+        setAuthStatus('GUEST');
+        setIsLoginOpen(true);
+        setIsCheckingInitialAuth(false);
+      }
+    };
+
+    initAuth();
   }, []);
 
   // Health check on mount
@@ -232,9 +278,30 @@ export default function App() {
       case 'completeness-checker': return 'Data & Laporan / Completeness Checker';
       case 'analytics': return 'Data & Laporan / Analytics Eksekutif';
       case 'administration': return 'Sistem & Administrasi / Pengaturan Pengguna';
-      default: return 'Rumah Tahfidz LMS';
+      default: return 'Rumah Tahfidz Al-Wildan 10';
     }
   };
+
+  // Initial Auth Checking Splash Screen
+  if (isCheckingInitialAuth) {
+    return (
+      <div id="initial-auth-loading-screen" className="min-h-screen w-full bg-slate-900 text-white flex flex-col items-center justify-center p-6 space-y-4">
+        <SchoolLogo size="xl" className="w-24 h-24 mb-1 animate-pulse drop-shadow-lg" />
+        <div className="text-center space-y-1.5 max-w-sm">
+          <h1 className="text-xl sm:text-2xl font-bold tracking-tight text-white leading-tight">
+            Rumah Tahfidz Al-Wildan 10
+          </h1>
+          <p className="text-xs text-slate-400 font-medium">
+            Sistem Informasi Terpadu Rumah Tahfidz
+          </p>
+        </div>
+        <div className="flex items-center gap-2.5 text-xs text-blue-400 font-semibold pt-4">
+          <Loader2 className="w-4 h-4 animate-spin text-blue-500" />
+          <span>Memeriksa sesi...</span>
+        </div>
+      </div>
+    );
+  }
 
   return (
     <div className="flex h-screen bg-slate-50 font-sans text-slate-900 overflow-hidden">
@@ -254,17 +321,19 @@ export default function App() {
       }`}>
         
         {/* Brand Header */}
-        <div className="p-6 flex items-center justify-between border-b border-slate-800">
-          <div className="flex items-center gap-3">
-            <div className="w-8 h-8 bg-blue-600 rounded flex items-center justify-center font-extrabold text-white text-sm shadow-sm">
-              RT
-            </div>
-            <div>
-              <span className="text-white font-bold text-base tracking-tight block leading-tight">Rumah Tahfidz</span>
-              <span className="text-[10px] font-mono text-slate-400 uppercase tracking-widest">LMS Console</span>
+        <div className="p-5 flex items-center justify-between border-b border-slate-800">
+          <div className="flex items-center gap-3 min-w-0">
+            <SchoolLogo size="md" className="w-10 h-10 bg-slate-800/80 p-1 rounded-xl border border-slate-700/60 shadow-xs shrink-0" />
+            <div className="min-w-0">
+              <span className="text-white font-bold text-sm sm:text-base tracking-tight block leading-tight truncate">
+                Rumah Tahfidz Al-Wildan 10
+              </span>
+              <span className="text-[10px] font-medium text-slate-400 leading-tight mt-0.5 block break-words line-clamp-2">
+                Sistem Informasi Terpadu Rumah Tahfidz
+              </span>
             </div>
           </div>
-          <button onClick={() => setSidebarOpen(false)} className="lg:hidden text-slate-400 hover:text-white">
+          <button onClick={() => setSidebarOpen(false)} className="lg:hidden text-slate-400 hover:text-white p-1 ml-1 shrink-0">
             <X className="w-5 h-5" />
           </button>
         </div>
@@ -559,21 +628,32 @@ export default function App() {
 
             {/* Quick Role Switcher / Login Button */}
             <div className="flex items-center gap-1 sm:gap-1.5 shrink-0">
-              <button
-                id="topbar-role-btn"
-                onClick={() => setIsLoginOpen(true)}
-                className="bg-slate-900 hover:bg-slate-800 text-white font-semibold text-xs px-2 sm:px-3 py-1.5 rounded-lg transition shadow-xs flex items-center gap-1 sm:gap-1.5 shrink-0 whitespace-nowrap"
-              >
-                <Shield className="w-3.5 h-3.5 text-blue-400 shrink-0" />
-                <span className="hidden sm:inline">Akses:</span>
-                <span className="font-bold text-amber-300 uppercase">{currentRole}</span>
-              </button>
+              {currentUser ? (
+                <button
+                  id="topbar-role-btn"
+                  onClick={() => setIsLoginOpen(true)}
+                  className="bg-slate-900 hover:bg-slate-800 text-white font-semibold text-xs px-2 sm:px-3 py-1.5 rounded-lg transition shadow-xs flex items-center gap-1 sm:gap-1.5 shrink-0 whitespace-nowrap cursor-pointer"
+                >
+                  <Shield className="w-3.5 h-3.5 text-blue-400 shrink-0" />
+                  <span className="hidden sm:inline">Akses:</span>
+                  <span className="font-bold text-amber-300 uppercase">{currentRole}</span>
+                </button>
+              ) : (
+                <button
+                  id="topbar-login-btn"
+                  onClick={() => setIsLoginOpen(true)}
+                  className="bg-blue-600 hover:bg-blue-700 active:bg-blue-800 text-white font-bold text-xs px-3 py-1.5 rounded-lg transition shadow-xs flex items-center gap-1.5 shrink-0 whitespace-nowrap cursor-pointer"
+                >
+                  <LogIn className="w-3.5 h-3.5" />
+                  <span>Login Guru / Admin</span>
+                </button>
+              )}
 
               {currentUser && (
                 <button
                   id="topbar-logout-btn"
                   onClick={() => setIsLogoutConfirmOpen(true)}
-                  className="bg-rose-50 hover:bg-rose-100 text-rose-700 border border-rose-200 font-semibold text-xs px-2 sm:px-3 py-1.5 rounded-lg transition shadow-xs flex items-center gap-1 sm:gap-1.5 shrink-0 whitespace-nowrap"
+                  className="bg-rose-50 hover:bg-rose-100 text-rose-700 border border-rose-200 font-semibold text-xs px-2 sm:px-3 py-1.5 rounded-lg transition shadow-xs flex items-center gap-1 sm:gap-1.5 shrink-0 whitespace-nowrap cursor-pointer"
                   title="Keluar dari akun"
                 >
                   <LogOut className="w-3.5 h-3.5 text-rose-600 shrink-0" />
@@ -620,18 +700,28 @@ export default function App() {
               </div>
               <h2 className="text-lg font-bold text-slate-900">Akses Dibatasi</h2>
               <p className="text-xs text-slate-500">
-                Peran Anda ({currentRole}) tidak memiliki akses untuk membuka halaman ini. Silakan pilih menu lain atau ganti role akses Anda.
+                Peran Anda ({currentRole}) tidak memiliki akses untuk membuka halaman ini. Silakan pilih menu lain atau masuk dengan akun yang memiliki hak akses.
               </p>
-              <button
-                onClick={() => setActiveTab(currentRole === 'PUBLIC' ? 'student-progress' : currentRole === 'TEACHER' ? 'my-halaqah' : 'admin-dashboard')}
-                className="px-4 py-2 bg-slate-900 text-white rounded-xl text-xs font-bold hover:bg-slate-800 transition"
-              >
-                Kembali ke Halaman Utama
-              </button>
+              <div className="flex items-center justify-center gap-2 pt-2">
+                <button
+                  onClick={() => setActiveTab(currentRole === 'PUBLIC' ? 'student-progress' : currentRole === 'TEACHER' ? 'my-halaqah' : 'admin-dashboard')}
+                  className="px-4 py-2 bg-slate-900 text-white rounded-xl text-xs font-bold hover:bg-slate-800 transition"
+                >
+                  Kembali ke Halaman Utama
+                </button>
+                <button
+                  onClick={() => setIsLoginOpen(true)}
+                  className="px-4 py-2 bg-blue-600 text-white rounded-xl text-xs font-bold hover:bg-blue-700 transition"
+                >
+                  Login Akun Lain
+                </button>
+              </div>
             </div>
           ) : (
             <TeacherWorkspaceProvider currentUser={currentUser}>
-              {activeTab === 'student-progress' && <StudentProgressLookup />}
+              {activeTab === 'student-progress' && (
+                <StudentProgressLookup onOpenLogin={() => setIsLoginOpen(true)} />
+              )}
 
               {activeTab === 'my-halaqah' && (
                 <MyHalaqah
@@ -680,8 +770,23 @@ export default function App() {
       <LoginModal
         isOpen={isLoginOpen}
         onClose={() => setIsLoginOpen(false)}
-        onLoginSuccess={(u) => setCurrentUser(u)}
+        onLoginSuccess={(u) => {
+          setCurrentUser(u);
+          setCurrentRole(u.role);
+          setAuthStatus('VALID');
+          setIsLoginOpen(false);
+          if (u.role === 'TEACHER') {
+            setActiveTab('my-halaqah');
+          } else if (u.role === 'ADMIN' || u.role === 'COORDINATOR') {
+            setActiveTab('admin-dashboard');
+          }
+        }}
         onQuickRole={(r) => handleSelectRole(r)}
+        onGoToPublicProgress={() => {
+          setIsLoginOpen(false);
+          setCurrentRole('PUBLIC');
+          setActiveTab('student-progress');
+        }}
       />
 
       {/* DATABASE CONNECTION MODAL (ADMIN & COORDINATOR) */}
@@ -713,7 +818,7 @@ export default function App() {
               <button
                 id="logout-cancel-btn"
                 onClick={() => setIsLogoutConfirmOpen(false)}
-                className="flex-1 px-4 py-2.5 bg-slate-100 hover:bg-slate-200 text-slate-700 text-xs font-bold rounded-xl transition"
+                className="flex-1 px-4 py-2.5 bg-slate-100 hover:bg-slate-200 text-slate-700 text-xs font-bold rounded-xl transition cursor-pointer"
               >
                 Batal
               </button>
@@ -726,8 +831,9 @@ export default function App() {
                   setCurrentRole('PUBLIC');
                   setActiveTab('student-progress');
                   setAuthNotice(null);
+                  setIsLoginOpen(true);
                 }}
-                className="flex-1 px-4 py-2.5 bg-rose-600 hover:bg-rose-700 text-white text-xs font-bold rounded-xl transition shadow-sm"
+                className="flex-1 px-4 py-2.5 bg-rose-600 hover:bg-rose-700 text-white text-xs font-bold rounded-xl transition shadow-sm cursor-pointer"
               >
                 Keluar
               </button>

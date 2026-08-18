@@ -1,6 +1,6 @@
 {
-  "name": "Rumah Tahfidz LMS",
-  "description": "Learning Management System for Quran Memorization Program across annual Rumah Tahfidz events",
+  "name": "Rumah Tahfidz Al-Wildan 10",
+  "description": "Sistem Informasi Terpadu Rumah Tahfidz Al-Wildan 10",
   "requestFramePermissions": [],
   "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
 }

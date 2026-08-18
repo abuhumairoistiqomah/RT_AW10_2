@@ -491,9 +491,6 @@ export const StudentManagement: React.FC = () => {
                     onChange={(e) => setFormData({ ...formData, grade_level: e.target.value })}
                     className="w-full px-3 py-2 bg-slate-50 border border-slate-300 rounded-lg text-xs font-medium focus:ring-2 focus:ring-emerald-500 outline-none"
                   >
-                    <option value="7">Kelas 7</option>
-                    <option value="8">Kelas 8</option>
-                    <option value="9">Kelas 9</option>
                   </select>
                 </div>
 
