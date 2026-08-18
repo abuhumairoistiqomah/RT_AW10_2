@@ -94,31 +94,40 @@ export function getEffectiveTargets(
     }
   }
 
-  // 2. Nuroniyyah target calculation (always in BARIS, strictly target_nuroniyyah_lines)
+  // 2. Nuroniyyah target calculation (always in BARIS, target_nuroniyyah_lines with legacy target_iqra_pages fallback)
   let nuroniyyahLines: number | null = null;
-  if (isManual) {
+  const getParticipantNur = (): number | null => {
     if (participant?.target_nuroniyyah_lines !== undefined && participant?.target_nuroniyyah_lines !== null && participant?.target_nuroniyyah_lines !== '') {
       const val = Number(participant.target_nuroniyyah_lines);
-      if (!isNaN(val) && val > 0) {
-        nuroniyyahLines = val;
-      }
+      if (!isNaN(val) && val > 0) return val;
     }
-  } else {
-    // Non-manual: prioritize Halaqah default
+    if (participant?.target_iqra_pages !== undefined && participant?.target_iqra_pages !== null && participant?.target_iqra_pages !== '') {
+      const val = Number(participant.target_iqra_pages);
+      if (!isNaN(val) && val > 0) return val;
+    }
+    return null;
+  };
+
+  const getHalaqahNur = (): number | null => {
     if (halaqah?.target_nuroniyyah_lines !== undefined && halaqah?.target_nuroniyyah_lines !== null && halaqah?.target_nuroniyyah_lines !== '') {
       const val = Number(halaqah.target_nuroniyyah_lines);
-      if (!isNaN(val) && val > 0) {
-        nuroniyyahLines = val;
-      }
+      if (!isNaN(val) && val > 0) return val;
     }
+    if (halaqah?.target_iqra_pages !== undefined && halaqah?.target_iqra_pages !== null && halaqah?.target_iqra_pages !== '') {
+      const val = Number(halaqah.target_iqra_pages);
+      if (!isNaN(val) && val > 0) return val;
+    }
+    return null;
+  };
+
+  if (isManual) {
+    nuroniyyahLines = getParticipantNur();
+  } else {
+    // Non-manual: prioritize Halaqah default
+    nuroniyyahLines = getHalaqahNur();
     // Fallback to participant if > 0
     if (nuroniyyahLines === null) {
-      if (participant?.target_nuroniyyah_lines !== undefined && participant?.target_nuroniyyah_lines !== null && participant?.target_nuroniyyah_lines !== '') {
-        const val = Number(participant.target_nuroniyyah_lines);
-        if (!isNaN(val) && val > 0) {
-          nuroniyyahLines = val;
-        }
-      }
+      nuroniyyahLines = getParticipantNur();
     }
   }
 
@@ -139,17 +148,9 @@ export function getEffectiveTargets(
 
   if (skill === 'NON_BBL') {
     displayText = nuroniyyahText || 'Belum ditentukan';
-  } else if (skill === 'BBL' || skill === 'BBLS') {
-    displayText = ziyadahText || 'Belum ditentukan';
   } else {
-    // Skill is blank/unknown
-    if (ziyadahText && nuroniyyahText) {
-      displayText = `${ziyadahText} • ${nuroniyyahText}`;
-    } else if (ziyadahText) {
-      displayText = ziyadahText;
-    } else if (nuroniyyahText) {
-      displayText = nuroniyyahText;
-    }
+    // All conditions other than NON_BBL (BBL, BBLS, blank, null, undefined) -> Ziyadah ONLY
+    displayText = ziyadahText || 'Belum ditentukan';
   }
 
   return {

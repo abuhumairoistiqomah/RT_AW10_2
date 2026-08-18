@@ -22,7 +22,7 @@ import { formatParticipantTarget, getEffectiveTargets } from '../utils/targetUti
 
 // Read Environment Variables & Runtime Database Connection
 const DEFAULT_API_URL =
-  'https://script.google.com/macros/s/AKfycbwtfcT21Q-Uq1Mwp1HoIlCSkIkc8AlghuKLTKS8vXNSt_MX0K5uIEBP8t7qT2wMZCXs4g/exec';
+  'https://script.google.com/macros/s/AKfycbz1g7hgOtVKDcAKrF5H--GQyH0jJuPQlrdl0WAmsMAoGjG0UCb-OVwwlAQyBewoyfhWmQ/exec';
 
 export function resolveApiUrl(): string {
   if (typeof window !== 'undefined') {

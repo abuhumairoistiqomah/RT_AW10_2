@@ -873,8 +873,12 @@ function getEffectiveParticipantTargetsGS(participant, halaqah) {
   var participantZiyadah = positiveNumberOrNullGS(participant.target_lines);
   var halaqahZiyadah = positiveNumberOrNullGS(halaqah.target_ziyadah_lines);
 
-  var participantNuroniyyah = positiveNumberOrNullGS(participant.target_nuroniyyah_lines);
-  var halaqahNuroniyyah = positiveNumberOrNullGS(halaqah.target_nuroniyyah_lines);
+  var participantNuroniyyah = positiveNumberOrNullGS(participant.target_nuroniyyah_lines) !== null
+    ? positiveNumberOrNullGS(participant.target_nuroniyyah_lines)
+    : positiveNumberOrNullGS(participant.target_iqra_pages);
+  var halaqahNuroniyyah = positiveNumberOrNullGS(halaqah.target_nuroniyyah_lines) !== null
+    ? positiveNumberOrNullGS(halaqah.target_nuroniyyah_lines)
+    : positiveNumberOrNullGS(halaqah.target_iqra_pages);
 
   var ziyadah = null;
   var nuroniyyah = null;
@@ -904,16 +908,10 @@ function formatParticipantTargetGS(participant, halaqah) {
 
   if (skill === 'NON_BBL') {
     return nurText || 'Belum ditentukan';
-  }
-  if (skill === 'BBL' || skill === 'BBLS') {
+  } else {
+    // All other cases (BBL, BBLS, blank, null, undefined): Ziyadah ONLY
     return ziText || 'Belum ditentukan';
   }
-
-  // Blank/unknown skill: show both available
-  var parts = [];
-  if (ziText) parts.push(ziText);
-  if (nurText) parts.push(nurText);
-  return parts.length ? parts.join(' • ') : 'Belum ditentukan';
 }
 
 function normalizeAssessmentModeGS(assessment) {
@@ -936,8 +934,7 @@ function getRawAssessmentModeGS(assessment) {
 function defaultAssessmentModeForParticipantGS(participant) {
   var skill = upperGS(participant && participant.skill_status_start);
   if (skill === 'NON_BBL') return ASSESSMENT_MODES.NURONIYYAH;
-  if (skill === 'BBL' || skill === 'BBLS') return ASSESSMENT_MODES.ZIYADAH;
-  return '';
+  return ASSESSMENT_MODES.ZIYADAH;
 }
 
 function clearQuranProgressFieldsGS(assessment) {
