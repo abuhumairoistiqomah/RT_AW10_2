@@ -18,7 +18,7 @@ import { calculateStats, getDistributionBuckets, getStudentLinesMap, calculateSk
 import { getCurrentIso } from '../utils/date';
 import { getSurahByNo } from '../utils/quran';
 import { generateRandomAccessCode } from '../utils/accessCode';
-import { formatParticipantTarget } from '../utils/targetUtils';
+import { formatParticipantTarget, getEffectiveTargets } from '../utils/targetUtils';
 
 // Read Environment Variables & Runtime Database Connection
 const DEFAULT_API_URL =
@@ -1183,7 +1183,9 @@ export class ApiService {
       events.find(e => e.status === 'ACTIVE') || events[0] || null;
     const currentUser = this.getStoredUser();
     const isTeacher = currentUser?.role === 'TEACHER';
-    const resolvedTeacherId = isTeacher ? currentUser?.teacher_id : (teacherId || currentUser?.teacher_id);
+    const resolvedTeacherId = isTeacher
+      ? (currentUser?.teacher_id || null)
+      : (teacherId && teacherId.trim() !== '' ? teacherId.trim() : null);
 
     if (!targetEvent) {
       return {
@@ -1276,7 +1278,23 @@ export class ApiService {
       const st = studentMap.get(p.student_id);
       const studentEval = evalMap.get(p.participant_id) || evalMap.get(p.student_id);
       const studentAsms = studentAsmsMap.get(p.student_id) || [];
-      const totalLines = studentAsms.reduce((sum, a) => sum + (Number(a.lines_added) || 0), 0);
+      
+      let ziyadahLines = 0;
+      let nuroniyyahLines = 0;
+      studentAsms.forEach(a => {
+        const lines = Number(a.lines_added) || 0;
+        const mode = a.assessment_mode?.toUpperCase();
+        if (mode === 'NURONIYYAH' || mode === 'IQRA') {
+          nuroniyyahLines += lines;
+        } else if (mode === 'ZIYADAH') {
+          ziyadahLines += lines;
+        } else if (a.nuroniyyah_dars || a.iqra_level || a.iqra_page_start || a.iqra_page_end) {
+          nuroniyyahLines += lines;
+        } else {
+          ziyadahLines += lines;
+        }
+      });
+      const totalLines = ziyadahLines + nuroniyyahLines;
 
       return {
         student_id: p.student_id,
@@ -1288,7 +1306,7 @@ export class ApiService {
         class_snapshot: p.class_snapshot,
         grade_class: `${p.grade_snapshot || ''} (${p.class_snapshot || ''})`,
         gender: st?.gender || selectedHalaqah.gender || 'IKHWAN',
-        skill_status_start: (p.skill_status_start && String(p.skill_status_start).trim() !== '' ? (p.skill_status_start as SkillStatus) : undefined),
+        skill_status_start: (p.skill_status_start && String(p.skill_status_start).trim() !== '' ? (String(p.skill_status_start).toUpperCase().trim() as SkillStatus) : undefined),
         baseline_surah: p.baseline_surah,
         baseline_ayah: p.baseline_ayah,
         target_surah_start: p.target_surah_start,
@@ -1296,10 +1314,13 @@ export class ApiService {
         target_surah_end: p.target_surah_end,
         target_ayah_end: p.target_ayah_end,
         target_lines: p.target_lines,
+        target_nuroniyyah_lines: p.target_nuroniyyah_lines,
         target_iqra_pages: p.target_iqra_pages,
         target_source: p.target_source,
-        targetText: formatParticipantTarget(p),
+        targetText: formatParticipantTarget(p, selectedHalaqah),
         totalLinesAdded: totalLines,
+        totalZiyadahLinesAdded: ziyadahLines,
+        totalNuroniyyahLinesAdded: nuroniyyahLines,
         completionStatus: studentEval ? studentEval.completion_status : 'NOT_EVALUATED',
         session_group_id: p.session_group_id || selectedHalaqah.session_group_id
       };
@@ -1318,6 +1339,9 @@ export class ApiService {
         grade_group: selectedHalaqah.grade_group,
         session_group_id: selectedHalaqah.session_group_id,
         location: selectedHalaqah.location,
+        target_ziyadah_lines: selectedHalaqah.target_ziyadah_lines,
+        target_nuroniyyah_lines: selectedHalaqah.target_nuroniyyah_lines ?? selectedHalaqah.target_iqra_pages,
+        target_iqra_pages: selectedHalaqah.target_iqra_pages,
         active: true
       },
       availableHalaqahs,
@@ -1820,6 +1844,10 @@ export class ApiService {
       .filter(a => a.attendance_status === 'PRESENT')
       .reduce((sum, a) => sum + (a.lines_added || 0), 0);
 
+    const halaqahs = await this.getHalaqahList(event_id);
+    const studentHalaqah = halaqahs.find(h => h.halaqah_id === participant.halaqah_id);
+    const effectiveTarget = getEffectiveTargets(participant, studentHalaqah);
+
     const baselineSurahObj = participant.baseline_surah ? getSurahByNo(participant.baseline_surah) : null;
     const targetSurahStartObj = participant.target_surah_start ? getSurahByNo(participant.target_surah_start) : null;
     const targetSurahEndObj = participant.target_surah_end ? getSurahByNo(participant.target_surah_end) : null;
@@ -1828,9 +1856,11 @@ export class ApiService {
       ? `${baselineSurahObj.surah_name} (Ayat 1–${participant.baseline_ayah || 1})`
       : 'Belum diisi';
 
-    const targetText = (targetSurahStartObj && targetSurahEndObj)
-      ? `${targetSurahStartObj.surah_name} Ayat ${participant.target_ayah_start || 1} s/d ${targetSurahEndObj.surah_name} Ayat ${participant.target_ayah_end || 1}`
-      : 'Belum diisi';
+    const targetText = effectiveTarget.displayText !== 'Belum ditentukan'
+      ? effectiveTarget.displayText
+      : (targetSurahStartObj && targetSurahEndObj)
+        ? `${targetSurahStartObj.surah_name} Ayat ${participant.target_ayah_start || 1} s/d ${targetSurahEndObj.surah_name} Ayat ${participant.target_ayah_end || 1}`
+        : 'Belum diisi';
 
     return {
       success: true,
@@ -1840,7 +1870,7 @@ export class ApiService {
       eventName: currentEvt?.event_name || 'Rumah Tahfidz',
       baselineText,
       targetText,
-      targetLines: participant.target_lines != null && participant.target_lines > 0 ? participant.target_lines : null,
+      targetLines: effectiveTarget.ziyadahLines,
       totalLinesAdded,
       completionStatus: studentEval ? studentEval.completion_status : ('NOT_EVALUATED' as EvaluationState),
       sessions: studentAssessments.map(a => {
@@ -1918,10 +1948,12 @@ export class ApiService {
         full_name: st?.full_name || 'Siswa',
         access_code: st?.access_code || '',
         grade_class: `${p.grade_snapshot} (${p.class_snapshot})`,
+        skill_status_start: (p.skill_status_start && String(p.skill_status_start).trim() !== '' ? (String(p.skill_status_start).toUpperCase().trim() as SkillStatus) : undefined),
         target_lines: p.target_lines,
+        target_nuroniyyah_lines: p.target_nuroniyyah_lines,
         target_iqra_pages: p.target_iqra_pages,
         target_source: p.target_source,
-        targetText: formatParticipantTarget(p),
+        targetText: formatParticipantTarget(p, currentHalaqah),
         totalLinesAdded: linesMap[p.student_id] || 0,
         completionStatus: studentEval ? studentEval.completion_status : ('NOT_EVALUATED' as EvaluationState)
       };

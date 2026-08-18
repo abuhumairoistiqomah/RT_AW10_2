@@ -4,6 +4,7 @@ import { useTeacherWorkspace } from '../../context/TeacherWorkspaceContext';
 import { TeacherSyncBadge } from './TeacherSyncBadge';
 import { ApiService } from '../../services/api';
 import { formatSessionOptionLabel, sortSessionConfigs, isFinalEvaluationSession as checkIsFinalEvaluationSession } from '../../utils/sessionFormatter';
+import { formatSkillBadgeText, formatSplitProgressDisplay } from '../../utils/targetUtils';
 import { SessionSummaryCard } from '../common/SessionSummaryCard';
 import { StudentSessionHistoryModal } from './StudentSessionHistoryModal';
 import {
@@ -334,6 +335,20 @@ export const MyHalaqah: React.FC<MyHalaqahProps> = ({ currentUser, onNavigateToA
             <span>Guru: <strong className="text-white">{halaqah.teacher_name}</strong></span>
             <span>&bull;</span>
             <span>Kapasitas: <strong className="text-white">{students.length}</strong> Siswa</span>
+            {((halaqah.target_ziyadah_lines != null && halaqah.target_ziyadah_lines > 0) || (halaqah.target_nuroniyyah_lines != null && halaqah.target_nuroniyyah_lines > 0) || (halaqah.target_iqra_pages != null && halaqah.target_iqra_pages > 0)) && (
+              <>
+                <span>&bull;</span>
+                <span className="inline-flex items-center gap-1.5 px-2 py-0.5 rounded bg-blue-950/80 border border-blue-700/60 text-blue-200 font-semibold text-xs">
+                  <span>Target Kelompok:</span>
+                  <strong className="text-white">
+                    {[
+                      halaqah.target_ziyadah_lines ? `${halaqah.target_ziyadah_lines} Baris Ziyadah` : null,
+                      (halaqah.target_nuroniyyah_lines || halaqah.target_iqra_pages) ? `${halaqah.target_nuroniyyah_lines || halaqah.target_iqra_pages} Baris Nuroniyyah` : null
+                    ].filter(Boolean).join(' • ')}
+                  </strong>
+                </span>
+              </>
+            )}
             {sessionConfigs.some(sc => checkIsFinalEvaluationSession(sc, sessionConfigs)) && (
               <>
                 <span>&bull;</span>
@@ -611,7 +626,9 @@ export const MyHalaqah: React.FC<MyHalaqahProps> = ({ currentUser, onNavigateToA
                         <span className="bg-slate-100 text-slate-700 px-2 py-0.5 rounded font-semibold">
                           {st.grade_class}
                         </span>
-                        <span>NIS: {st.nis || '-'}</span>
+                        <span className="font-semibold text-slate-600">
+                          {formatSkillBadgeText(st.skill_status_start)}
+                        </span>
                       </div>
                     </div>
                   </div>
@@ -685,12 +702,12 @@ export const MyHalaqah: React.FC<MyHalaqahProps> = ({ currentUser, onNavigateToA
                   <div className="bg-slate-50/80 rounded-lg p-2.5 border border-slate-100 grid grid-cols-2 gap-2 text-xs">
                     <div>
                       <p className="text-[10px] uppercase font-bold text-slate-400">Target Acara</p>
-                      <p className="font-semibold text-slate-700 mt-0.5">{st.targetText || '-'}</p>
+                      <p className="font-semibold text-slate-700 mt-0.5">{st.targetText || 'Belum ditentukan'}</p>
                     </div>
                     <div>
                       <p className="text-[10px] uppercase font-bold text-slate-400">Progress</p>
                       <p className="font-bold text-blue-600 mt-0.5">
-                        +{st.totalLinesAdded} Baris
+                        {formatSplitProgressDisplay(st)}
                       </p>
                     </div>
                   </div>
@@ -763,7 +780,7 @@ export const MyHalaqah: React.FC<MyHalaqahProps> = ({ currentUser, onNavigateToA
                     </button>
                   </div>
                 </th>
-                <th className="py-3 px-4">Nama Siswa & NIS</th>
+                <th className="py-3 px-4">Nama Siswa</th>
                 <th className="py-3 px-4">Kelas</th>
                 <th className="py-3 px-4">Status Presensi</th>
                 <th className="py-3 px-4">Target Acara</th>
@@ -817,14 +834,14 @@ export const MyHalaqah: React.FC<MyHalaqahProps> = ({ currentUser, onNavigateToA
                       </div>
                     </td>
 
-                    {/* Student Name & NIS */}
+                    {/* Student Name & Skill */}
                     <td className="py-3 px-4">
                       <div className="flex items-center gap-2">
                         <div>
                           <p className="font-bold text-slate-900 text-sm group-hover:text-blue-700 transition">
                             {st.full_name}
                           </p>
-                          <p className="text-[10px] text-slate-500 font-mono">NIS: {st.nis}</p>
+                          <p className="text-[11px] text-slate-500 font-medium">{formatSkillBadgeText(st.skill_status_start)}</p>
                         </div>
                         <span className="opacity-0 group-hover:opacity-100 text-blue-600 transition ml-auto shrink-0" title="Lihat riwayat sesi">
                           <Eye className="w-4 h-4" />
@@ -885,10 +902,10 @@ export const MyHalaqah: React.FC<MyHalaqahProps> = ({ currentUser, onNavigateToA
                     </td>
 
                     {/* Target Event */}
-                    <td className="py-3 px-4 font-medium text-slate-700">{st.targetText}</td>
+                    <td className="py-3 px-4 font-medium text-slate-700">{st.targetText || 'Belum ditentukan'}</td>
 
                     {/* Total Lines Added */}
-                    <td className="py-3 px-4 font-bold text-blue-600">+{st.totalLinesAdded} Baris</td>
+                    <td className="py-3 px-4 font-bold text-blue-600">{formatSplitProgressDisplay(st)}</td>
 
                     {/* Target Completion Status */}
                     <td className="py-3 px-4">

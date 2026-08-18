@@ -1,54 +1,31 @@
 /**
  * GOOGLE APPS SCRIPT BACKEND FOR RUMAH TAHFIDZ LMS
  *
+ * Rewritten backend goals:
+ * - Role-first authorization. ADMIN never becomes TEACHER just because a teacher context exists.
+ * - ADMIN/COORDINATOR may preview teacher workspace only when teacherId is explicitly supplied.
+ * - TEACHER is always restricted to assigned halaqah.
+ * - COORDINATOR is read-only.
+ * - Nuroniyyah is a first-class assessment mode. IQRA remains legacy-compatible only.
+ * - Ziyadah and Nuroniyyah progress are calculated separately.
+ * - Spreadsheet writes are header-based.
+ * - Session storage is spreadsheet-authoritative.
+ *
  * Deployment Target: Web App
  * Execute as: Me
  * Who has access: Anyone
  *
  * Script Properties Required:
- * - SPREADSHEET_ID: The Google Spreadsheet ID
- * - AUTH_PEPPER: Secret pepper for SHA-256 password hashing (REQUIRED)
+ * - SPREADSHEET_ID
+ * - AUTH_PEPPER
  */
+
+// ====================================================
+// 0. CONSTANTS
+// ====================================================
 
 var _cachedSpreadsheet = null;
 
-function getSpreadsheet() {
-  if (_cachedSpreadsheet) {
-    return _cachedSpreadsheet;
-  }
-  var id = PropertiesService.getScriptProperties().getProperty('SPREADSHEET_ID');
-  if (!id) {
-    throw new Error('SPREADSHEET_ID script property is missing. Please configure it in Project Settings -> Script Properties.');
-  }
-  _cachedSpreadsheet = SpreadsheetApp.openById(id);
-  return _cachedSpreadsheet;
-}
-
-function getSheet(sheetName) {
-  var ss = getSpreadsheet();
-  var sheet = ss.getSheetByName(sheetName);
-  if (!sheet) {
-    if (sheetName === '16_SESSIONS') {
-      sheet = ss.insertSheet(sheetName);
-      sheet.appendRow(['session_token', 'user_id', 'role', 'teacher_id', 'created_at', 'last_seen_at', 'revoked', 'revoked_at']);
-      return sheet;
-    }
-    throw new Error('Sheet "' + sheetName + '" not found in Google Spreadsheet.');
-  }
-  return sheet;
-}
-
-function getPepper() {
-  var pepper = PropertiesService.getScriptProperties().getProperty('AUTH_PEPPER');
-  if (!pepper) {
-    throw new Error('SERVER_CONFIG_ERROR: Property "AUTH_PEPPER" belum dikonfigurasi di Script Properties.');
-  }
-  return pepper;
-}
-
-// ----------------------------------------------------
-// SHORT-TERM CACHE (TTL: 180s)
-// ----------------------------------------------------
 var CACHEABLE_SHEETS = [
   '01_APP_CONFIG',
   '03_MASTER_STUDENTS',
@@ -60,20 +37,172 @@ var CACHEABLE_SHEETS = [
   '10_HALAQAH',
   '11_HALAQAH_TEACHERS'
 ];
+
 var CACHE_TTL_SECONDS = 180;
+
+var ROLES = {
+  ADMIN: 'ADMIN',
+  COORDINATOR: 'COORDINATOR',
+  TEACHER: 'TEACHER',
+  VIEWER: 'VIEWER'
+};
+
+var ASSESSMENT_MODES = {
+  ZIYADAH: 'ZIYADAH',
+  NURONIYYAH: 'NURONIYYAH',
+  IQRA: 'IQRA'
+};
+
+var ATTENDANCE_STATUSES = ['UNASSESSED', 'PRESENT', 'SICK', 'PERMISSION', 'ABSENT'];
+var SKILL_STATUSES = ['NON_BBL', 'BBL', 'BBLS'];
+var COMPLETION_STATUSES = ['COMPLETE', 'INCOMPLETE'];
+
+// ====================================================
+// 1. GENERIC HELPERS
+// ====================================================
+
+function nowIsoGS() {
+  return new Date().toISOString();
+}
+
+function cleanStringGS(value) {
+  if (value === undefined || value === null) return '';
+  return String(value).trim();
+}
+
+function upperGS(value) {
+  return cleanStringGS(value).toUpperCase();
+}
+
+function isTrueGS(value) {
+  return value === true || upperGS(value) === 'TRUE' || upperGS(value) === 'ACTIVE';
+}
+
+function isFalseGS(value) {
+  return value === false || upperGS(value) === 'FALSE' || upperGS(value) === 'INACTIVE';
+}
+
+function isActiveRecordGS(record) {
+  if (!record) return false;
+  if (record.active === undefined || record.active === null || record.active === '') return true;
+  return !isFalseGS(record.active);
+}
+
+function isDeletedRecordGS(record) {
+  if (!record) return false;
+  return isTrueGS(record.is_deleted);
+}
+
+function hasValueGS(value) {
+  return value !== undefined && value !== null && value !== '';
+}
+
+function toNumberOrUndefinedGS(value) {
+  if (!hasValueGS(value)) return undefined;
+  var n = Number(value);
+  return isFinite(n) && !isNaN(n) ? n : undefined;
+}
+
+function positiveNumberOrNullGS(value) {
+  if (!hasValueGS(value)) return null;
+  var n = Number(value);
+  return isFinite(n) && !isNaN(n) && n > 0 ? n : null;
+}
+
+function normalizeRoleGS(role) {
+  return upperGS(role);
+}
+
+function safeCloneGS(value) {
+  return JSON.parse(JSON.stringify(value || {}));
+}
+
+function makeIdGS(prefix, length) {
+  var raw = Utilities.getUuid().replace(/-/g, '');
+  var size = length || 16;
+  return prefix + raw.substring(0, size);
+}
+
+function uniqueStringsGS(values) {
+  var seen = {};
+  var out = [];
+  (values || []).forEach(function(v) {
+    var s = cleanStringGS(v);
+    if (s && !seen[s]) {
+      seen[s] = true;
+      out.push(s);
+    }
+  });
+  return out;
+}
+
+function normalizeWriteValueGS(value) {
+  if (value === undefined || value === null) return '';
+  if (typeof value === 'boolean') return value;
+  if (typeof value === 'object') return JSON.stringify(value);
+  return value;
+}
+
+// ====================================================
+// 2. SPREADSHEET + CACHE
+// ====================================================
+
+function getSpreadsheet() {
+  if (_cachedSpreadsheet) return _cachedSpreadsheet;
+
+  var id = PropertiesService.getScriptProperties().getProperty('SPREADSHEET_ID');
+  if (!id) {
+    throw new Error('SERVER_CONFIG_ERROR: SPREADSHEET_ID belum dikonfigurasi di Script Properties.');
+  }
+
+  _cachedSpreadsheet = SpreadsheetApp.openById(id);
+  return _cachedSpreadsheet;
+}
+
+function getSheet(sheetName) {
+  var ss = getSpreadsheet();
+  var sheet = ss.getSheetByName(sheetName);
+
+  if (!sheet) {
+    if (sheetName === '16_SESSIONS') {
+      sheet = ss.insertSheet(sheetName);
+      sheet.appendRow([
+        'session_token',
+        'user_id',
+        'role',
+        'teacher_id',
+        'created_at',
+        'last_seen_at',
+        'revoked',
+        'revoked_at'
+      ]);
+      return sheet;
+    }
+    throw new Error('SERVER_CONFIG_ERROR: Sheet "' + sheetName + '" tidak ditemukan.');
+  }
+
+  return sheet;
+}
+
+function getHeadersGS(sheet) {
+  var lastColumn = sheet.getLastColumn();
+  if (lastColumn < 1) return [];
+  return sheet.getRange(1, 1, 1, lastColumn).getValues()[0].map(function(h) {
+    return cleanStringGS(h).toLowerCase();
+  });
+}
 
 function getCachedSheetObjects(sheetName) {
   try {
     var cache = CacheService.getScriptCache();
     var metaStr = cache.get('CACHE_META_' + sheetName);
     var fullJson = null;
+
     if (metaStr) {
       var meta = JSON.parse(metaStr);
       if (meta && meta.chunks) {
         var keys = [];
-        for (var i = 0; i < meta.chunks; i++) {
-          keys.push('CACHE_' + sheetName + '_' + i);
-        }
+        for (var i = 0; i < meta.chunks; i++) keys.push('CACHE_' + sheetName + '_' + i);
         var chunkMap = cache.getAll(keys);
         var combined = '';
         var allPresent = true;
@@ -88,9 +217,8 @@ function getCachedSheetObjects(sheetName) {
       var direct = cache.get('CACHE_' + sheetName);
       if (direct) fullJson = direct;
     }
-    if (fullJson) {
-      return JSON.parse(fullJson);
-    }
+
+    if (fullJson) return JSON.parse(fullJson);
   } catch (e) {
     Logger.log('Cache read error for ' + sheetName + ': ' + e.message);
   }
@@ -102,20 +230,22 @@ function setCachedSheetObjects(sheetName, data) {
     var cache = CacheService.getScriptCache();
     var jsonStr = JSON.stringify(data);
     var CHUNK_SIZE = 90000;
+
     if (jsonStr.length <= CHUNK_SIZE) {
       cache.put('CACHE_' + sheetName, jsonStr, CACHE_TTL_SECONDS);
       cache.remove('CACHE_META_' + sheetName);
-    } else {
-      var numChunks = Math.ceil(jsonStr.length / CHUNK_SIZE);
-      var chunkObj = {};
-      for (var i = 0; i < numChunks; i++) {
-        var start = i * CHUNK_SIZE;
-        chunkObj['CACHE_' + sheetName + '_' + i] = jsonStr.substring(start, start + CHUNK_SIZE);
-      }
-      cache.putAll(chunkObj, CACHE_TTL_SECONDS);
-      cache.put('CACHE_META_' + sheetName, JSON.stringify({ chunks: numChunks }), CACHE_TTL_SECONDS);
-      cache.remove('CACHE_' + sheetName);
+      return;
     }
+
+    var numChunks = Math.ceil(jsonStr.length / CHUNK_SIZE);
+    var chunkObj = {};
+    for (var i = 0; i < numChunks; i++) {
+      var start = i * CHUNK_SIZE;
+      chunkObj['CACHE_' + sheetName + '_' + i] = jsonStr.substring(start, start + CHUNK_SIZE);
+    }
+    cache.putAll(chunkObj, CACHE_TTL_SECONDS);
+    cache.put('CACHE_META_' + sheetName, JSON.stringify({ chunks: numChunks }), CACHE_TTL_SECONDS);
+    cache.remove('CACHE_' + sheetName);
   } catch (e) {
     Logger.log('Cache write error for ' + sheetName + ': ' + e.message);
   }
@@ -130,9 +260,7 @@ function invalidateSheetCache(sheetName) {
       var meta = JSON.parse(metaStr);
       if (meta && meta.chunks) {
         var keys = ['CACHE_META_' + sheetName];
-        for (var i = 0; i < meta.chunks; i++) {
-          keys.push('CACHE_' + sheetName + '_' + i);
-        }
+        for (var i = 0; i < meta.chunks; i++) keys.push('CACHE_' + sheetName + '_' + i);
         cache.removeAll(keys);
       }
     }
@@ -142,16 +270,10 @@ function invalidateSheetCache(sheetName) {
   }
 }
 
-/**
- * Reads all rows from a sheet and returns an array of objects.
- * Headers are read dynamically from row 1.
- */
 function readSheetObjects(sheetName, skipCache) {
   if (!skipCache && CACHEABLE_SHEETS.indexOf(sheetName) !== -1) {
     var cached = getCachedSheetObjects(sheetName);
-    if (cached) {
-      return cached;
-    }
+    if (cached) return cached;
   }
 
   var sheet = getSheet(sheetName);
@@ -160,94 +282,62 @@ function readSheetObjects(sheetName, skipCache) {
   var displayData = range.getDisplayValues();
   if (data.length < 2) return [];
 
-  var headers = data[0].map(function(h) { return String(h).trim().toLowerCase(); });
+  var headers = data[0].map(function(h) { return cleanStringGS(h).toLowerCase(); });
   var result = [];
 
   for (var i = 1; i < data.length; i++) {
     var row = data[i];
     var displayRow = displayData[i] || [];
     var obj = {};
-    var hasValue = false;
+    var hasAnyValue = false;
 
     for (var j = 0; j < headers.length; j++) {
       var header = headers[j];
       if (!header) continue;
       var val = row[j];
-      var dispVal = displayRow[j] !== undefined ? displayRow[j] : '';
-      
+      var displayVal = displayRow[j] !== undefined ? displayRow[j] : '';
+
       if (header === 'start_time' || header === 'end_time') {
-        // ALWAYS use normalizeClockTime for clock times.
-        // Prefer cell's formatted display value (e.g. "10:00"), falling back to raw cell value
-        val = normalizeClockTime(dispVal) || normalizeClockTime(val);
+        val = normalizeClockTime(displayVal) || normalizeClockTime(val);
       } else if (val instanceof Date) {
         val = val.toISOString();
       } else if (typeof val === 'string') {
         val = val.trim();
-        if (val === 'TRUE' || val === 'true') val = true;
-        else if (val === 'FALSE' || val === 'false') val = false;
+        if (upperGS(val) === 'TRUE') val = true;
+        else if (upperGS(val) === 'FALSE') val = false;
       }
-      
-      if (val !== '' && val !== null && val !== undefined) {
-        hasValue = true;
-      }
+
+      if (hasValueGS(val)) hasAnyValue = true;
       obj[header] = val;
     }
 
-    if (hasValue) {
-      result.push(obj);
-    }
+    if (hasAnyValue) result.push(obj);
   }
 
-  if (!skipCache && CACHEABLE_SHEETS.indexOf(sheetName) !== -1) {
-    setCachedSheetObjects(sheetName, result);
-  }
-
+  if (!skipCache && CACHEABLE_SHEETS.indexOf(sheetName) !== -1) setCachedSheetObjects(sheetName, result);
   return result;
 }
 
-/**
- * Helper to update an array of row values atomically into a sheet range.
- */
 function batchUpdateRowValues(sheet, rowIndex, headers, obj) {
-  var rowValues = headers.map(function(header) {
-    var val = obj[header];
-    if (val === undefined || val === null) return '';
-    if (typeof val === 'boolean') return val ? 'TRUE' : 'FALSE';
-    if (typeof val === 'object') return JSON.stringify(val);
-    return val;
-  });
+  var rowValues = headers.map(function(header) { return normalizeWriteValueGS(obj[header]); });
   sheet.getRange(rowIndex, 1, 1, headers.length).setValues([rowValues]);
 }
 
-/**
- * Appends a new object row to a sheet based on header column names.
- */
 function appendObject(sheetName, obj) {
   var lock = LockService.getScriptLock();
   lock.waitLock(10000);
   try {
     var sheet = getSheet(sheetName);
-    var data = sheet.getDataRange().getValues();
-    var headers = data[0].map(function(h) { return String(h).trim().toLowerCase(); });
-
-    var newRow = headers.map(function(header) {
-      var val = obj[header];
-      if (val === undefined || val === null) return '';
-      if (typeof val === 'boolean') return val ? 'TRUE' : 'FALSE';
-      if (typeof val === 'object') return JSON.stringify(val);
-      return val;
-    });
-
-    sheet.appendRow(newRow);
+    var headers = getHeadersGS(sheet);
+    if (headers.length === 0) throw new Error('SERVER_CONFIG_ERROR: Sheet "' + sheetName + '" tidak memiliki header.');
+    var row = headers.map(function(header) { return normalizeWriteValueGS(obj[header]); });
+    sheet.appendRow(row);
     invalidateSheetCache(sheetName);
   } finally {
     lock.releaseLock();
   }
 }
 
-/**
- * Updates a row in a sheet matching a primary key or unique filter.
- */
 function updateObject(sheetName, keyField, keyValue, newFields) {
   var lock = LockService.getScriptLock();
   lock.waitLock(10000);
@@ -256,32 +346,25 @@ function updateObject(sheetName, keyField, keyValue, newFields) {
     var data = sheet.getDataRange().getValues();
     if (data.length < 2) return false;
 
-    var headers = data[0].map(function(h) { return String(h).trim().toLowerCase(); });
-    var keyIndex = headers.indexOf(String(keyField).trim().toLowerCase());
+    var headers = data[0].map(function(h) { return cleanStringGS(h).toLowerCase(); });
+    var keyIndex = headers.indexOf(cleanStringGS(keyField).toLowerCase());
     if (keyIndex === -1) return false;
 
     var targetRowIndex = -1;
     var targetObj = null;
+    var wanted = cleanStringGS(keyValue).toLowerCase();
 
     for (var i = 1; i < data.length; i++) {
-      if (String(data[i][keyIndex]).trim().toLowerCase() === String(keyValue).trim().toLowerCase()) {
+      if (cleanStringGS(data[i][keyIndex]).toLowerCase() === wanted) {
         targetRowIndex = i + 1;
         targetObj = {};
-        for (var j = 0; j < headers.length; j++) {
-          targetObj[headers[j]] = data[i][j];
-        }
+        for (var j = 0; j < headers.length; j++) targetObj[headers[j]] = data[i][j];
         break;
       }
     }
 
     if (targetRowIndex === -1) return false;
-
-    for (var k in newFields) {
-      if (newFields.hasOwnProperty(k)) {
-        targetObj[k.toLowerCase()] = newFields[k];
-      }
-    }
-
+    Object.keys(newFields || {}).forEach(function(k) { targetObj[cleanStringGS(k).toLowerCase()] = newFields[k]; });
     batchUpdateRowValues(sheet, targetRowIndex, headers, targetObj);
     invalidateSheetCache(sheetName);
     return true;
@@ -290,10 +373,6 @@ function updateObject(sheetName, keyField, keyValue, newFields) {
   }
 }
 
-/**
- * Deletes a row in a sheet matching a primary key or unique filter.
- * Returns the deleted object if found and deleted, or null if not found.
- */
 function deleteRowByField(sheetName, keyField, keyValue) {
   var lock = LockService.getScriptLock();
   lock.waitLock(10000);
@@ -302,27 +381,24 @@ function deleteRowByField(sheetName, keyField, keyValue) {
     var data = sheet.getDataRange().getValues();
     if (data.length < 2) return null;
 
-    var headers = data[0].map(function(h) { return String(h).trim().toLowerCase(); });
-    var keyIndex = headers.indexOf(String(keyField).trim().toLowerCase());
+    var headers = data[0].map(function(h) { return cleanStringGS(h).toLowerCase(); });
+    var keyIndex = headers.indexOf(cleanStringGS(keyField).toLowerCase());
     if (keyIndex === -1) return null;
 
+    var wanted = cleanStringGS(keyValue).toLowerCase();
     var targetRowNumber = -1;
     var deletedObj = null;
 
     for (var i = 1; i < data.length; i++) {
-      if (String(data[i][keyIndex]).trim().toLowerCase() === String(keyValue).trim().toLowerCase()) {
+      if (cleanStringGS(data[i][keyIndex]).toLowerCase() === wanted) {
         targetRowNumber = i + 1;
         deletedObj = {};
-        for (var j = 0; j < headers.length; j++) {
-          deletedObj[headers[j]] = data[i][j];
-        }
+        for (var j = 0; j < headers.length; j++) deletedObj[headers[j]] = data[i][j];
         break;
       }
     }
 
     if (targetRowNumber === -1) return null;
-
-    Logger.log('DELETE ROW FOUND: ' + targetRowNumber);
     sheet.deleteRow(targetRowNumber);
     SpreadsheetApp.flush();
     invalidateSheetCache(sheetName);
@@ -332,35 +408,27 @@ function deleteRowByField(sheetName, keyField, keyValue) {
   }
 }
 
-/**
- * Upserts an object row matching compound key fields.
- * Preserves existing primary key IDs during updates to ensure ID stability.
- */
 function upsertObject(sheetName, keyFields, obj, idFieldName) {
   var lock = LockService.getScriptLock();
   lock.waitLock(10000);
   try {
     var sheet = getSheet(sheetName);
     var data = sheet.getDataRange().getValues();
-    if (data.length < 2) {
-      var headers = sheet.getRange(1, 1, 1, sheet.getLastColumn()).getValues()[0].map(function(h) {
-        return String(h).trim().toLowerCase();
-      });
-      var newRow = headers.map(function(h) {
-        var val = obj[h];
-        if (val === undefined || val === null) return '';
-        if (typeof val === 'boolean') return val ? 'TRUE' : 'FALSE';
-        if (typeof val === 'object') return JSON.stringify(val);
-        return val;
-      });
-      sheet.appendRow(newRow);
-      return 'INSERTED';
+    var headers = getHeadersGS(sheet);
+    if (headers.length === 0) throw new Error('SERVER_CONFIG_ERROR: Sheet "' + sheetName + '" tidak memiliki header.');
+
+    var sourceObj = safeCloneGS(obj);
+    var keyIndices = keyFields.map(function(kf) { return headers.indexOf(cleanStringGS(kf).toLowerCase()); });
+    if (keyIndices.some(function(idx) { return idx === -1; })) {
+      throw new Error('SERVER_CONFIG_ERROR: Compound key [' + keyFields.join(', ') + '] tidak lengkap di sheet "' + sheetName + '".');
     }
 
-    var headers = data[0].map(function(h) { return String(h).trim().toLowerCase(); });
-    var keyIndices = keyFields.map(function(kf) {
-      return headers.indexOf(String(kf).trim().toLowerCase());
-    });
+    if (data.length < 2) {
+      var firstRow = headers.map(function(header) { return normalizeWriteValueGS(sourceObj[header]); });
+      sheet.appendRow(firstRow);
+      invalidateSheetCache(sheetName);
+      return 'INSERTED';
+    }
 
     var targetRowIndex = -1;
     var existingRowObj = {};
@@ -369,82 +437,159 @@ function upsertObject(sheetName, keyFields, obj, idFieldName) {
       var match = true;
       for (var k = 0; k < keyFields.length; k++) {
         var idx = keyIndices[k];
-        if (idx === -1) { match = false; break; }
-        var cellVal = String(data[i][idx]).trim().toLowerCase();
-        var matchVal = String(obj[keyFields[k]] || '').trim().toLowerCase();
-        if (cellVal !== matchVal) {
-          match = false;
-          break;
-        }
+        var keyName = cleanStringGS(keyFields[k]).toLowerCase();
+        var cellVal = cleanStringGS(data[i][idx]).toLowerCase();
+        var matchVal = cleanStringGS(sourceObj[keyName] !== undefined ? sourceObj[keyName] : sourceObj[keyFields[k]]).toLowerCase();
+        if (cellVal !== matchVal) { match = false; break; }
       }
       if (match) {
         targetRowIndex = i + 1;
-        for (var hIdx = 0; hIdx < headers.length; hIdx++) {
-          existingRowObj[headers[hIdx]] = data[i][hIdx];
-        }
+        for (var hIdx = 0; hIdx < headers.length; hIdx++) existingRowObj[headers[hIdx]] = data[i][hIdx];
         break;
       }
     }
 
     if (targetRowIndex === -1) {
-      var newRow = headers.map(function(header) {
-        var val = obj[header];
-        if (val === undefined || val === null) return '';
-        if (typeof val === 'boolean') return val ? 'TRUE' : 'FALSE';
-        if (typeof val === 'object') return JSON.stringify(val);
-        return val;
-      });
+      var newRow = headers.map(function(header) { return normalizeWriteValueGS(sourceObj[header]); });
       sheet.appendRow(newRow);
       invalidateSheetCache(sheetName);
       return 'INSERTED';
-    } else {
-      // Update row: merge obj onto existing object
-      // PRESERVE EXISTING PRIMARY KEY ID
-      for (var prop in obj) {
-        if (obj.hasOwnProperty(prop)) {
-          var propLower = prop.toLowerCase();
-          if (idFieldName && propLower === String(idFieldName).toLowerCase() && existingRowObj[propLower]) {
-            obj[prop] = existingRowObj[propLower];
-            continue;
-          }
-          if ((propLower === 'assessment_id' || propLower === 'final_evaluation_id' || propLower === 'participant_id' || propLower === 'student_id') && existingRowObj[propLower]) {
-            obj[prop] = existingRowObj[propLower];
-            continue;
-          }
-          existingRowObj[propLower] = obj[prop];
-        }
-      }
-      batchUpdateRowValues(sheet, targetRowIndex, headers, existingRowObj);
-      invalidateSheetCache(sheetName);
-      return 'UPDATED';
     }
+
+    Object.keys(sourceObj).forEach(function(prop) {
+      var propLower = cleanStringGS(prop).toLowerCase();
+      if (idFieldName && propLower === cleanStringGS(idFieldName).toLowerCase() && hasValueGS(existingRowObj[propLower])) return;
+      if (['assessment_id', 'final_evaluation_id', 'participant_id', 'student_id'].indexOf(propLower) !== -1 && hasValueGS(existingRowObj[propLower])) return;
+      existingRowObj[propLower] = sourceObj[prop];
+    });
+
+    batchUpdateRowValues(sheet, targetRowIndex, headers, existingRowObj);
+    invalidateSheetCache(sheetName);
+    return 'UPDATED';
   } finally {
     lock.releaseLock();
   }
 }
 
-// JSON Output Helpers
+function batchUpsertObjectsGS(sheetName, keyFields, objects, idFieldName) {
+  if (!Array.isArray(objects) || objects.length === 0) return [];
+
+  var lock = LockService.getScriptLock();
+  lock.waitLock(20000);
+  try {
+    var sheet = getSheet(sheetName);
+    var data = sheet.getDataRange().getValues();
+    var headers = getHeadersGS(sheet);
+    if (headers.length === 0) throw new Error('SERVER_CONFIG_ERROR: Sheet "' + sheetName + '" tidak memiliki header.');
+
+    var keyIndices = keyFields.map(function(kf) { return headers.indexOf(cleanStringGS(kf).toLowerCase()); });
+    if (keyIndices.some(function(idx) { return idx === -1; })) {
+      throw new Error('SERVER_CONFIG_ERROR: Compound key [' + keyFields.join(', ') + '] tidak lengkap di sheet "' + sheetName + '".');
+    }
+
+    var rowMap = {};
+    for (var i = 1; i < data.length; i++) {
+      var keyParts = [];
+      for (var k = 0; k < keyIndices.length; k++) keyParts.push(cleanStringGS(data[i][keyIndices[k]]).toLowerCase());
+      rowMap[keyParts.join('|||')] = i + 1;
+    }
+
+    var results = [];
+    var appendedRows = [];
+    var appendedKeyMap = {};
+
+    objects.forEach(function(originalObj) {
+      var obj = safeCloneGS(originalObj);
+      var keyParts = keyFields.map(function(kf) {
+        var lower = cleanStringGS(kf).toLowerCase();
+        return cleanStringGS(obj[lower] !== undefined ? obj[lower] : obj[kf]).toLowerCase();
+      });
+      var key = keyParts.join('|||');
+      var existingRowNumber = rowMap[key];
+
+      if (!existingRowNumber && appendedKeyMap[key] !== undefined) {
+        var appendIndex = appendedKeyMap[key];
+        var pending = appendedRows[appendIndex];
+        headers.forEach(function(header, colIdx) {
+          if (obj[header] !== undefined) pending[colIdx] = normalizeWriteValueGS(obj[header]);
+        });
+        results.push('UPDATED');
+        return;
+      }
+
+      if (!existingRowNumber) {
+        var newRow = headers.map(function(header) { return normalizeWriteValueGS(obj[header]); });
+        appendedKeyMap[key] = appendedRows.length;
+        appendedRows.push(newRow);
+        results.push('INSERTED');
+        return;
+      }
+
+      var rowValues = sheet.getRange(existingRowNumber, 1, 1, headers.length).getValues()[0];
+      var existingObj = {};
+      headers.forEach(function(header, idx) { existingObj[header] = rowValues[idx]; });
+
+      Object.keys(obj).forEach(function(prop) {
+        var propLower = cleanStringGS(prop).toLowerCase();
+        if (idFieldName && propLower === cleanStringGS(idFieldName).toLowerCase() && hasValueGS(existingObj[propLower])) return;
+        if (['assessment_id', 'final_evaluation_id', 'participant_id', 'student_id'].indexOf(propLower) !== -1 && hasValueGS(existingObj[propLower])) return;
+        existingObj[propLower] = obj[prop];
+      });
+
+      var mergedRow = headers.map(function(header) { return normalizeWriteValueGS(existingObj[header]); });
+      sheet.getRange(existingRowNumber, 1, 1, headers.length).setValues([mergedRow]);
+      results.push('UPDATED');
+    });
+
+    if (appendedRows.length > 0) {
+      sheet.getRange(sheet.getLastRow() + 1, 1, appendedRows.length, headers.length).setValues(appendedRows);
+    }
+
+    invalidateSheetCache(sheetName);
+    return results;
+  } finally {
+    lock.releaseLock();
+  }
+}
+
+// ====================================================
+// 3. JSON / ERROR HELPERS
+// ====================================================
+
 function jsonResponse(data) {
-  return ContentService
-    .createTextOutput(JSON.stringify({ success: true, data: data }))
-    .setMimeType(ContentService.MimeType.JSON);
+  return ContentService.createTextOutput(JSON.stringify({ success: true, data: data })).setMimeType(ContentService.MimeType.JSON);
 }
 
 function jsonError(code, message) {
-  return ContentService
-    .createTextOutput(JSON.stringify({
-      success: false,
-      error: { code: code || 'SERVER_ERROR', message: message || 'An error occurred' }
-    }))
-    .setMimeType(ContentService.MimeType.JSON);
+  return ContentService.createTextOutput(JSON.stringify({
+    success: false,
+    error: { code: code || 'SERVER_ERROR', message: message || 'An error occurred' }
+  })).setMimeType(ContentService.MimeType.JSON);
 }
 
-// Password Security (Salted SHA-256)
+function exceptionToJsonGS(err) {
+  var msg = err && err.message ? err.message : String(err || '');
+  var known = ['AUTH_REQUIRED', 'FORBIDDEN', 'VALIDATION_ERROR', 'NOT_FOUND', 'SERVER_CONFIG_ERROR'];
+  for (var i = 0; i < known.length; i++) {
+    var prefix = known[i] + ':';
+    if (msg.indexOf(prefix) === 0) return jsonError(known[i], msg.substring(prefix.length).trim());
+  }
+  return jsonError('SERVER_ERROR', msg || 'Terjadi kesalahan pada server.');
+}
+
+// ====================================================
+// 4. PASSWORD + SESSION
+// ====================================================
+
+function getPepper() {
+  var pepper = PropertiesService.getScriptProperties().getProperty('AUTH_PEPPER');
+  if (!pepper) throw new Error('SERVER_CONFIG_ERROR: AUTH_PEPPER belum dikonfigurasi di Script Properties.');
+  return pepper;
+}
+
 function hashPasswordGS(password, salt) {
   var pepper = getPepper();
-  if (!salt) {
-    salt = Utilities.getUuid().replace(/-/g, '').substring(0, 16);
-  }
+  if (!salt) salt = Utilities.getUuid().replace(/-/g, '').substring(0, 16);
   var rawBytes = Utilities.computeDigest(Utilities.DigestAlgorithm.SHA_256, salt + pepper + password);
   var hashHex = rawBytes.map(function(byte) {
     var v = (byte < 0 ? byte + 256 : byte).toString(16);
@@ -455,13 +600,9 @@ function hashPasswordGS(password, salt) {
 
 function verifyPasswordGS(inputPassword, storedHash) {
   if (!storedHash || typeof storedHash !== 'string') return false;
-  if (storedHash.indexOf(':') === -1) {
-    return false; // Plaintext or unsalted legacy passwords rejected
-  }
+  if (storedHash.indexOf(':') === -1) return false;
   var parts = storedHash.split(':');
-  var salt = parts[0];
-  var computed = hashPasswordGS(inputPassword, salt);
-  return computed === storedHash;
+  return hashPasswordGS(inputPassword, parts[0]) === storedHash;
 }
 
 function generatePasswordHashForSetup(password) {
@@ -470,128 +611,96 @@ function generatePasswordHashForSetup(password) {
   return hash;
 }
 
-// ====================================================
-// SESSION MANAGEMENT (Spreadsheet-Authoritative via 16_SESSIONS)
-// ====================================================
-
 function createSession(user) {
   var token = 'SES_' + Utilities.getUuid().replace(/-/g, '') + Utilities.getUuid().replace(/-/g, '').substring(0, 16);
-  var nowIso = new Date().toISOString();
-  var sessionObj = {
+  var now = nowIsoGS();
+  var role = normalizeRoleGS(user.role);
+  var sessionTeacherId = role === ROLES.TEACHER ? cleanStringGS(user.teacher_id) : '';
+  appendObject('16_SESSIONS', {
     session_token: token,
     user_id: user.user_id,
-    role: user.role,
-    teacher_id: user.teacher_id || '',
-    created_at: nowIso,
-    last_seen_at: nowIso,
-    revoked: 'FALSE',
+    role: role,
+    teacher_id: sessionTeacherId,
+    created_at: now,
+    last_seen_at: now,
+    revoked: false,
     revoked_at: ''
-  };
-
-  appendObject('16_SESSIONS', sessionObj);
-
-  return {
-    token: token,
-    user_id: user.user_id,
-    display_name: user.display_name,
-    role: user.role,
-    teacher_id: user.teacher_id || '',
-    created_at: nowIso
-  };
-}
-
-function getSession(token) {
-  if (!token) return null;
-
-  // 1. Read authoritative 16_SESSIONS (skip cache for instant consistency)
-  var sessions = readSheetObjects('16_SESSIONS', true);
-  var sessionRow = sessions.find(function(s) {
-    return String(s.session_token || '').trim() === String(token).trim();
   });
-
-  if (!sessionRow) return null;
-
-  // 2. Check revoked status
-  var isRevoked = sessionRow.revoked === true || String(sessionRow.revoked).toLowerCase() === 'true';
-  if (isRevoked) return null;
-
-  // 3. Load corresponding user from 06_USERS
-  var users = readSheetObjects('06_USERS');
-  var user = users.find(function(u) {
-    return String(u.user_id || '').trim() === String(sessionRow.user_id || '').trim();
-  });
-
-  if (!user) return null;
-
-  // 4. Verify user active status
-  var isUserActive = user.active == null || user.active === '' || user.active === true || String(user.active).toLowerCase() === 'true' || String(user.active).toUpperCase() === 'ACTIVE';
-  if (!isUserActive) {
-    return {
-      is_disabled_account: true,
-      user_id: user.user_id
-    };
-  }
-
-  // 5. Throttled last_seen_at update (e.g. at most once every 15 minutes)
-  try {
-    var lastSeen = sessionRow.last_seen_at ? new Date(sessionRow.last_seen_at).getTime() : 0;
-    var nowTime = Date.now();
-    if (!lastSeen || (nowTime - lastSeen > 15 * 60 * 1000)) {
-      updateObject('16_SESSIONS', 'session_token', token, {
-        last_seen_at: new Date(nowTime).toISOString()
-      });
-    }
-  } catch (e) {
-    Logger.log('Warning updating last_seen_at for session: ' + e.message);
-  }
-
-  // 6. Return current role, display_name, and teacher_id from 06_USERS (never stale)
   return {
     token: token,
     user_id: user.user_id,
     display_name: user.display_name || user.username,
-    role: user.role,
-    teacher_id: user.teacher_id || '',
+    role: role,
+    teacher_id: sessionTeacherId,
+    created_at: now
+  };
+}
+
+function getSession(token) {
+  token = cleanStringGS(token);
+  if (!token) return null;
+
+  var sessions = readSheetObjects('16_SESSIONS', true);
+  var sessionRow = sessions.find(function(s) { return cleanStringGS(s.session_token) === token; });
+  if (!sessionRow || isTrueGS(sessionRow.revoked)) return null;
+
+  var users = readSheetObjects('06_USERS', true);
+  var user = users.find(function(u) { return cleanStringGS(u.user_id) === cleanStringGS(sessionRow.user_id); });
+  if (!user) return null;
+  if (!isActiveRecordGS(user)) return { is_disabled_account: true, user_id: user.user_id };
+
+  try {
+    var lastSeen = sessionRow.last_seen_at ? new Date(sessionRow.last_seen_at).getTime() : 0;
+    var nowMs = Date.now();
+    if (!lastSeen || nowMs - lastSeen > 15 * 60 * 1000) {
+      updateObject('16_SESSIONS', 'session_token', token, { last_seen_at: new Date(nowMs).toISOString() });
+    }
+  } catch (e) {
+    Logger.log('Warning updating last_seen_at: ' + e.message);
+  }
+
+  var currentRole = normalizeRoleGS(user.role);
+  return {
+    token: token,
+    user_id: user.user_id,
+    display_name: user.display_name || user.username,
+    role: currentRole,
+    teacher_id: currentRole === ROLES.TEACHER ? cleanStringGS(user.teacher_id) : '',
     created_at: sessionRow.created_at
   };
 }
 
 function removeSession(token) {
+  token = cleanStringGS(token);
   if (!token) return;
-  var nowIso = new Date().toISOString();
-  updateObject('16_SESSIONS', 'session_token', token, {
-    revoked: 'TRUE',
-    revoked_at: nowIso
-  });
+  updateObject('16_SESSIONS', 'session_token', token, { revoked: true, revoked_at: nowIsoGS() });
 }
 
 function revokeAllUserSessions(userId) {
+  userId = cleanStringGS(userId);
   if (!userId) return;
+
   var lock = LockService.getScriptLock();
   lock.waitLock(10000);
   try {
     var sheet = getSheet('16_SESSIONS');
     var data = sheet.getDataRange().getValues();
     if (data.length < 2) return;
-    var headers = data[0].map(function(h) { return String(h).trim().toLowerCase(); });
+
+    var headers = data[0].map(function(h) { return cleanStringGS(h).toLowerCase(); });
     var userIdx = headers.indexOf('user_id');
     var revokedIdx = headers.indexOf('revoked');
     var revokedAtIdx = headers.indexOf('revoked_at');
     if (userIdx === -1 || revokedIdx === -1 || revokedAtIdx === -1) return;
 
-    var nowIso = new Date().toISOString();
+    var now = nowIsoGS();
     for (var i = 1; i < data.length; i++) {
-      if (String(data[i][userIdx]).trim() === String(userId).trim()) {
-        var isRevoked = data[i][revokedIdx] === true || String(data[i][revokedIdx]).toLowerCase() === 'true';
-        if (!isRevoked) {
-          sheet.getRange(i + 1, revokedIdx + 1).setValue('TRUE');
-          sheet.getRange(i + 1, revokedAtIdx + 1).setValue(nowIso);
-        }
+      if (cleanStringGS(data[i][userIdx]) === userId && !isTrueGS(data[i][revokedIdx])) {
+        sheet.getRange(i + 1, revokedIdx + 1).setValue(true);
+        sheet.getRange(i + 1, revokedAtIdx + 1).setValue(now);
       }
     }
     invalidateSheetCache('16_SESSIONS');
-  } catch (e) {
-    Logger.log('Error revoking sessions for user ' + userId + ': ' + e.message);
   } finally {
     lock.releaseLock();
   }
@@ -605,30 +714,21 @@ function cleanupRevokedSessions() {
     var data = sheet.getDataRange().getValues();
     if (data.length < 2) return 0;
 
-    var headers = data[0].map(function(h) { return String(h).trim().toLowerCase(); });
+    var headers = data[0].map(function(h) { return cleanStringGS(h).toLowerCase(); });
     var revokedIdx = headers.indexOf('revoked');
     var revokedAtIdx = headers.indexOf('revoked_at');
-    if (revokedIdx === -1) return 0;
+    if (revokedIdx === -1 || revokedAtIdx === -1) return 0;
 
-    var thirtyDaysAgo = Date.now() - (30 * 24 * 60 * 60 * 1000);
+    var threshold = Date.now() - 30 * 24 * 60 * 60 * 1000;
     var rowsToDelete = [];
-
     for (var i = 1; i < data.length; i++) {
-      var isRevoked = data[i][revokedIdx] === true || String(data[i][revokedIdx]).toLowerCase() === 'true';
-      if (isRevoked) {
-        var revokedAtVal = data[i][revokedAtIdx];
-        var revokedAtTime = revokedAtVal ? new Date(revokedAtVal).getTime() : 0;
-        if (revokedAtTime && revokedAtTime < thirtyDaysAgo) {
-          rowsToDelete.push(i + 1); // 1-based row number
-        }
-      }
+      if (!isTrueGS(data[i][revokedIdx])) continue;
+      var revokedAt = data[i][revokedAtIdx];
+      var revokedMs = revokedAt ? new Date(revokedAt).getTime() : 0;
+      if (revokedMs && revokedMs < threshold) rowsToDelete.push(i + 1);
     }
 
-    // Delete in reverse order to preserve indexes
-    for (var d = rowsToDelete.length - 1; d >= 0; d--) {
-      sheet.deleteRow(rowsToDelete[d]);
-    }
-
+    for (var d = rowsToDelete.length - 1; d >= 0; d--) sheet.deleteRow(rowsToDelete[d]);
     invalidateSheetCache('16_SESSIONS');
     return rowsToDelete.length;
   } finally {
@@ -638,43 +738,35 @@ function cleanupRevokedSessions() {
 
 function requireAuth(token) {
   var session = getSession(token);
-  if (!session) {
-    throw new Error('AUTH_REQUIRED: Sesi Anda telah berakhir atau tidak valid. Silakan login kembali.');
-  }
-  if (session.is_disabled_account) {
-    throw new Error('AUTH_REQUIRED: Akun Anda sudah tidak aktif. Silakan hubungi administrator.');
-  }
+  if (!session) throw new Error('AUTH_REQUIRED: Sesi Anda telah berakhir atau tidak valid. Silakan login kembali.');
+  if (session.is_disabled_account) throw new Error('AUTH_REQUIRED: Akun Anda sudah tidak aktif. Silakan hubungi administrator.');
   return session;
 }
 
 function requireRole(token, allowedRoles) {
   var session = requireAuth(token);
-  if (allowedRoles.indexOf(session.role) === -1) {
-    throw new Error('FORBIDDEN: Anda tidak memiliki hak akses untuk tindakan ini.');
-  }
+  var role = normalizeRoleGS(session.role);
+  if (allowedRoles.indexOf(role) === -1) throw new Error('FORBIDDEN: Anda tidak memiliki hak akses untuk tindakan ini.');
+  session.role = role;
   return session;
 }
 
-// Redact sensitive keys from Audit Log payloads
+// ====================================================
+// 5. AUDIT
+// ====================================================
+
 function redactSensitiveData(data) {
   if (!data) return '';
   try {
     var obj = typeof data === 'string' ? JSON.parse(data) : JSON.parse(JSON.stringify(data));
-    var sensitiveKeys = ['access_code', 'accesscode', 'newaccesscode', 'password', 'password_hash'];
-    
+    var sensitiveKeys = ['access_code', 'accesscode', 'newaccesscode', 'password', 'password_hash', 'session_token', 'token', 'authtoken'];
     function redactRecursive(item) {
       if (!item || typeof item !== 'object') return;
-      for (var k in item) {
-        if (item.hasOwnProperty(k)) {
-          if (sensitiveKeys.indexOf(k.toLowerCase()) !== -1) {
-            item[k] = '[REDACTED]';
-          } else if (typeof item[k] === 'object') {
-            redactRecursive(item[k]);
-          }
-        }
-      }
+      Object.keys(item).forEach(function(k) {
+        if (sensitiveKeys.indexOf(cleanStringGS(k).toLowerCase()) !== -1) item[k] = '[REDACTED]';
+        else if (typeof item[k] === 'object') redactRecursive(item[k]);
+      });
     }
-    
     redactRecursive(obj);
     return JSON.stringify(obj);
   } catch (e) {
@@ -682,14 +774,12 @@ function redactSensitiveData(data) {
   }
 }
 
-// Audit Logger
 function addAuditLog(action, entityType, entityId, oldData, newData, notes, actorUserId, eventId) {
   try {
-    var logs = readSheetObjects('15_AUDIT_LOG');
-    var logId = 'LOG' + String(logs.length + 1).padStart(6, '0');
-    var logObj = {
+    var logId = 'LOG_' + Utilities.formatDate(new Date(), Session.getScriptTimeZone(), 'yyyyMMddHHmmss') + '_' + Utilities.getUuid().replace(/-/g, '').substring(0, 8);
+    appendObject('15_AUDIT_LOG', {
       log_id: logId,
-      timestamp: new Date().toISOString(),
+      timestamp: nowIsoGS(),
       user_id: actorUserId || 'SYSTEM',
       action: action,
       entity_type: entityType,
@@ -698,33 +788,244 @@ function addAuditLog(action, entityType, entityId, oldData, newData, notes, acto
       old_data_json: redactSensitiveData(oldData),
       new_data_json: redactSensitiveData(newData),
       notes: notes || ''
-    };
-    appendObject('15_AUDIT_LOG', logObj);
+    });
   } catch (e) {
     Logger.log('Audit log error: ' + e.toString());
   }
 }
 
-// Web App Request Handlers
+// ====================================================
+// 6. DOMAIN HELPERS
+// ====================================================
+
+function resolveRequestedEventId(eventId) {
+  var explicit = cleanStringGS(eventId);
+  if (explicit) return explicit;
+
+  try {
+    var configs = readSheetObjects('01_APP_CONFIG');
+    var current = configs.find(function(c) { return cleanStringGS(c.config_key) === 'current_event_id'; });
+    if (current && cleanStringGS(current.config_value)) return cleanStringGS(current.config_value);
+  } catch (e1) {}
+
+  try {
+    var events = readSheetObjects('07_EVENTS');
+    var active = events.find(function(e) { return upperGS(e.status) === 'ACTIVE'; }) || events[0];
+    return active ? cleanStringGS(active.event_id) : '';
+  } catch (e2) {}
+
+  return '';
+}
+
+function resolveEventObjectGS(eventId) {
+  var events = readSheetObjects('07_EVENTS');
+  var resolvedId = resolveRequestedEventId(eventId);
+  var eventObj = resolvedId ? events.find(function(e) { return cleanStringGS(e.event_id) === resolvedId; }) : null;
+  if (!eventObj) eventObj = events.find(function(e) { return upperGS(e.status) === 'ACTIVE'; }) || events[0] || null;
+  return eventObj;
+}
+
+function getTeacherAuthorizedHalaqahIds(teacherId, eventId) {
+  teacherId = cleanStringGS(teacherId);
+  if (!teacherId) return [];
+  var resolvedEventId = resolveRequestedEventId(eventId);
+  if (!resolvedEventId) return [];
+  return uniqueStringsGS(readSheetObjects('11_HALAQAH_TEACHERS').filter(function(ht) {
+    return cleanStringGS(ht.teacher_id) === teacherId && cleanStringGS(ht.event_id) === resolvedEventId && isActiveRecordGS(ht);
+  }).map(function(ht) { return ht.halaqah_id; }));
+}
+
+function resolveResponsibleHalaqahTeacherId(halaqahId, eventId, preferredTeacherId) {
+  var assignments = readSheetObjects('11_HALAQAH_TEACHERS').filter(function(ht) {
+    return cleanStringGS(ht.halaqah_id) === cleanStringGS(halaqahId) && (!eventId || cleanStringGS(ht.event_id) === cleanStringGS(eventId)) && isActiveRecordGS(ht);
+  });
+
+  var preferred = cleanStringGS(preferredTeacherId);
+  if (preferred) {
+    var preferredAssigned = assignments.find(function(ht) { return cleanStringGS(ht.teacher_id) === preferred; });
+    if (preferredAssigned) return cleanStringGS(preferredAssigned.teacher_id);
+  }
+
+  var primary = assignments.find(function(ht) { return upperGS(ht.teacher_role) === 'PRIMARY'; });
+  if (primary) return cleanStringGS(primary.teacher_id);
+  if (assignments.length > 0) return cleanStringGS(assignments[0].teacher_id);
+  return '';
+}
+
+function resolveWorkspaceTeacherFilterGS(session, payload) {
+  if (session.role === ROLES.TEACHER) {
+    if (!cleanStringGS(session.teacher_id)) throw new Error('FORBIDDEN: Akun Guru Anda belum terhubung dengan Master Data Guru.');
+    return cleanStringGS(session.teacher_id);
+  }
+
+  if ((session.role === ROLES.ADMIN || session.role === ROLES.COORDINATOR) && payload && cleanStringGS(payload.teacherId)) {
+    return cleanStringGS(payload.teacherId);
+  }
+
+  return '';
+}
+
+function getEffectiveParticipantTargetsGS(participant, halaqah) {
+  participant = participant || {};
+  halaqah = halaqah || {};
+  var isManual = upperGS(participant.target_source) === 'MANUAL';
+
+  var participantZiyadah = positiveNumberOrNullGS(participant.target_lines);
+  var halaqahZiyadah = positiveNumberOrNullGS(halaqah.target_ziyadah_lines);
+
+  var participantNuroniyyah = positiveNumberOrNullGS(participant.target_nuroniyyah_lines);
+  var halaqahNuroniyyah = positiveNumberOrNullGS(halaqah.target_nuroniyyah_lines);
+
+  var ziyadah = null;
+  var nuroniyyah = null;
+
+  if (isManual && participantZiyadah !== null) ziyadah = participantZiyadah;
+  else if (halaqahZiyadah !== null) ziyadah = halaqahZiyadah;
+  else if (participantZiyadah !== null) ziyadah = participantZiyadah;
+
+  if (isManual && participantNuroniyyah !== null) nuroniyyah = participantNuroniyyah;
+  else if (halaqahNuroniyyah !== null) nuroniyyah = halaqahNuroniyyah;
+  else if (participantNuroniyyah !== null) nuroniyyah = participantNuroniyyah;
+
+  return { ziyadahLines: ziyadah, nuroniyyahLines: nuroniyyah, source: isManual ? 'MANUAL' : 'HALAQAH' };
+}
+
+function formatParticipantTargetGS(participant, halaqah) {
+  participant = participant || {};
+  halaqah = halaqah || {};
+  var skill = participant.skill_status_start ? cleanStringGS(participant.skill_status_start).toUpperCase() : '';
+  var target = getEffectiveParticipantTargetsGS(participant, halaqah);
+
+  var hasZi = target.ziyadahLines !== null && target.ziyadahLines > 0;
+  var hasNur = target.nuroniyyahLines !== null && target.nuroniyyahLines > 0;
+
+  var ziText = hasZi ? 'Zi ' + target.ziyadahLines + ' Baris' : '';
+  var nurText = hasNur ? 'Nur ' + target.nuroniyyahLines + ' Baris' : '';
+
+  if (skill === 'NON_BBL') {
+    return nurText || 'Belum ditentukan';
+  }
+  if (skill === 'BBL' || skill === 'BBLS') {
+    return ziText || 'Belum ditentukan';
+  }
+
+  // Blank/unknown skill: show both available
+  var parts = [];
+  if (ziText) parts.push(ziText);
+  if (nurText) parts.push(nurText);
+  return parts.length ? parts.join(' • ') : 'Belum ditentukan';
+}
+
+function normalizeAssessmentModeGS(assessment) {
+  assessment = assessment || {};
+  var rawMode = upperGS(assessment.assessment_mode);
+  if (rawMode === ASSESSMENT_MODES.ZIYADAH) return ASSESSMENT_MODES.ZIYADAH;
+  if (rawMode === ASSESSMENT_MODES.NURONIYYAH) return ASSESSMENT_MODES.NURONIYYAH;
+  if (rawMode === ASSESSMENT_MODES.IQRA) return ASSESSMENT_MODES.NURONIYYAH;
+  if (hasValueGS(assessment.nuroniyyah_dars)) return ASSESSMENT_MODES.NURONIYYAH;
+  if (hasValueGS(assessment.iqra_level) || hasValueGS(assessment.iqra_page_start) || hasValueGS(assessment.iqra_page_end)) return ASSESSMENT_MODES.NURONIYYAH;
+  return ASSESSMENT_MODES.ZIYADAH;
+}
+
+function getRawAssessmentModeGS(assessment) {
+  var raw = upperGS(assessment && assessment.assessment_mode);
+  if (raw === ASSESSMENT_MODES.IQRA) return ASSESSMENT_MODES.IQRA;
+  return normalizeAssessmentModeGS(assessment);
+}
+
+function defaultAssessmentModeForParticipantGS(participant) {
+  var skill = upperGS(participant && participant.skill_status_start);
+  if (skill === 'NON_BBL') return ASSESSMENT_MODES.NURONIYYAH;
+  if (skill === 'BBL' || skill === 'BBLS') return ASSESSMENT_MODES.ZIYADAH;
+  return '';
+}
+
+function clearQuranProgressFieldsGS(assessment) {
+  assessment.surah_start = '';
+  assessment.ayah_start = '';
+  assessment.surah_end = '';
+  assessment.ayah_end = '';
+}
+
+function clearNuroniyyahProgressFieldsGS(assessment) {
+  assessment.nuroniyyah_dars = '';
+}
+
+function clearLegacyIqraFieldsGS(assessment) {
+  assessment.iqra_level = '';
+  assessment.iqra_page_start = '';
+  assessment.iqra_page_end = '';
+}
+
+function clearAllProgressFieldsGS(assessment) {
+  clearQuranProgressFieldsGS(assessment);
+  clearNuroniyyahProgressFieldsGS(assessment);
+  clearLegacyIqraFieldsGS(assessment);
+  assessment.lines_added = '';
+}
+
+function hasCompletedPresentProgressGS(assessment) {
+  if (upperGS(assessment.attendance_status) !== 'PRESENT') return false;
+  var rawMode = getRawAssessmentModeGS(assessment);
+  if (rawMode === ASSESSMENT_MODES.IQRA) return hasValueGS(assessment.iqra_level) && hasValueGS(assessment.iqra_page_start);
+  var mode = normalizeAssessmentModeGS(assessment);
+  if (mode === ASSESSMENT_MODES.NURONIYYAH) return hasValueGS(assessment.nuroniyyah_dars) && hasValueGS(assessment.lines_added);
+  return hasValueGS(assessment.surah_start) && hasValueGS(assessment.ayah_start) && hasValueGS(assessment.surah_end) && hasValueGS(assessment.ayah_end) && hasValueGS(assessment.lines_added);
+}
+
+function summarizeAssessmentsByModeGS(assessments) {
+  var result = { ziyadahLines: 0, nuroniyyahLines: 0, ziyadahPresentCount: 0, nuroniyyahPresentCount: 0 };
+  (assessments || []).forEach(function(a) {
+    if (upperGS(a.attendance_status) !== 'PRESENT') return;
+    var mode = normalizeAssessmentModeGS(a);
+    var lines = Number(a.lines_added);
+    if (!isFinite(lines) || isNaN(lines)) lines = 0;
+    if (mode === ASSESSMENT_MODES.NURONIYYAH) {
+      result.nuroniyyahLines += lines;
+      result.nuroniyyahPresentCount++;
+    } else {
+      result.ziyadahLines += lines;
+      result.ziyadahPresentCount++;
+    }
+  });
+  return result;
+}
+
+function buildLegacyIqraLabelGS(assessment) {
+  if (!assessment) return '';
+  var level = cleanStringGS(assessment.iqra_level);
+  var start = cleanStringGS(assessment.iqra_page_start);
+  var end = cleanStringGS(assessment.iqra_page_end);
+  var text = level ? 'Iqra Jilid ' + level : 'Iqra';
+  if (start && end) text += ' Hal. ' + start + '–' + end;
+  else if (start) text += ' Hal. ' + start;
+  return text;
+}
+
+function getSurahNameFromListGS(surahs, surahNo) {
+  if (!hasValueGS(surahNo)) return null;
+  var found = (surahs || []).find(function(s) {
+    return Number(s.surah_no || s.surah_number || s.number || s.id) === Number(surahNo);
+  });
+  return found ? (found.surah_name || found.surah_name_latin || found.name) : 'Surah #' + surahNo;
+}
+
+function sanitizeSkillStatusGS(value) {
+  var skill = upperGS(value);
+  return SKILL_STATUSES.indexOf(skill) !== -1 ? skill : '';
+}
+
+// ====================================================
+// 7. WEB APP ENTRY POINTS
+// ====================================================
+
 function doGet(e) {
   try {
-    var action = (e && e.parameter && e.parameter.action) ? e.parameter.action : 'health';
-    if (action === 'health') {
-      return handleHealth();
-    }
+    var action = e && e.parameter && e.parameter.action ? e.parameter.action : 'health';
+    if (action === 'health') return handleHealth();
     return jsonError('METHOD_NOT_ALLOWED', 'Aksi API "' + action + '" memerlukan HTTP POST.');
   } catch (err) {
-    var msg = (err && err.message) ? err.message : String(err || '');
-    if (msg.indexOf('AUTH_REQUIRED:') === 0) {
-      return jsonError('AUTH_REQUIRED', msg.replace('AUTH_REQUIRED:', '').trim());
-    }
-    if (msg.indexOf('FORBIDDEN:') === 0) {
-      return jsonError('FORBIDDEN', msg.replace('FORBIDDEN:', '').trim());
-    }
-    if (msg.indexOf('VALIDATION_ERROR:') === 0) {
-      return jsonError('VALIDATION_ERROR', msg.replace('VALIDATION_ERROR:', '').trim());
-    }
-    return jsonError('SERVER_ERROR', msg);
+    return exceptionToJsonGS(err);
   }
 }
 
@@ -732,1054 +1033,203 @@ function doPost(e) {
   try {
     var contents = {};
     if (e && e.postData && e.postData.contents) {
-      try {
-        contents = JSON.parse(e.postData.contents);
-      } catch (pe) {
-        return jsonError('VALIDATION_ERROR', 'Format JSON post body tidak valid.');
-      }
+      try { contents = JSON.parse(e.postData.contents); }
+      catch (parseError) { return jsonError('VALIDATION_ERROR', 'Format JSON post body tidak valid.'); }
     }
 
     var action = contents.action || (e && e.parameter && e.parameter.action) || '';
     var payload = contents.payload || {};
     var authToken = contents.authToken || contents.token || '';
-
     return handlePostAndGetRouter(action, payload, authToken);
   } catch (err) {
-    var msg = (err && err.message) ? err.message : String(err || '');
-    if (msg.indexOf('AUTH_REQUIRED:') === 0) {
-      return jsonError('AUTH_REQUIRED', msg.replace('AUTH_REQUIRED:', '').trim());
-    }
-    if (msg.indexOf('FORBIDDEN:') === 0) {
-      return jsonError('FORBIDDEN', msg.replace('FORBIDDEN:', '').trim());
-    }
-    if (msg.indexOf('VALIDATION_ERROR:') === 0) {
-      return jsonError('VALIDATION_ERROR', msg.replace('VALIDATION_ERROR:', '').trim());
-    }
-    return jsonError('SERVER_ERROR', msg);
+    return exceptionToJsonGS(err);
   }
 }
 
 function handleHealth() {
   try {
     var ss = getSpreadsheet();
-    var connected = Boolean(ss);
     return jsonResponse({
       status: 'ok',
-      spreadsheetConnected: connected
+      spreadsheetConnected: Boolean(ss),
+      backendVersion: 'RT-GS-ROLE-FIRST-NURONIYYAH-2026-08-18'
     });
   } catch (e) {
     return jsonError('SERVER_ERROR', 'Gagal terhubung ke Google Spreadsheet: ' + e.message);
   }
 }
 
-// Reusable helper to resolve requested event ID or fall back to current/active event
-function resolveRequestedEventId(eventId) {
-  if (eventId && String(eventId).trim() !== '') {
-    return String(eventId).trim();
-  }
-  try {
-    var configs = readSheetObjects('01_APP_CONFIG');
-    var currConf = configs.find(function(c) { return c.config_key === 'current_event_id'; });
-    if (currConf && currConf.config_value && String(currConf.config_value).trim() !== '') {
-      return String(currConf.config_value).trim();
-    }
-  } catch (e) {}
-  try {
-    var events = readSheetObjects('07_EVENTS');
-    var activeEvt = events.find(function(evt) { return evt.status === 'ACTIVE'; }) || events[0];
-    if (activeEvt && activeEvt.event_id) return String(activeEvt.event_id).trim();
-  } catch (e) {}
-  return '';
-}
-
-// Helper to get active teacher halaqahs for a resolved event
-function getTeacherAuthorizedHalaqahIds(teacherId, eventId) {
-  if (!teacherId) return [];
-  var resolvedEvtId = resolveRequestedEventId(eventId);
-  if (!resolvedEvtId) return []; // Fail closed if no event can be resolved
-  var assignments = readSheetObjects('11_HALAQAH_TEACHERS')
-    .filter(function(ht) {
-      var isTeacher = ht.teacher_id === teacherId;
-      var isActive = ht.active === true || String(ht.active) === 'true';
-      var isEvt = ht.event_id === resolvedEvtId;
-      return isTeacher && isActive && isEvt;
-    });
-  return assignments.map(function(ht) { return ht.halaqah_id; });
-}
+// ====================================================
+// 8. ROUTER
+// ====================================================
 
 function handlePostAndGetRouter(action, payload, authToken) {
+  payload = payload || {};
+
   switch (action) {
-    // PUBLIC ROUTES
-    case 'health':
-      return handleHealth();
-
-    case 'login':
-      return handleLogin(payload);
-
-    case 'searchLoginAccounts':
-      return handleSearchLoginAccounts(payload);
-
+    case 'health': return handleHealth();
+    case 'login': return handleLogin(payload);
+    case 'searchLoginAccounts': return handleSearchLoginAccounts(payload);
     case 'logout':
       removeSession(authToken);
       return jsonResponse({ message: 'Berhasil logout' });
-
     case 'validateSession':
-      var sess = requireAuth(authToken);
+      var sessionCheck = requireAuth(authToken);
       return jsonResponse({
         valid: true,
         user: {
-          user_id: sess.user_id,
-          display_name: sess.display_name,
-          role: sess.role,
-          teacher_id: sess.teacher_id || ''
+          user_id: sessionCheck.user_id,
+          display_name: sessionCheck.display_name,
+          role: sessionCheck.role,
+          teacher_id: sessionCheck.teacher_id || ''
         }
       });
+    case 'publicStudentProgress': return handlePublicStudentProgress(payload);
 
     case 'cleanupRevokedSessions':
-      requireRole(authToken, ['ADMIN', 'COORDINATOR']);
-      var deletedCount = cleanupRevokedSessions();
-      return jsonResponse({ success: true, deletedCount: deletedCount });
+      requireRole(authToken, [ROLES.ADMIN]);
+      return jsonResponse({ deletedCount: cleanupRevokedSessions() });
 
-    case 'publicStudentProgress':
-      return handlePublicStudentProgress(payload);
-
-    // PROTECTED ROUTES
     case 'getCurrentEvent':
       requireAuth(authToken);
-      var events = readSheetObjects('07_EVENTS');
-      var configs = readSheetObjects('01_APP_CONFIG');
-      var currConf = configs.find(function(c) { return c.config_key === 'current_event_id'; });
-      var activeId = currConf ? currConf.config_value : '';
-      var activeEvt = events.find(function(evt) { return evt.event_id === activeId; }) ||
-                        events.find(function(evt) { return evt.status === 'ACTIVE'; }) ||
-                        events[0] || null;
-      return jsonResponse(activeEvt);
-
+      return jsonResponse(resolveEventObjectGS(payload.eventId));
     case 'getAppConfigs':
       requireAuth(authToken);
       return jsonResponse(readSheetObjects('01_APP_CONFIG'));
-
-    case 'updateAppConfig':
-      var sess = requireRole(authToken, ['ADMIN', 'COORDINATOR']);
-      updateObject('01_APP_CONFIG', 'config_key', payload.key, {
-        config_value: payload.value,
-        updated_at: new Date().toISOString()
-      });
-      addAuditLog('UPDATE_CONFIG', 'CONFIG', payload.key, null, JSON.stringify(payload), null, sess.user_id);
-      return jsonResponse({ success: true });
-
     case 'getLookups':
       requireAuth(authToken);
       return jsonResponse(readSheetObjects('02_LOOKUPS'));
-
     case 'getEvents':
       requireAuth(authToken);
       return jsonResponse(readSheetObjects('07_EVENTS'));
-
-    case 'saveEvent':
-      var sess = requireRole(authToken, ['ADMIN', 'COORDINATOR']);
-      upsertObject('07_EVENTS', ['event_id'], payload.event, 'event_id');
-      addAuditLog('SAVE_EVENT', 'EVENT', payload.event.event_id, null, payload.event, null, sess.user_id, payload.event.event_id);
-      return jsonResponse(payload.event);
-
     case 'getEventDays':
       requireAuth(authToken);
-      var days = readSheetObjects('07A_EVENT_DAYS');
-      if (payload.eventId) {
-        days = days.filter(function(d) { return d.event_id === payload.eventId; });
-      }
-      return jsonResponse(days);
-
-    case 'saveEventDay':
-      var sess = requireRole(authToken, ['ADMIN', 'COORDINATOR']);
-      upsertObject('07A_EVENT_DAYS', ['event_day_id'], payload.eventDay, 'event_day_id');
-      addAuditLog('SAVE_EVENT_DAY', 'EVENT_DAY', payload.eventDay.event_day_id, null, payload.eventDay, null, sess.user_id, payload.eventDay.event_id);
-      return jsonResponse(payload.eventDay);
-
+      var eventDays = readSheetObjects('07A_EVENT_DAYS');
+      if (payload.eventId) eventDays = eventDays.filter(function(d) { return cleanStringGS(d.event_id) === cleanStringGS(payload.eventId); });
+      return jsonResponse(eventDays);
     case 'getSessionGroups':
       requireAuth(authToken);
       var groups = readSheetObjects('08_SESSION_GROUPS');
-      if (payload.eventId) {
-        groups = groups.filter(function(g) { return g.event_id === payload.eventId; });
-      }
+      if (payload.eventId) groups = groups.filter(function(g) { return cleanStringGS(g.event_id) === cleanStringGS(payload.eventId); });
       return jsonResponse(groups);
-
-    case 'saveSessionGroup':
-      var sess = requireRole(authToken, ['ADMIN', 'COORDINATOR']);
-      upsertObject('08_SESSION_GROUPS', ['session_group_id'], payload.sessionGroup, 'session_group_id');
-      addAuditLog('SAVE_SESSION_GROUP', 'SESSION_GROUP', payload.sessionGroup.session_group_id, null, payload.sessionGroup, null, sess.user_id, payload.sessionGroup.event_id);
-      return jsonResponse(payload.sessionGroup);
-
-    case 'getSessionConfigs':
-      requireAuth(authToken);
-      var sConfigs = readSheetObjects('09_SESSION_CONFIG');
-      if (payload.eventId) {
-        sConfigs = sConfigs.filter(function(sc) { return sc.event_id === payload.eventId; });
-      }
-      sConfigs = sConfigs.map(function(sc) {
-        sc.start_time = normalizeClockTime(sc.start_time);
-        sc.end_time = normalizeClockTime(sc.end_time);
-        return sc;
-      });
-      return jsonResponse(sConfigs);
-
-    case 'saveSessionConfig':
-      var sess = requireRole(authToken, ['ADMIN', 'COORDINATOR']);
-      var sc = payload.sessionConfig;
-      if (!sc || !sc.session_config_id) {
-        return jsonError('VALIDATION_ERROR', 'Data konfigurasi sesi dan session_config_id wajib diisi.');
-      }
-
-      // Explicitly retrieve start_time and end_time (handling camelCase as fallback)
-      var rawStartTime = sc.start_time !== undefined && sc.start_time !== null ? sc.start_time : (sc.startTime || '');
-      var rawEndTime = sc.end_time !== undefined && sc.end_time !== null ? sc.end_time : (sc.endTime || '');
-
-      if (!rawStartTime || String(rawStartTime).trim() === '') {
-        return jsonError('VALIDATION_ERROR', 'Jam mulai (start_time) wajib diisi.');
-      }
-      if (!rawEndTime || String(rawEndTime).trim() === '') {
-        return jsonError('VALIDATION_ERROR', 'Jam selesai (end_time) wajib diisi.');
-      }
-
-      var normStartTime = normalizeClockTime(rawStartTime);
-      var normEndTime = normalizeClockTime(rawEndTime);
-
-      if (!normStartTime) {
-        return jsonError('VALIDATION_ERROR', 'Format Jam Mulai tidak valid ("' + rawStartTime + '"). Gunakan format HH:mm (contoh: 08:00).');
-      }
-      if (!normEndTime) {
-        return jsonError('VALIDATION_ERROR', 'Format Jam Selesai tidak valid ("' + rawEndTime + '"). Gunakan format HH:mm (contoh: 09:00).');
-      }
-
-      if (normStartTime >= normEndTime) {
-        return jsonError('VALIDATION_ERROR', 'Jam Mulai (' + normStartTime + ') harus lebih awal dari Jam Selesai (' + normEndTime + ').');
-      }
-
-      sc.start_time = normStartTime;
-      sc.end_time = normEndTime;
-      delete sc.startTime;
-      delete sc.endTime;
-
-      Logger.log('SESSION TIME SAVE start=' + sc.start_time + ' end=' + sc.end_time);
-
-      upsertObject('09_SESSION_CONFIG', ['session_config_id'], sc, 'session_config_id');
-      addAuditLog('SAVE_SESSION_CONFIG', 'SESSION_CONFIG', sc.session_config_id, null, sc, null, sess.user_id, sc.event_id);
-      return jsonResponse(sc);
-
-    case 'getStudents':
-      var sess = requireAuth(authToken);
-      var students = readSheetObjects('03_MASTER_STUDENTS');
-
-      if (sess.role === 'ADMIN') {
-        return jsonResponse(students);
-      }
-
-      if (sess.role === 'COORDINATOR') {
-        return jsonResponse(students.map(function(s) {
-          var copy = Object.assign({}, s);
-          copy.access_code = '';
-          return copy;
-        }));
-      }
-
-      if (sess.role === 'TEACHER') {
-        if (!sess.teacher_id) {
-          return jsonError('FORBIDDEN', 'Akun Guru Anda tidak memiliki ID Guru yang terhubung.');
-        }
-        var resolvedEvtId = resolveRequestedEventId(payload.eventId);
-        var teacherHalaqahIds = getTeacherAuthorizedHalaqahIds(sess.teacher_id, resolvedEvtId);
-        var allowedStudentIds = {};
-        readSheetObjects('12_EVENT_PARTICIPANTS').forEach(function(p) {
-          if (p.event_id === resolvedEvtId && teacherHalaqahIds.indexOf(p.halaqah_id) !== -1) {
-            allowedStudentIds[p.student_id] = true;
-          }
-        });
-        var teacherStudents = students.filter(function(s) { return allowedStudentIds[s.student_id]; }).map(function(s) {
-          var copy = Object.assign({}, s);
-          copy.access_code = '';
-          return copy;
-        });
-        return jsonResponse(teacherStudents);
-      }
-
-      // VIEWER or others: mask access_code
-      return jsonResponse(students.map(function(s) {
-        var copy = Object.assign({}, s);
-        copy.access_code = '';
-        return copy;
-      }));
-
-    case 'saveStudent':
-      var sess = requireRole(authToken, ['ADMIN', 'COORDINATOR']);
-      var studentObj = payload.student;
-      var allStudents = readSheetObjects('03_MASTER_STUDENTS');
-
-      if (!studentObj || !studentObj.student_id) {
-        return jsonError('VALIDATION_ERROR', 'Data siswa dan student_id wajib diisi.');
-      }
-
-      if (studentObj.access_code && String(studentObj.access_code).trim() !== '') {
-        var reqCode = String(studentObj.access_code).trim().toLowerCase();
-        var duplicate = allStudents.find(function(s) {
-          return s.student_id !== studentObj.student_id && String(s.access_code || '').trim().toLowerCase() === reqCode;
-        });
-        if (duplicate) {
-          return jsonError('VALIDATION_ERROR', 'Kode Akses "' + studentObj.access_code + '" sudah digunakan oleh siswa lain (' + duplicate.full_name + ').');
-        }
-      } else {
-        var existingCodes = allStudents.map(function(s) { return s.access_code; });
-        studentObj.access_code = generateRandomAccessCodeGS(existingCodes);
-      }
-
-      upsertObject('03_MASTER_STUDENTS', ['student_id'], studentObj, 'student_id');
-      addAuditLog('SAVE_STUDENT', 'STUDENT', studentObj.student_id, null, studentObj, null, sess.user_id);
-      return jsonResponse(studentObj);
-
-    case 'regenerateAccessCode':
-      // Admin/Coordinator ONLY
-      var sess = requireRole(authToken, ['ADMIN', 'COORDINATOR']);
-      var studentId = payload.studentId;
-      var allStudents = readSheetObjects('03_MASTER_STUDENTS');
-      var targetStudent = allStudents.find(function(s) { return s.student_id === studentId; });
-      if (!targetStudent) {
-        return jsonError('NOT_FOUND', 'Siswa tidak ditemukan.');
-      }
-
-      var existingCodes = allStudents.map(function(s) { return s.access_code; });
-      var newCode = generateRandomAccessCodeGS(existingCodes);
-      var oldCode = targetStudent.access_code;
-      targetStudent.access_code = newCode;
-      targetStudent.updated_at = new Date().toISOString();
-      upsertObject('03_MASTER_STUDENTS', ['student_id'], targetStudent, 'student_id');
-      addAuditLog('REGENERATE_ACCESS_CODE', 'STUDENT', studentId, { access_code: oldCode }, { access_code: newCode }, null, sess.user_id);
-      return jsonResponse({ success: true, newAccessCode: newCode });
-
+    case 'getSessionConfigs': return handleGetSessionConfigs(payload, authToken);
+    case 'getStudents': return handleGetStudents(payload, authToken);
     case 'getTeachers':
       requireAuth(authToken);
       return jsonResponse(readSheetObjects('04_MASTER_TEACHERS'));
-
-    case 'saveTeacher':
-      var sess = requireRole(authToken, ['ADMIN', 'COORDINATOR']);
-      upsertObject('04_MASTER_TEACHERS', ['teacher_id'], payload.teacher, 'teacher_id');
-      addAuditLog('SAVE_TEACHER', 'TEACHER', payload.teacher.teacher_id, null, payload.teacher, null, sess.user_id);
-      return jsonResponse(payload.teacher);
-
     case 'getUsers':
-      requireRole(authToken, ['ADMIN', 'COORDINATOR']);
-      var users = readSheetObjects('06_USERS').map(function(u) {
+      requireRole(authToken, [ROLES.ADMIN, ROLES.COORDINATOR]);
+      return jsonResponse(readSheetObjects('06_USERS', true).map(function(u) {
         var safe = Object.assign({}, u);
         delete safe.password_hash;
         delete safe.password;
         return safe;
-      });
-      return jsonResponse(users);
-
-    case 'saveUser':
-      var sess = requireRole(authToken, ['ADMIN']);
-      var userPayload = Object.assign({}, payload.user);
-      if (!userPayload || !userPayload.user_id || !userPayload.username || !userPayload.display_name) {
-        return jsonError('VALIDATION_ERROR', 'ID Pengguna, username, dan nama tampilan wajib diisi.');
-      }
-      
-      var allowedRoles = ['ADMIN', 'COORDINATOR', 'TEACHER', 'VIEWER'];
-      var role = String(userPayload.role || '').toUpperCase().trim();
-      if (allowedRoles.indexOf(role) === -1) {
-        return jsonError('VALIDATION_ERROR', 'Peran (role) "' + userPayload.role + '" tidak valid. Pilihan: ADMIN, COORDINATOR, TEACHER, VIEWER.');
-      }
-      userPayload.role = role;
-
-      if (role === 'TEACHER') {
-        if (!userPayload.teacher_id || String(userPayload.teacher_id).trim() === '') {
-          return jsonError('VALIDATION_ERROR', 'Akun dengan role Guru (TEACHER) wajib menghubungkan Guru Terkait.');
-        }
-        var teachers = readSheetObjects('04_MASTER_TEACHERS');
-        var matchedTeacher = teachers.find(function(t) { return t.teacher_id === userPayload.teacher_id; });
-        if (!matchedTeacher) {
-          return jsonError('VALIDATION_ERROR', 'Guru yang dipilih tidak ditemukan di Master Data Guru.');
-        }
-      } else {
-        userPayload.teacher_id = '';
-      }
-
-      // Check username uniqueness (case-insensitive)
-      var allUsers = readSheetObjects('06_USERS');
-      var usernameLower = String(userPayload.username).trim().toLowerCase();
-      var duplicate = allUsers.find(function(u) {
-        return u.user_id !== userPayload.user_id && String(u.username || '').trim().toLowerCase() === usernameLower;
-      });
-      if (duplicate) {
-        return jsonError('VALIDATION_ERROR', 'Username "' + userPayload.username + '" sudah digunakan oleh akun lain (' + duplicate.display_name + ').');
-      }
-
-      var existingUser = allUsers.find(function(u) { return u.user_id === userPayload.user_id; });
-      var passwordChanged = false;
-      var nowIso = new Date().toISOString();
-
-      if (userPayload.password && String(userPayload.password).trim() !== '') {
-        userPayload.password_hash = hashPasswordGS(String(userPayload.password).trim());
-        passwordChanged = true;
-      } else if (existingUser) {
-        userPayload.password_hash = existingUser.password_hash || '';
-      } else {
-        return jsonError('VALIDATION_ERROR', 'Password awal wajib diisi untuk pembuatan akun baru.');
-      }
-
-      delete userPayload.password;
-      userPayload.updated_at = nowIso;
-      if (!existingUser) {
-        userPayload.created_at = nowIso;
-        userPayload.last_login_at = '';
-      }
-
-      upsertObject('06_USERS', ['user_id'], userPayload, 'user_id');
-
-      if (passwordChanged || userPayload.active === false || String(userPayload.active).toLowerCase() === 'false') {
-        revokeAllUserSessions(userPayload.user_id);
-      }
-
-      addAuditLog(
-        existingUser ? 'UPDATE_USER' : 'CREATE_USER',
-        'USER',
-        userPayload.user_id,
-        existingUser ? { display_name: existingUser.display_name, username: existingUser.username, role: existingUser.role, active: existingUser.active, teacher_id: existingUser.teacher_id } : null,
-        { display_name: userPayload.display_name, username: userPayload.username, role: userPayload.role, active: userPayload.active, teacher_id: userPayload.teacher_id },
-        null,
-        sess.user_id
-      );
-
-      delete userPayload.password_hash;
-      delete userPayload.password;
-      return jsonResponse(userPayload);
-
-    case 'resetUserPassword':
-      return handleResetUserPassword(payload, authToken);
-
-    case 'getHalaqahList':
-      requireAuth(authToken);
-      var list = readSheetObjects('10_HALAQAH');
-      if (payload.eventId) {
-        list = list.filter(function(h) { return h.event_id === payload.eventId; });
-      }
-      return jsonResponse(list);
-
-    case 'saveHalaqah':
-      var sess = requireRole(authToken, ['ADMIN', 'COORDINATOR']);
-      upsertObject('10_HALAQAH', ['halaqah_id'], payload.halaqah, 'halaqah_id');
-      addAuditLog('SAVE_HALAQAH', 'HALAQAH', payload.halaqah.halaqah_id, null, payload.halaqah, null, sess.user_id, payload.halaqah.event_id);
-      return jsonResponse(payload.halaqah);
-
-    case 'getHalaqahTeachers':
-      requireAuth(authToken);
-      var hts = readSheetObjects('11_HALAQAH_TEACHERS');
-      hts = hts.filter(function(item) {
-        return item.active === true || String(item.active).toLowerCase() === 'true';
-      });
-      if (payload.eventId) {
-        hts = hts.filter(function(item) { return item.event_id === payload.eventId; });
-      }
-      return jsonResponse(hts);
-
-    case 'saveHalaqahTeacher':
-      var sess = requireRole(authToken, ['ADMIN', 'COORDINATOR']);
-      var ht = payload.halaqahTeacher;
-      if (!ht || !ht.event_id || !ht.halaqah_id || !ht.teacher_id) {
-        return jsonError('VALIDATION_ERROR', 'Data penugasan guru tidak lengkap.');
-      }
-
-      var allHts = readSheetObjects('11_HALAQAH_TEACHERS');
-      var nowIso = new Date().toISOString();
-
-      // Find matching assignments by business key: event_id + halaqah_id + teacher_id
-      var matchingList = allHts.filter(function(item) {
-        return item.event_id === ht.event_id &&
-               item.halaqah_id === ht.halaqah_id &&
-               item.teacher_id === ht.teacher_id;
-      });
-
-      var activeMatch = matchingList.find(function(item) {
-        return item.active === true || String(item.active).toLowerCase() === 'true';
-      });
-
-      if (activeMatch) {
-        // Active assignment already exists - update role if changed
-        if (ht.teacher_role && activeMatch.teacher_role !== ht.teacher_role) {
-          activeMatch.teacher_role = ht.teacher_role;
-          activeMatch.updated_at = nowIso;
-          var updateSuccess = updateObject('11_HALAQAH_TEACHERS', 'assignment_id', activeMatch.assignment_id, {
-            teacher_role: activeMatch.teacher_role,
-            updated_at: activeMatch.updated_at
-          });
-          if (!updateSuccess) {
-            return jsonError('SERVER_ERROR', 'Gagal memperbarui peran penugasan guru.');
-          }
-          addAuditLog('UPDATE_HALAQAH_TEACHER_ROLE', 'HALAQAH_TEACHER', activeMatch.assignment_id, null, activeMatch, null, sess.user_id, activeMatch.event_id);
-          invalidateSheetCache('11_HALAQAH_TEACHERS');
-          invalidateSheetCache('10_HALAQAH');
-        }
-        return jsonResponse(activeMatch);
-      }
-
-      // Check for inactive matching assignment to reactivate
-      var inactiveMatch = matchingList.find(function(item) {
-        return item.active === false || String(item.active).toLowerCase() === 'false';
-      }) || matchingList[0];
-
-      if (inactiveMatch) {
-        inactiveMatch.active = 'TRUE';
-        inactiveMatch.teacher_role = ht.teacher_role || inactiveMatch.teacher_role || 'PRIMARY';
-        inactiveMatch.updated_at = nowIso;
-        var reactivateSuccess = updateObject('11_HALAQAH_TEACHERS', 'assignment_id', inactiveMatch.assignment_id, {
-          active: 'TRUE',
-          teacher_role: inactiveMatch.teacher_role,
-          updated_at: inactiveMatch.updated_at
-        });
-        if (!reactivateSuccess) {
-          return jsonError('SERVER_ERROR', 'Gagal mengaktifkan kembali penugasan guru.');
-        }
-        addAuditLog('REACTIVATE_HALAQAH_TEACHER', 'HALAQAH_TEACHER', inactiveMatch.assignment_id, null, inactiveMatch, null, sess.user_id, inactiveMatch.event_id);
-        invalidateSheetCache('11_HALAQAH_TEACHERS');
-        invalidateSheetCache('10_HALAQAH');
-        return jsonResponse(inactiveMatch);
-      }
-
-      // No matching assignment found at all, create new row
-      var newAssignment = {
-        assignment_id: ht.assignment_id || ('HT-' + Utilities.getUuid().replace(/-/g, '').substring(0, 16)),
-        event_id: ht.event_id,
-        halaqah_id: ht.halaqah_id,
-        teacher_id: ht.teacher_id,
-        teacher_role: ht.teacher_role || 'PRIMARY',
-        active: 'TRUE',
-        created_at: nowIso,
-        updated_at: nowIso
-      };
-      upsertObject('11_HALAQAH_TEACHERS', ['assignment_id'], newAssignment, 'assignment_id');
-      addAuditLog('ASSIGN_HALAQAH_TEACHER', 'HALAQAH_TEACHER', newAssignment.assignment_id, null, newAssignment, null, sess.user_id, newAssignment.event_id);
-      invalidateSheetCache('11_HALAQAH_TEACHERS');
-      invalidateSheetCache('10_HALAQAH');
-      return jsonResponse(newAssignment);
-
-    case 'deleteHalaqahTeacher':
-      var sess = requireRole(authToken, ['ADMIN', 'COORDINATOR']);
-      var assignmentId = payload.assignmentId;
-      if (!assignmentId) {
-        return jsonError('VALIDATION_ERROR', 'ID penugasan guru (assignmentId) wajib diisi.');
-      }
-
-      Logger.log('DELETE HALAQAH TEACHER REQUEST: ' + assignmentId);
-
-      var deleted = deleteRowByField('11_HALAQAH_TEACHERS', 'assignment_id', assignmentId);
-      if (!deleted) {
-        return jsonError('NOT_FOUND', 'Penugasan guru tidak ditemukan.');
-      }
-
-      invalidateSheetCache('11_HALAQAH_TEACHERS');
-      invalidateSheetCache('10_HALAQAH');
-
-      Logger.log('DELETE COMPLETED: ' + assignmentId);
-
-      addAuditLog(
-        'DELETE_HALAQAH_TEACHER',
-        'HALAQAH_TEACHER',
-        assignmentId,
-        deleted,
-        { deleted: true, deleted_at: new Date().toISOString() },
-        null,
-        sess.user_id,
-        deleted.event_id
-      );
-
-      return jsonResponse({
-        deleted: true,
-        assignmentId: assignmentId,
-        teacherId: deleted.teacher_id,
-        halaqahId: deleted.halaqah_id
-      });
-
-    case 'getEventParticipants':
-      var sess = requireAuth(authToken);
-      var resolvedEvtId = resolveRequestedEventId(payload.eventId);
-      var parts = readSheetObjects('12_EVENT_PARTICIPANTS');
-      if (resolvedEvtId) {
-        parts = parts.filter(function(p) { return p.event_id === resolvedEvtId; });
-      }
-
-      if (sess.role === 'TEACHER') {
-        var teacherHalaqahIds = getTeacherAuthorizedHalaqahIds(sess.teacher_id, resolvedEvtId);
-        parts = parts.filter(function(p) { return teacherHalaqahIds.indexOf(p.halaqah_id) !== -1; });
-      }
-
-      return jsonResponse(parts);
-
-    case 'getStudentPlacementBootstrap':
-      var sess = requireRole(authToken, ['ADMIN', 'COORDINATOR']);
-      var startTime = new Date().getTime();
-      Logger.log('BOOTSTRAP START');
-
-      // 1. Resolve Event
-      var targetEventId = payload.eventId;
-      var allEvents = readSheetObjects('07_EVENTS');
-      var targetEvent = null;
-      if (targetEventId) {
-        targetEvent = allEvents.find(function(e) { return e.event_id === targetEventId; });
-      }
-      if (!targetEvent) {
-        var configs = readSheetObjects('01_APP_CONFIG');
-        var currConf = configs.find(function(c) { return c.config_key === 'current_event_id'; });
-        var activeId = currConf ? currConf.config_value : '';
-        targetEvent = allEvents.find(function(e) { return e.event_id === activeId; }) ||
-                      allEvents.find(function(e) { return e.status === 'ACTIVE'; }) ||
-                      allEvents[0] || null;
-      }
-      var resolvedEvtId = targetEvent ? targetEvent.event_id : targetEventId;
-
-      // 2. Load Master Students (Project only required fields)
-      var t1 = new Date().getTime();
-      var rawStudents = readSheetObjects('03_MASTER_STUDENTS');
-      var students = rawStudents.map(function(s) {
-        return {
-          student_id: s.student_id,
-          nis: s.nis,
-          full_name: s.full_name,
-          gender: s.gender,
-          grade_level: s.grade_level,
-          class_name: s.class_name,
-          active: s.active
-        };
-      });
-      var studentsTime = new Date().getTime() - t1;
-      Logger.log('students loaded: ' + studentsTime + ' ms');
-
-      // 3. Load Participants (filtered by event_id)
-      var t2 = new Date().getTime();
-      var allParticipants = readSheetObjects('12_EVENT_PARTICIPANTS');
-      var participants = allParticipants.filter(function(p) {
-        return p.event_id === resolvedEvtId;
-      });
-      var participantsTime = new Date().getTime() - t2;
-      Logger.log('participants loaded: ' + participantsTime + ' ms');
-
-      // 4. Load Halaqahs (filtered by event_id)
-      var t3 = new Date().getTime();
-      var allHalaqahs = readSheetObjects('10_HALAQAH');
-      var halaqahs = allHalaqahs.filter(function(h) {
-        return h.event_id === resolvedEvtId && (h.active === true || String(h.active) === 'true');
-      });
-      var halaqahsTime = new Date().getTime() - t3;
-      Logger.log('halaqahs loaded: ' + halaqahsTime + ' ms');
-
-      var totalTime = new Date().getTime() - startTime;
-      Logger.log('total bootstrap: ' + totalTime + ' ms');
-
-      return jsonResponse({
-        event: targetEvent,
-        students: students,
-        participants: participants,
-        halaqahs: halaqahs
-      });
-
-    case 'getTeacherWorkspaceBootstrap':
-      return handleGetTeacherWorkspaceBootstrap(payload, authToken);
-
-    case 'bulkRegisterAndAssignStudentsToHalaqah':
-    case 'bulkAssignStudentsToHalaqah':
-      return handleBulkRegisterAndAssignStudentsToHalaqah(payload, authToken);
-
-    case 'updateParticipantTarget':
-      var sess = requireRole(authToken, ['ADMIN', 'COORDINATOR']);
-      upsertObject('12_EVENT_PARTICIPANTS', ['participant_id'], payload.participant, 'participant_id');
-      addAuditLog('UPDATE_BASELINE_TARGET', 'PARTICIPANT', payload.participant.participant_id, null, payload.participant, null, sess.user_id, payload.participant.event_id);
-      return jsonResponse(payload.participant);
-
-    case 'getSessionAssessments':
-      var sess = requireAuth(authToken);
-      var resolvedEvtId = resolveRequestedEventId(payload.eventId);
-      var asms = readSheetObjects('13_SESSION_ASSESSMENTS');
-      asms = asms.filter(function(a) { return !a.is_deleted && String(a.is_deleted) !== 'true'; });
-      if (resolvedEvtId) {
-        asms = asms.filter(function(a) { return a.event_id === resolvedEvtId; });
-      }
-
-      if (sess.role === 'TEACHER') {
-        var teacherHalaqahs = getTeacherAuthorizedHalaqahIds(sess.teacher_id, resolvedEvtId);
-        asms = asms.filter(function(a) { return teacherHalaqahs.indexOf(a.halaqah_id) !== -1; });
-      }
-
-      return jsonResponse(asms);
-
-    case 'saveSessionAssessment':
-      var sess = requireRole(authToken, ['TEACHER', 'ADMIN', 'COORDINATOR']);
-      var asm = Object.assign({}, payload.assessment);
-      if (!asm || !asm.participant_id) {
-        return jsonError('VALIDATION_ERROR', 'ID Peserta (participant_id) wajib diisi.');
-      }
-
-      // Resolve participant server-side
-      var allParticipants = readSheetObjects('12_EVENT_PARTICIPANTS');
-      var participant = allParticipants.find(function(p) { return p.participant_id === asm.participant_id; });
-      if (!participant) {
-        return jsonError('VALIDATION_ERROR', 'Peserta dengan ID "' + asm.participant_id + '" tidak ditemukan.');
-      }
-
-      // Derive authoritative participant values
-      asm.student_id = participant.student_id;
-      asm.halaqah_id = participant.halaqah_id;
-      asm.event_id = participant.event_id;
-
-      // Check teacher authorization
-      if (sess.role === 'TEACHER') {
-        if (!sess.teacher_id) {
-          return jsonError('FORBIDDEN', 'Akun Guru Anda tidak terhubung dengan Master Data Guru.');
-        }
-        var teacherHalaqahs = getTeacherAuthorizedHalaqahIds(sess.teacher_id, participant.event_id);
-        if (teacherHalaqahs.indexOf(participant.halaqah_id) === -1) {
-          return jsonError('FORBIDDEN', 'Anda tidak berwenang mengedit penilaian untuk peserta ini.');
-        }
-        asm.teacher_id = sess.teacher_id;
-      } else {
-        // ADMIN or COORDINATOR: resolve responsible teacher for halaqah from 11_HALAQAH_TEACHERS
-        var responsibleTeacherId = resolveResponsibleHalaqahTeacherId(participant.halaqah_id, participant.event_id, asm.teacher_id);
-        if (!responsibleTeacherId) {
-          return jsonError('VALIDATION_ERROR', 'Tidak ada guru penanggung jawab yang terdaftar untuk halaqah ini di Master Penugasan Guru.');
-        }
-        asm.teacher_id = responsibleTeacherId;
-      }
-
-      // Validate session_config_id
-      if (!asm.session_config_id) {
-        return jsonError('VALIDATION_ERROR', 'Sesi penilaian (session_config_id) wajib diisi.');
-      }
-      var allSessionConfigs = readSheetObjects('09_SESSION_CONFIG');
-      var sConfig = allSessionConfigs.find(function(sc) { return sc.session_config_id === asm.session_config_id; });
-      if (!sConfig) {
-        return jsonError('VALIDATION_ERROR', 'Konfigurasi sesi "' + asm.session_config_id + '" tidak ditemukan.');
-      }
-
-      if (sConfig.event_id !== participant.event_id) {
-        return jsonError('VALIDATION_ERROR', 'Sesi penilaian tidak sesuai dengan event peserta.');
-      }
-
-      if (participant.session_group_id && String(participant.session_group_id).trim() !== '') {
-        if (sConfig.session_group_id !== participant.session_group_id) {
-          return jsonError('VALIDATION_ERROR', 'Sesi penilaian tidak sesuai dengan kelompok sesi peserta.');
-        }
-      }
-
-      // Derive session values from SessionConfig
-      asm.event_day_id = sConfig.event_day_id;
-      asm.session_no = sConfig.session_no;
-
-      // Validate attendance status & progress fields
-      var status = String(asm.attendance_status || 'UNASSESSED').toUpperCase().trim();
-      var allowedStatuses = ['UNASSESSED', 'PRESENT', 'SICK', 'PERMISSION', 'ABSENT'];
-      if (allowedStatuses.indexOf(status) === -1) {
-        return jsonError('VALIDATION_ERROR', 'Status kehadiran "' + asm.attendance_status + '" tidak valid. Pilihan yang valid: UNASSESSED, PRESENT, SICK, PERMISSION, ABSENT.');
-      }
-      asm.attendance_status = status;
-
-      if (status === 'PRESENT') {
-        var mode = String(asm.assessment_mode || (asm.nuroniyyah_dars ? 'NURONIYYAH' : (asm.iqra_level ? 'IQRA' : 'ZIYADAH'))).toUpperCase().trim();
-        asm.assessment_mode = mode;
-
-        if (mode === 'NURONIYYAH') {
-          if (!asm.nuroniyyah_dars || asm.lines_added == null || asm.lines_added === '') {
-            return jsonError('VALIDATION_ERROR', 'Untuk status HADIR pada mode Nuroniyyah, data Ad-Dars dan jumlah penambahan baris wajib diisi.');
-          }
-          asm.nuroniyyah_dars = String(asm.nuroniyyah_dars);
-          asm.lines_added = Number(asm.lines_added);
-          asm.surah_start = '';
-          asm.ayah_start = '';
-          asm.surah_end = '';
-          asm.ayah_end = '';
-          asm.iqra_level = '';
-          asm.iqra_page_start = '';
-          asm.iqra_page_end = '';
-          asm.assessment_status = 'COMPLETED';
-        } else if (mode === 'IQRA') {
-          asm.lines_added = asm.lines_added != null && asm.lines_added !== '' ? Number(asm.lines_added) : 0;
-          asm.assessment_status = 'COMPLETED';
-        } else {
-          // Default ZIYADAH
-          asm.assessment_mode = 'ZIYADAH';
-          if (asm.surah_start == null || asm.surah_start === '' ||
-              asm.ayah_start == null || asm.ayah_start === '' ||
-              asm.surah_end == null || asm.surah_end === '' ||
-              asm.ayah_end == null || asm.ayah_end === '' ||
-              asm.lines_added == null || asm.lines_added === '') {
-            return jsonError('VALIDATION_ERROR', 'Untuk status HADIR pada mode Hafalan Al-Qur\'an, data surah/ayat awal & akhir serta jumlah baris wajib diisi.');
-          }
-          asm.surah_start = Number(asm.surah_start);
-          asm.ayah_start = Number(asm.ayah_start);
-          asm.surah_end = Number(asm.surah_end);
-          asm.ayah_end = Number(asm.ayah_end);
-          asm.lines_added = Number(asm.lines_added); // preserves explicit 0
-          asm.nuroniyyah_dars = '';
-          asm.iqra_level = '';
-          asm.iqra_page_start = '';
-          asm.iqra_page_end = '';
-          asm.assessment_status = 'COMPLETED';
-        }
-      } else if (status === 'UNASSESSED') {
-        asm.assessment_status = 'PENDING';
-        asm.surah_start = '';
-        asm.ayah_start = '';
-        asm.surah_end = '';
-        asm.ayah_end = '';
-        asm.lines_added = '';
-        asm.nuroniyyah_dars = '';
-        asm.iqra_level = '';
-        asm.iqra_page_start = '';
-        asm.iqra_page_end = '';
-      } else {
-        // Clear progress fields for non-PRESENT (do not store 0 for absence)
-        asm.assessment_status = 'COMPLETED';
-        asm.surah_start = '';
-        asm.ayah_start = '';
-        asm.surah_end = '';
-        asm.ayah_end = '';
-        asm.lines_added = '';
-        asm.nuroniyyah_dars = '';
-        asm.iqra_level = '';
-        asm.iqra_page_start = '';
-        asm.iqra_page_end = '';
-      }
-
-      asm.updated_at = new Date().toISOString();
-      if (!asm.created_at) asm.created_at = new Date().toISOString();
-      asm.is_deleted = 'FALSE';
-      asm.deleted_at = '';
-      asm.deleted_by = '';
-
-      // UPSERT by event_id + participant_id + session_config_id, PRESERVE assessment_id
-      var resStatus = upsertObject('13_SESSION_ASSESSMENTS', ['event_id', 'participant_id', 'session_config_id'], asm, 'assessment_id');
-      addAuditLog(resStatus === 'INSERTED' ? 'CREATE_ASSESSMENT' : 'UPDATE_ASSESSMENT', 'SESSION_ASSESSMENT', asm.assessment_id, null, asm, null, sess.user_id, asm.event_id);
-      return jsonResponse(asm);
-
-    case 'bulkSaveSessionAttendance':
-      return handleBulkSaveSessionAttendance(payload, authToken);
-
-    case 'deleteSessionAssessment':
-      var sess = requireRole(authToken, ['TEACHER', 'ADMIN', 'COORDINATOR']);
-      var assessmentId = payload.assessmentId;
-      var existingAsm = readSheetObjects('13_SESSION_ASSESSMENTS').find(function(a) { return a.assessment_id === assessmentId; });
-      if (!existingAsm) {
-        return jsonError('NOT_FOUND', 'Penilaian tidak ditemukan.');
-      }
-
-      if (sess.role === 'TEACHER') {
-        var teacherHalaqahs = getTeacherAuthorizedHalaqahIds(sess.teacher_id, existingAsm.event_id);
-        if (teacherHalaqahs.indexOf(existingAsm.halaqah_id) === -1 && existingAsm.teacher_id !== sess.teacher_id) {
-          return jsonError('FORBIDDEN', 'Anda tidak berwenang menghapus penilaian ini.');
-        }
-      }
-
-      updateObject('13_SESSION_ASSESSMENTS', 'assessment_id', assessmentId, {
-        is_deleted: 'TRUE',
-        deleted_at: new Date().toISOString(),
-        deleted_by: sess.user_id
-      });
-      addAuditLog('SOFT_DELETE_ASSESSMENT', 'SESSION_ASSESSMENT', assessmentId, null, null, null, sess.user_id);
-      return jsonResponse({ success: true });
-
-    case 'getFinalEvaluations':
-      var sess = requireAuth(authToken);
-      var resolvedEvtId = resolveRequestedEventId(payload.eventId);
-      var evals = readSheetObjects('14_FINAL_EVALUATIONS');
-      if (resolvedEvtId) {
-        evals = evals.filter(function(e) { return e.event_id === resolvedEvtId; });
-      }
-
-      if (sess.role === 'TEACHER') {
-        var teacherHalaqahs = getTeacherAuthorizedHalaqahIds(sess.teacher_id, resolvedEvtId);
-        var allowedParticipants = readSheetObjects('12_EVENT_PARTICIPANTS').filter(function(p) {
-          return p.event_id === resolvedEvtId && teacherHalaqahs.indexOf(p.halaqah_id) !== -1;
-        });
-        var allowedIds = {};
-        allowedParticipants.forEach(function(p) {
-          allowedIds[p.participant_id] = true;
-          allowedIds[p.student_id] = true;
-        });
-        evals = evals.filter(function(e) { return allowedIds[e.participant_id] || allowedIds[e.student_id]; });
-      }
-
-      return jsonResponse(evals);
-
-    case 'saveFinalEvaluation':
-      var sess = requireRole(authToken, ['TEACHER', 'ADMIN', 'COORDINATOR']);
-      var fe = Object.assign({}, payload.finalEvaluation);
-      if (!fe || !fe.participant_id) {
-        return jsonError('VALIDATION_ERROR', 'ID Peserta (participant_id) wajib diisi.');
-      }
-
-      var allParticipants = readSheetObjects('12_EVENT_PARTICIPANTS');
-      var participant = allParticipants.find(function(p) { return p.participant_id === fe.participant_id; });
-      if (!participant) {
-        return jsonError('VALIDATION_ERROR', 'Peserta dengan ID "' + fe.participant_id + '" tidak ditemukan.');
-      }
-
-      // Derive student_id and event_id from participant
-      fe.student_id = participant.student_id;
-      fe.event_id = participant.event_id;
-
-      if (sess.role === 'TEACHER') {
-        if (!sess.teacher_id) {
-          return jsonError('FORBIDDEN', 'Akun Guru Anda tidak terhubung dengan Master Data Guru.');
-        }
-        var teacherHalaqahs = getTeacherAuthorizedHalaqahIds(sess.teacher_id, participant.event_id);
-        if (teacherHalaqahs.indexOf(participant.halaqah_id) === -1) {
-          return jsonError('FORBIDDEN', 'Anda tidak berwenang mengedit evaluasi akhir untuk peserta ini.');
-        }
-        fe.evaluator_teacher_id = sess.teacher_id;
-      } else {
-        // ADMIN or COORDINATOR: resolve responsible evaluator teacher for halaqah from 11_HALAQAH_TEACHERS
-        var responsibleTeacherId = resolveResponsibleHalaqahTeacherId(participant.halaqah_id, participant.event_id, fe.evaluator_teacher_id || fe.teacher_id);
-        if (!responsibleTeacherId) {
-          return jsonError('VALIDATION_ERROR', 'Tidak ada guru evaluator penanggung jawab yang terdaftar untuk halaqah ini di Master Penugasan Guru.');
-        }
-        fe.evaluator_teacher_id = responsibleTeacherId;
-      }
-
-      // Validate completion_status ONLY: COMPLETE, INCOMPLETE
-      var compStatus = String(fe.completion_status || '').toUpperCase().trim();
-      if (['COMPLETE', 'INCOMPLETE'].indexOf(compStatus) === -1) {
-        return jsonError('VALIDATION_ERROR', 'Status kelulusan (completion_status) harus COMPLETE atau INCOMPLETE.');
-      }
-      fe.completion_status = compStatus;
-
-      // Validate skill_status_end ONLY: NON_BBL, BBL, BBLS
-      var skillEnd = String(fe.skill_status_end || '').toUpperCase().trim();
-      if (['NON_BBL', 'BBL', 'BBLS'].indexOf(skillEnd) === -1) {
-        return jsonError('VALIDATION_ERROR', 'Status kemampuan akhir (skill_status_end) harus NON_BBL, BBL, atau BBLS.');
-      }
-      fe.skill_status_end = skillEnd;
-
-      // Validate affective_rating ONLY: A, B, C, D or empty string
-      var affRating = String(fe.affective_rating || '').toUpperCase().trim();
-      delete fe.affective_grade;
-      if (affRating !== '') {
-        if (['A', 'B', 'C', 'D'].indexOf(affRating) === -1) {
-          return jsonError('VALIDATION_ERROR', 'Nilai sikap (affective_rating) harus A, B, C, D, atau dikosongkan.');
-        }
-        fe.affective_rating = affRating;
-      } else {
-        fe.affective_rating = '';
-      }
-
-      // Require actual Quran evaluation range
-      if (fe.evaluation_surah_start == null || fe.evaluation_surah_start === '' ||
-          fe.evaluation_ayah_start == null || fe.evaluation_ayah_start === '' ||
-          fe.evaluation_surah_end == null || fe.evaluation_surah_end === '' ||
-          fe.evaluation_ayah_end == null || fe.evaluation_ayah_end === '') {
-        return jsonError('VALIDATION_ERROR', 'Jangkauan surah dan ayat evaluasi akhir wajib diisi.');
-      }
-
-      fe.evaluation_surah_start = Number(fe.evaluation_surah_start);
-      fe.evaluation_ayah_start = Number(fe.evaluation_ayah_start);
-      fe.evaluation_surah_end = Number(fe.evaluation_surah_end);
-      fe.evaluation_ayah_end = Number(fe.evaluation_ayah_end);
-
-      fe.updated_at = new Date().toISOString();
-      if (!fe.created_at) fe.created_at = new Date().toISOString();
-
-      // UPSERT by event_id + participant_id, PRESERVE final_evaluation_id
-      var feStatus = upsertObject('14_FINAL_EVALUATIONS', ['event_id', 'participant_id'], fe, 'final_evaluation_id');
-      addAuditLog(feStatus === 'INSERTED' ? 'SAVE_FINAL_EVALUATION' : 'UPDATE_FINAL_EVALUATION', 'FINAL_EVALUATION', fe.final_evaluation_id, null, fe, null, sess.user_id, fe.event_id);
-      return jsonResponse(fe);
-
-    case 'getMyHalaqahData':
-      var sess = requireRole(authToken, ['TEACHER', 'ADMIN', 'COORDINATOR']);
-      var teacherId = null;
-      if (sess.role === 'TEACHER') {
-        teacherId = sess.teacher_id || null;
-      } else {
-        if (payload.teacherId && String(payload.teacherId).trim() !== '') {
-          teacherId = String(payload.teacherId).trim();
-        } else if (sess.teacher_id && String(sess.teacher_id).trim() !== '') {
-          teacherId = String(sess.teacher_id).trim();
-        }
-      }
-      return handleGetMyHalaqahData(teacherId, payload.eventId, payload.selectedHalaqahId, sess.role);
-
-    case 'getAdminOverview':
-      return handleGetAdminOverview(payload.eventId, authToken);
-
-    case 'getCompletenessReport':
-      return handleGetCompletenessReport(payload.eventId, authToken);
-
-    case 'getExecutiveAnalytics':
-      return handleGetExecutiveAnalytics(payload, authToken);
-
+      }));
+    case 'getHalaqahList': return handleGetHalaqahList(payload, authToken);
+    case 'getHalaqahTeachers': return handleGetHalaqahTeachers(payload, authToken);
+    case 'getEventParticipants': return handleGetEventParticipants(payload, authToken);
+    case 'getStudentPlacementBootstrap': return handleGetStudentPlacementBootstrap(payload, authToken);
+    case 'getTeacherWorkspaceBootstrap': return handleGetTeacherWorkspaceBootstrap(payload, authToken);
+    case 'getMyHalaqahData': return handleGetMyHalaqahData(payload, authToken);
+    case 'getSessionAssessments': return handleGetSessionAssessments(payload, authToken);
+    case 'getFinalEvaluations': return handleGetFinalEvaluations(payload, authToken);
+    case 'getAdminOverview': return handleGetAdminOverview(payload.eventId, authToken);
+    case 'getCompletenessReport': return handleGetCompletenessReport(payload.eventId, authToken);
+    case 'getExecutiveAnalytics': return handleGetExecutiveAnalytics(payload, authToken);
     case 'getAuditLogs':
-      requireRole(authToken, ['ADMIN', 'COORDINATOR']);
+      requireRole(authToken, [ROLES.ADMIN, ROLES.COORDINATOR]);
       return jsonResponse(readSheetObjects('15_AUDIT_LOG'));
+
+    case 'updateAppConfig': return handleUpdateAppConfig(payload, authToken);
+    case 'saveEvent': return handleSaveEvent(payload, authToken);
+    case 'saveEventDay': return handleSaveEventDay(payload, authToken);
+    case 'saveSessionGroup': return handleSaveSessionGroup(payload, authToken);
+    case 'saveSessionConfig': return handleSaveSessionConfig(payload, authToken);
+    case 'saveStudent': return handleSaveStudent(payload, authToken);
+    case 'regenerateAccessCode': return handleRegenerateAccessCode(payload, authToken);
+    case 'saveTeacher': return handleSaveTeacher(payload, authToken);
+    case 'saveUser': return handleSaveUser(payload, authToken);
+    case 'resetUserPassword': return handleResetUserPassword(payload, authToken);
+    case 'saveHalaqah': return handleSaveHalaqah(payload, authToken);
+    case 'saveHalaqahTeacher': return handleSaveHalaqahTeacher(payload, authToken);
+    case 'deleteHalaqahTeacher': return handleDeleteHalaqahTeacher(payload, authToken);
+    case 'bulkRegisterAndAssignStudentsToHalaqah':
+    case 'bulkAssignStudentsToHalaqah': return handleBulkRegisterAndAssignStudentsToHalaqah(payload, authToken);
+    case 'updateParticipantTarget': return handleUpdateParticipantTarget(payload, authToken);
+
+    case 'saveSessionAssessment': return handleSaveSessionAssessment(payload, authToken);
+    case 'bulkSaveSessionAttendance': return handleBulkSaveSessionAttendance(payload, authToken);
+    case 'deleteSessionAssessment': return handleDeleteSessionAssessment(payload, authToken);
+    case 'saveFinalEvaluation': return handleSaveFinalEvaluation(payload, authToken);
 
     default:
       return jsonError('VALIDATION_ERROR', 'Aksi API "' + action + '" tidak dikenal.');
   }
 }
 
-// Search Login Accounts Handler (Public minimal endpoint)
-function handleSearchLoginAccounts(payload) {
-  var query = (payload.query || payload.q || '').trim().toLowerCase();
-  if (!query || query.length < 2) {
-    return jsonResponse([]);
-  }
+// ====================================================
+// 9. LOGIN / USER HANDLERS
+// ====================================================
 
-  var users = readSheetObjects('06_USERS');
-  var activeUsers = users.filter(function(u) {
-    return u.active === true || String(u.active).toLowerCase() === 'true';
+function handleSearchLoginAccounts(payload) {
+  var query = cleanStringGS(payload.query || payload.q).toLowerCase();
+  if (!query || query.length < 2) return jsonResponse([]);
+
+  var users = readSheetObjects('06_USERS', true).filter(function(u) { return isActiveRecordGS(u); });
+  var scored = [];
+
+  users.forEach(function(u) {
+    var username = cleanStringGS(u.username);
+    var displayName = cleanStringGS(u.display_name);
+    var usernameLower = username.toLowerCase();
+    var displayLower = displayName.toLowerCase();
+    var score = 999;
+
+    if (usernameLower === query) score = 0;
+    else if (usernameLower.indexOf(query) === 0) score = 1;
+    else if (displayLower.indexOf(query) === 0) score = 2;
+    else if (usernameLower.indexOf(query) !== -1) score = 3;
+    else if (displayLower.indexOf(query) !== -1) score = 4;
+
+    if (score < 999) scored.push({ score: score, username: username, display_name: displayName });
   });
 
-  var matches = [];
-  for (var i = 0; i < activeUsers.length; i++) {
-    var u = activeUsers[i];
-    var username = String(u.username || '').trim();
-    var displayName = String(u.display_name || '').trim();
-    
-    var usernameLower = username.toLowerCase();
-    var displayNameLower = displayName.toLowerCase();
+  scored.sort(function(a, b) {
+    if (a.score !== b.score) return a.score - b.score;
+    return a.display_name.localeCompare(b.display_name);
+  });
 
-    if (usernameLower.indexOf(query) !== -1 || displayNameLower.indexOf(query) !== -1) {
-      matches.push({
-        username: username,
-        display_name: displayName
-      });
-      if (matches.length >= 8) {
-        break;
-      }
-    }
-  }
-
-  return jsonResponse(matches);
+  return jsonResponse(scored.slice(0, 8).map(function(item) {
+    return { username: item.username, display_name: item.display_name };
+  }));
 }
 
-// Login Handler
 function handleLogin(payload) {
-  var username = (payload.username || '').trim().toLowerCase();
-  var password = (payload.password || '').trim();
+  var username = cleanStringGS(payload.username).toLowerCase();
+  var password = cleanStringGS(payload.password);
 
-  if (!username || !password) {
-    return jsonError('VALIDATION_ERROR', 'Username dan password wajib diisi.');
-  }
+  if (!username || !password) return jsonError('VALIDATION_ERROR', 'Username dan password wajib diisi.');
 
-  var users = readSheetObjects('06_USERS');
+  var users = readSheetObjects('06_USERS', true);
   var user = users.find(function(u) {
-    return String(u.username || '').trim().toLowerCase() === username && (u.active === true || String(u.active) === 'true');
+    return cleanStringGS(u.username).toLowerCase() === username && isActiveRecordGS(u);
   });
 
-  if (!user) {
+  if (!user || !verifyPasswordGS(password, user.password_hash)) {
     return jsonError('AUTH_INVALID', 'Username atau password tidak cocok.');
   }
 
-  // Salted SHA-256 password validation ONLY
-  var passValid = verifyPasswordGS(password, user.password_hash);
+  var role = normalizeRoleGS(user.role);
+  if ([ROLES.ADMIN, ROLES.COORDINATOR, ROLES.TEACHER, ROLES.VIEWER].indexOf(role) === -1) {
+    return jsonError('AUTH_INVALID', 'Role akun tidak valid. Silakan hubungi administrator.');
+  }
 
-  if (!passValid) {
-    return jsonError('AUTH_INVALID', 'Username atau password tidak cocok.');
+  if (role === ROLES.TEACHER && !cleanStringGS(user.teacher_id)) {
+    return jsonError('AUTH_INVALID', 'Akun Guru belum terhubung dengan Master Data Guru.');
   }
 
   var session = createSession(user);
-
+  updateObject('06_USERS', 'user_id', user.user_id, { last_login_at: nowIsoGS() });
   addAuditLog('USER_LOGIN', 'USER', user.user_id, null, { username: user.username }, 'Login berhasil', user.user_id);
 
   return jsonResponse({
@@ -1787,667 +1237,1253 @@ function handleLogin(payload) {
     user: {
       user_id: user.user_id,
       display_name: user.display_name,
-      role: user.role,
-      teacher_id: user.teacher_id || ''
+      role: role,
+      teacher_id: role === ROLES.TEACHER ? cleanStringGS(user.teacher_id) : ''
     }
   });
 }
 
-// Reset User Password Handler (ADMIN only)
-function handleResetUserPassword(payload, authToken) {
-  var sess = requireRole(authToken, ['ADMIN']);
-  var targetUserId = payload.userId || payload.user_id;
-  var newPlainPassword = payload.newPassword || payload.password;
+function handleSaveUser(payload, authToken) {
+  var actor = requireRole(authToken, [ROLES.ADMIN]);
+  var incoming = Object.assign({}, payload.user || {});
 
-  if (!targetUserId || String(targetUserId).trim() === '') {
-    return jsonError('VALIDATION_ERROR', 'ID Pengguna wajib diisi.');
+  if (!cleanStringGS(incoming.user_id) || !cleanStringGS(incoming.username) || !cleanStringGS(incoming.display_name)) {
+    return jsonError('VALIDATION_ERROR', 'ID Pengguna, username, dan nama tampilan wajib diisi.');
   }
 
-  if (!newPlainPassword || String(newPlainPassword).trim() === '') {
-    return jsonError('VALIDATION_ERROR', 'Password baru tidak boleh kosong.');
+  var role = normalizeRoleGS(incoming.role);
+  var allowedRoles = [ROLES.ADMIN, ROLES.COORDINATOR, ROLES.TEACHER, ROLES.VIEWER];
+  if (allowedRoles.indexOf(role) === -1) {
+    return jsonError('VALIDATION_ERROR', 'Peran (role) "' + incoming.role + '" tidak valid. Pilihan: ADMIN, COORDINATOR, TEACHER, VIEWER.');
+  }
+  incoming.role = role;
+
+  if (role === ROLES.TEACHER) {
+    var teacherId = cleanStringGS(incoming.teacher_id);
+    if (!teacherId) return jsonError('VALIDATION_ERROR', 'Akun dengan role Guru wajib menghubungkan Guru Terkait.');
+
+    var teacherExists = readSheetObjects('04_MASTER_TEACHERS').some(function(t) {
+      return cleanStringGS(t.teacher_id) === teacherId;
+    });
+    if (!teacherExists) return jsonError('VALIDATION_ERROR', 'Guru yang dipilih tidak ditemukan di Master Data Guru.');
+    incoming.teacher_id = teacherId;
+  } else {
+    // Non-teacher accounts never inherit teacher identity.
+    incoming.teacher_id = '';
   }
 
-  var cleanPassword = String(newPlainPassword).trim();
-  if (cleanPassword.length < 6) {
-    return jsonError('VALIDATION_ERROR', 'Password baru minimal harus terdiri dari 6 karakter.');
-  }
-
-  var allUsers = readSheetObjects('06_USERS');
-  var targetUser = allUsers.find(function(u) { return u.user_id === targetUserId; });
-  if (!targetUser) {
-    return jsonError('NOT_FOUND', 'Pengguna tidak ditemukan.');
-  }
-
-  var newHash = hashPasswordGS(cleanPassword);
-  var nowIso = new Date().toISOString();
-
-  // Update ONLY password_hash and updated_at
-  updateObject('06_USERS', 'user_id', targetUserId, {
-    password_hash: newHash,
-    updated_at: nowIso
+  var allUsers = readSheetObjects('06_USERS', true);
+  var usernameLower = cleanStringGS(incoming.username).toLowerCase();
+  var duplicate = allUsers.find(function(u) {
+    return cleanStringGS(u.user_id) !== cleanStringGS(incoming.user_id) && cleanStringGS(u.username).toLowerCase() === usernameLower;
   });
+  if (duplicate) {
+    return jsonError('VALIDATION_ERROR', 'Username "' + incoming.username + '" sudah digunakan oleh akun lain (' + duplicate.display_name + ').');
+  }
 
-  // Revoke all active sessions for that user
-  revokeAllUserSessions(targetUserId);
+  var existing = allUsers.find(function(u) { return cleanStringGS(u.user_id) === cleanStringGS(incoming.user_id); });
+  var passwordChanged = false;
+  var now = nowIsoGS();
 
-  // Write audit log without password or hash
+  if (cleanStringGS(incoming.password)) {
+    incoming.password_hash = hashPasswordGS(cleanStringGS(incoming.password));
+    passwordChanged = true;
+  } else if (existing) {
+    incoming.password_hash = existing.password_hash || '';
+  } else {
+    return jsonError('VALIDATION_ERROR', 'Password awal wajib diisi untuk pembuatan akun baru.');
+  }
+
+  delete incoming.password;
+  incoming.updated_at = now;
+  if (!existing) {
+    incoming.created_at = now;
+    incoming.last_login_at = '';
+  }
+
+  upsertObject('06_USERS', ['user_id'], incoming, 'user_id');
+
+  if (passwordChanged || isFalseGS(incoming.active)) revokeAllUserSessions(incoming.user_id);
+
   addAuditLog(
-    'RESET_USER_PASSWORD',
+    existing ? 'UPDATE_USER' : 'CREATE_USER',
     'USER',
-    targetUserId,
-    null,
+    incoming.user_id,
+    existing ? {
+      display_name: existing.display_name,
+      username: existing.username,
+      role: existing.role,
+      active: existing.active,
+      teacher_id: existing.teacher_id
+    } : null,
     {
-      username: targetUser.username,
-      display_name: targetUser.display_name,
-      reset_at: nowIso
+      display_name: incoming.display_name,
+      username: incoming.username,
+      role: incoming.role,
+      active: incoming.active,
+      teacher_id: incoming.teacher_id
     },
-    'Reset password user berhasil dilakukan oleh Admin',
-    sess.user_id
+    null,
+    actor.user_id
   );
 
+  var safe = Object.assign({}, incoming);
+  delete safe.password_hash;
+  delete safe.password;
+  return jsonResponse(safe);
+}
+
+function handleResetUserPassword(payload, authToken) {
+  var actor = requireRole(authToken, [ROLES.ADMIN]);
+  var targetUserId = cleanStringGS(payload.userId || payload.user_id);
+  var plain = cleanStringGS(payload.newPassword || payload.password);
+
+  if (!targetUserId) return jsonError('VALIDATION_ERROR', 'ID Pengguna wajib diisi.');
+  if (!plain) return jsonError('VALIDATION_ERROR', 'Password baru tidak boleh kosong.');
+  if (plain.length < 6) return jsonError('VALIDATION_ERROR', 'Password baru minimal 6 karakter.');
+
+  var targetUser = readSheetObjects('06_USERS', true).find(function(u) {
+    return cleanStringGS(u.user_id) === targetUserId;
+  });
+  if (!targetUser) return jsonError('NOT_FOUND', 'Pengguna tidak ditemukan.');
+
+  var now = nowIsoGS();
+  if (!updateObject('06_USERS', 'user_id', targetUserId, { password_hash: hashPasswordGS(plain), updated_at: now })) {
+    return jsonError('SERVER_ERROR', 'Gagal memperbarui password pengguna.');
+  }
+
+  revokeAllUserSessions(targetUserId);
+  addAuditLog('RESET_USER_PASSWORD', 'USER', targetUserId, null, {
+    username: targetUser.username,
+    display_name: targetUser.display_name,
+    reset_at: now
+  }, 'Reset password user dilakukan oleh Admin', actor.user_id);
+
+  return jsonResponse({ success: true, userId: targetUserId });
+}
+
+// ====================================================
+// 10. SIMPLE ADMIN WRITE HANDLERS
+// ====================================================
+
+function handleUpdateAppConfig(payload, authToken) {
+  var actor = requireRole(authToken, [ROLES.ADMIN]);
+  if (!cleanStringGS(payload.key)) return jsonError('VALIDATION_ERROR', 'Key konfigurasi wajib diisi.');
+
+  var ok = updateObject('01_APP_CONFIG', 'config_key', payload.key, {
+    config_value: payload.value,
+    updated_at: nowIsoGS()
+  });
+  if (!ok) return jsonError('NOT_FOUND', 'Konfigurasi tidak ditemukan.');
+
+  addAuditLog('UPDATE_CONFIG', 'CONFIG', payload.key, null, { key: payload.key, value: payload.value }, null, actor.user_id);
+  return jsonResponse({ success: true });
+}
+
+function handleSaveEvent(payload, authToken) {
+  var actor = requireRole(authToken, [ROLES.ADMIN]);
+  var eventObj = Object.assign({}, payload.event || {});
+  if (!cleanStringGS(eventObj.event_id)) return jsonError('VALIDATION_ERROR', 'event_id wajib diisi.');
+
+  upsertObject('07_EVENTS', ['event_id'], eventObj, 'event_id');
+  addAuditLog('SAVE_EVENT', 'EVENT', eventObj.event_id, null, eventObj, null, actor.user_id, eventObj.event_id);
+  return jsonResponse(eventObj);
+}
+
+function handleSaveEventDay(payload, authToken) {
+  var actor = requireRole(authToken, [ROLES.ADMIN]);
+  var eventDay = Object.assign({}, payload.eventDay || {});
+  if (!cleanStringGS(eventDay.event_day_id)) return jsonError('VALIDATION_ERROR', 'event_day_id wajib diisi.');
+
+  upsertObject('07A_EVENT_DAYS', ['event_day_id'], eventDay, 'event_day_id');
+  addAuditLog('SAVE_EVENT_DAY', 'EVENT_DAY', eventDay.event_day_id, null, eventDay, null, actor.user_id, eventDay.event_id);
+  return jsonResponse(eventDay);
+}
+
+function handleSaveSessionGroup(payload, authToken) {
+  var actor = requireRole(authToken, [ROLES.ADMIN]);
+  var group = Object.assign({}, payload.sessionGroup || {});
+  if (!cleanStringGS(group.session_group_id)) return jsonError('VALIDATION_ERROR', 'session_group_id wajib diisi.');
+
+  upsertObject('08_SESSION_GROUPS', ['session_group_id'], group, 'session_group_id');
+  addAuditLog('SAVE_SESSION_GROUP', 'SESSION_GROUP', group.session_group_id, null, group, null, actor.user_id, group.event_id);
+  return jsonResponse(group);
+}
+
+function handleSaveSessionConfig(payload, authToken) {
+  var actor = requireRole(authToken, [ROLES.ADMIN]);
+  var sc = Object.assign({}, payload.sessionConfig || {});
+  if (!cleanStringGS(sc.session_config_id)) return jsonError('VALIDATION_ERROR', 'Data konfigurasi sesi dan session_config_id wajib diisi.');
+
+  var rawStart = sc.start_time !== undefined && sc.start_time !== null ? sc.start_time : sc.startTime;
+  var rawEnd = sc.end_time !== undefined && sc.end_time !== null ? sc.end_time : sc.endTime;
+  var start = normalizeClockTime(rawStart);
+  var end = normalizeClockTime(rawEnd);
+
+  if (!start) return jsonError('VALIDATION_ERROR', 'Jam Mulai tidak valid. Gunakan format HH:mm.');
+  if (!end) return jsonError('VALIDATION_ERROR', 'Jam Selesai tidak valid. Gunakan format HH:mm.');
+  if (start >= end) return jsonError('VALIDATION_ERROR', 'Jam Mulai (' + start + ') harus lebih awal dari Jam Selesai (' + end + ').');
+
+  sc.start_time = start;
+  sc.end_time = end;
+  delete sc.startTime;
+  delete sc.endTime;
+
+  upsertObject('09_SESSION_CONFIG', ['session_config_id'], sc, 'session_config_id');
+  addAuditLog('SAVE_SESSION_CONFIG', 'SESSION_CONFIG', sc.session_config_id, null, sc, null, actor.user_id, sc.event_id);
+  return jsonResponse(sc);
+}
+
+function handleSaveTeacher(payload, authToken) {
+  var actor = requireRole(authToken, [ROLES.ADMIN]);
+  var teacher = Object.assign({}, payload.teacher || {});
+  if (!cleanStringGS(teacher.teacher_id)) return jsonError('VALIDATION_ERROR', 'teacher_id wajib diisi.');
+
+  upsertObject('04_MASTER_TEACHERS', ['teacher_id'], teacher, 'teacher_id');
+  addAuditLog('SAVE_TEACHER', 'TEACHER', teacher.teacher_id, null, teacher, null, actor.user_id);
+  return jsonResponse(teacher);
+}
+
+function handleSaveHalaqah(payload, authToken) {
+  var actor = requireRole(authToken, [ROLES.ADMIN]);
+  var halaqah = Object.assign({}, payload.halaqah || {});
+  if (!cleanStringGS(halaqah.halaqah_id)) return jsonError('VALIDATION_ERROR', 'halaqah_id wajib diisi.');
+
+  upsertObject('10_HALAQAH', ['halaqah_id'], halaqah, 'halaqah_id');
+  addAuditLog('SAVE_HALAQAH', 'HALAQAH', halaqah.halaqah_id, null, halaqah, null, actor.user_id, halaqah.event_id);
+  return jsonResponse(halaqah);
+}
+
+// ====================================================
+// 11. STUDENT / ACCESS CODE
+// ====================================================
+
+function handleGetStudents(payload, authToken) {
+  var session = requireAuth(authToken);
+  var students = readSheetObjects('03_MASTER_STUDENTS');
+
+  if (session.role === ROLES.ADMIN) return jsonResponse(students);
+
+  if (session.role === ROLES.TEACHER) {
+    if (!cleanStringGS(session.teacher_id)) return jsonError('FORBIDDEN', 'Akun Guru Anda belum terhubung dengan Master Data Guru.');
+
+    var eventId = resolveRequestedEventId(payload.eventId);
+    var halaqahIds = getTeacherAuthorizedHalaqahIds(session.teacher_id, eventId);
+    var allowedStudentIds = {};
+
+    readSheetObjects('12_EVENT_PARTICIPANTS').forEach(function(p) {
+      if (cleanStringGS(p.event_id) === eventId && halaqahIds.indexOf(cleanStringGS(p.halaqah_id)) !== -1) {
+        allowedStudentIds[cleanStringGS(p.student_id)] = true;
+      }
+    });
+
+    students = students.filter(function(s) { return Boolean(allowedStudentIds[cleanStringGS(s.student_id)]); });
+  }
+
+  return jsonResponse(students.map(function(s) {
+    var safe = Object.assign({}, s);
+    safe.access_code = '';
+    return safe;
+  }));
+}
+
+function handleSaveStudent(payload, authToken) {
+  var actor = requireRole(authToken, [ROLES.ADMIN]);
+  var student = Object.assign({}, payload.student || {});
+  if (!cleanStringGS(student.student_id)) return jsonError('VALIDATION_ERROR', 'Data siswa dan student_id wajib diisi.');
+
+  var allStudents = readSheetObjects('03_MASTER_STUDENTS');
+  var requestedCode = cleanStringGS(student.access_code);
+
+  if (requestedCode) {
+    var duplicate = allStudents.find(function(s) {
+      return cleanStringGS(s.student_id) !== cleanStringGS(student.student_id) && cleanStringGS(s.access_code).toLowerCase() === requestedCode.toLowerCase();
+    });
+    if (duplicate) return jsonError('VALIDATION_ERROR', 'Kode Akses "' + requestedCode + '" sudah digunakan oleh siswa lain (' + duplicate.full_name + ').');
+    student.access_code = requestedCode;
+  } else {
+    var existing = allStudents.find(function(s) { return cleanStringGS(s.student_id) === cleanStringGS(student.student_id); });
+    if (existing && cleanStringGS(existing.access_code)) student.access_code = existing.access_code;
+    else student.access_code = generateRandomAccessCodeGS(allStudents.map(function(s) { return s.access_code; }));
+  }
+
+  if (!student.created_at) student.created_at = nowIsoGS();
+  student.updated_at = nowIsoGS();
+  upsertObject('03_MASTER_STUDENTS', ['student_id'], student, 'student_id');
+  addAuditLog('SAVE_STUDENT', 'STUDENT', student.student_id, null, student, null, actor.user_id);
+  return jsonResponse(student);
+}
+
+function handleRegenerateAccessCode(payload, authToken) {
+  var actor = requireRole(authToken, [ROLES.ADMIN]);
+  var studentId = cleanStringGS(payload.studentId);
+  if (!studentId) return jsonError('VALIDATION_ERROR', 'studentId wajib diisi.');
+
+  var allStudents = readSheetObjects('03_MASTER_STUDENTS');
+  var student = allStudents.find(function(s) { return cleanStringGS(s.student_id) === studentId; });
+  if (!student) return jsonError('NOT_FOUND', 'Siswa tidak ditemukan.');
+
+  var newCode = generateRandomAccessCodeGS(allStudents.map(function(s) { return s.access_code; }));
+  var oldCode = student.access_code;
+  updateObject('03_MASTER_STUDENTS', 'student_id', studentId, { access_code: newCode, updated_at: nowIsoGS() });
+  addAuditLog('REGENERATE_ACCESS_CODE', 'STUDENT', studentId, { access_code: oldCode }, { access_code: newCode }, null, actor.user_id);
+  return jsonResponse({ newAccessCode: newCode });
+}
+
+function generateRandomAccessCodeGS(existingCodes) {
+  var chars = '23456789ABCDEFGHJKMNPQRSTUVWXYZ';
+  var normalizedExisting = {};
+  (existingCodes || []).forEach(function(c) { normalizedExisting[cleanStringGS(c).toUpperCase()] = true; });
+
+  var code = '';
+  do {
+    var random = '';
+    for (var i = 0; i < 6; i++) random += chars.charAt(Math.floor(Math.random() * chars.length));
+    code = 'RT-' + random;
+  } while (normalizedExisting[code]);
+  return code;
+}
+
+// ====================================================
+// 12. HALAQAH + TEACHER ASSIGNMENT
+// ====================================================
+
+function handleGetHalaqahList(payload, authToken) {
+  var session = requireAuth(authToken);
+  var eventId = resolveRequestedEventId(payload.eventId);
+  var list = readSheetObjects('10_HALAQAH');
+
+  if (eventId) list = list.filter(function(h) { return cleanStringGS(h.event_id) === eventId; });
+
+  if (session.role === ROLES.TEACHER) {
+    var allowedIds = getTeacherAuthorizedHalaqahIds(session.teacher_id, eventId);
+    list = list.filter(function(h) { return allowedIds.indexOf(cleanStringGS(h.halaqah_id)) !== -1; });
+  }
+
+  return jsonResponse(list);
+}
+
+function handleGetHalaqahTeachers(payload, authToken) {
+  var session = requireAuth(authToken);
+  var eventId = resolveRequestedEventId(payload.eventId);
+  var assignments = readSheetObjects('11_HALAQAH_TEACHERS').filter(function(ht) { return isActiveRecordGS(ht); });
+
+  if (eventId) assignments = assignments.filter(function(ht) { return cleanStringGS(ht.event_id) === eventId; });
+  if (session.role === ROLES.TEACHER) assignments = assignments.filter(function(ht) { return cleanStringGS(ht.teacher_id) === cleanStringGS(session.teacher_id); });
+
+  return jsonResponse(assignments);
+}
+
+function handleSaveHalaqahTeacher(payload, authToken) {
+  var actor = requireRole(authToken, [ROLES.ADMIN]);
+  var ht = Object.assign({}, payload.halaqahTeacher || {});
+  if (!cleanStringGS(ht.event_id) || !cleanStringGS(ht.halaqah_id) || !cleanStringGS(ht.teacher_id)) {
+    return jsonError('VALIDATION_ERROR', 'Data penugasan guru tidak lengkap.');
+  }
+
+  var allAssignments = readSheetObjects('11_HALAQAH_TEACHERS');
+  var now = nowIsoGS();
+  var matches = allAssignments.filter(function(item) {
+    return cleanStringGS(item.event_id) === cleanStringGS(ht.event_id) && cleanStringGS(item.halaqah_id) === cleanStringGS(ht.halaqah_id) && cleanStringGS(item.teacher_id) === cleanStringGS(ht.teacher_id);
+  });
+
+  var activeMatch = matches.find(function(item) { return isActiveRecordGS(item); });
+  if (activeMatch) {
+    if (cleanStringGS(ht.teacher_role) && upperGS(activeMatch.teacher_role) !== upperGS(ht.teacher_role)) {
+      updateObject('11_HALAQAH_TEACHERS', 'assignment_id', activeMatch.assignment_id, {
+        teacher_role: upperGS(ht.teacher_role),
+        updated_at: now
+      });
+      activeMatch.teacher_role = upperGS(ht.teacher_role);
+      activeMatch.updated_at = now;
+      addAuditLog('UPDATE_HALAQAH_TEACHER_ROLE', 'HALAQAH_TEACHER', activeMatch.assignment_id, null, activeMatch, null, actor.user_id, activeMatch.event_id);
+    }
+    return jsonResponse(activeMatch);
+  }
+
+  var inactiveMatch = matches[0];
+  if (inactiveMatch) {
+    var reactivated = Object.assign({}, inactiveMatch, {
+      active: true,
+      teacher_role: upperGS(ht.teacher_role || inactiveMatch.teacher_role || 'PRIMARY'),
+      updated_at: now
+    });
+    updateObject('11_HALAQAH_TEACHERS', 'assignment_id', inactiveMatch.assignment_id, {
+      active: true,
+      teacher_role: reactivated.teacher_role,
+      updated_at: now
+    });
+    addAuditLog('REACTIVATE_HALAQAH_TEACHER', 'HALAQAH_TEACHER', reactivated.assignment_id, null, reactivated, null, actor.user_id, reactivated.event_id);
+    return jsonResponse(reactivated);
+  }
+
+  var newAssignment = {
+    assignment_id: cleanStringGS(ht.assignment_id) || makeIdGS('HT_', 16),
+    event_id: cleanStringGS(ht.event_id),
+    halaqah_id: cleanStringGS(ht.halaqah_id),
+    teacher_id: cleanStringGS(ht.teacher_id),
+    teacher_role: upperGS(ht.teacher_role || 'PRIMARY'),
+    active: true,
+    created_at: now,
+    updated_at: now
+  };
+
+  upsertObject('11_HALAQAH_TEACHERS', ['assignment_id'], newAssignment, 'assignment_id');
+  addAuditLog('ASSIGN_HALAQAH_TEACHER', 'HALAQAH_TEACHER', newAssignment.assignment_id, null, newAssignment, null, actor.user_id, newAssignment.event_id);
+  return jsonResponse(newAssignment);
+}
+
+function handleDeleteHalaqahTeacher(payload, authToken) {
+  var actor = requireRole(authToken, [ROLES.ADMIN]);
+  var assignmentId = cleanStringGS(payload.assignmentId);
+  if (!assignmentId) return jsonError('VALIDATION_ERROR', 'assignmentId wajib diisi.');
+
+  var deleted = deleteRowByField('11_HALAQAH_TEACHERS', 'assignment_id', assignmentId);
+  if (!deleted) return jsonError('NOT_FOUND', 'Penugasan guru tidak ditemukan.');
+
+  addAuditLog('DELETE_HALAQAH_TEACHER', 'HALAQAH_TEACHER', assignmentId, deleted, { deleted: true, deleted_at: nowIsoGS() }, null, actor.user_id, deleted.event_id);
   return jsonResponse({
-    success: true,
-    userId: targetUserId
+    deleted: true,
+    assignmentId: assignmentId,
+    teacherId: deleted.teacher_id,
+    halaqahId: deleted.halaqah_id
   });
 }
 
-// Teacher Halaqah Data Resolver
-function handleGetMyHalaqahData(teacherId, eventId, selectedHalaqahId, userRole) {
-  if (!teacherId) {
-    return jsonResponse({ halaqah: null, students: [], sessions: [], sessionConfigs: [] });
+// ====================================================
+// 13. SESSION CONFIG READ WITH TEACHER SCOPE
+// ====================================================
+
+function handleGetSessionConfigs(payload, authToken) {
+  var session = requireAuth(authToken);
+  var eventId = resolveRequestedEventId(payload.eventId);
+  var configs = readSheetObjects('09_SESSION_CONFIG');
+
+  if (eventId) configs = configs.filter(function(sc) { return cleanStringGS(sc.event_id) === eventId; });
+
+  if (session.role === ROLES.TEACHER) {
+    var allowedHalaqahs = getTeacherAuthorizedHalaqahIds(session.teacher_id, eventId);
+    var groupIds = {};
+    readSheetObjects('10_HALAQAH').forEach(function(h) {
+      if (cleanStringGS(h.event_id) === eventId && allowedHalaqahs.indexOf(cleanStringGS(h.halaqah_id)) !== -1 && cleanStringGS(h.session_group_id)) {
+        groupIds[cleanStringGS(h.session_group_id)] = true;
+      }
+    });
+    configs = configs.filter(function(sc) { return Boolean(groupIds[cleanStringGS(sc.session_group_id)]); });
   }
 
-  var events = readSheetObjects('07_EVENTS');
-  var configs = readSheetObjects('01_APP_CONFIG');
-  var currConf = configs.find(function(c) { return c.config_key === 'current_event_id'; });
-  var activeId = eventId || (currConf ? currConf.config_value : '') || (events[0] ? events[0].event_id : '');
+  configs = configs.map(function(sc) {
+    var copy = Object.assign({}, sc);
+    copy.start_time = normalizeClockTime(sc.start_time);
+    copy.end_time = normalizeClockTime(sc.end_time);
+    return copy;
+  });
+  configs.sort(function(a, b) { return (Number(a.session_no) || 0) - (Number(b.session_no) || 0); });
+  return jsonResponse(configs);
+}
 
-  if (!activeId) {
-    return jsonResponse({ halaqah: null, students: [], sessions: [], sessionConfigs: [] });
+// ====================================================
+// 14. PARTICIPANTS + PLACEMENT
+// ====================================================
+
+function handleGetEventParticipants(payload, authToken) {
+  var session = requireAuth(authToken);
+  var eventId = resolveRequestedEventId(payload.eventId);
+  var participants = readSheetObjects('12_EVENT_PARTICIPANTS');
+
+  if (eventId) participants = participants.filter(function(p) { return cleanStringGS(p.event_id) === eventId; });
+
+  if (session.role === ROLES.TEACHER) {
+    var halaqahIds = getTeacherAuthorizedHalaqahIds(session.teacher_id, eventId);
+    participants = participants.filter(function(p) { return halaqahIds.indexOf(cleanStringGS(p.halaqah_id)) !== -1; });
   }
 
-  var halaqahList = readSheetObjects('10_HALAQAH').filter(function(h) {
-    return h.event_id === activeId && (h.active === true || String(h.active).toLowerCase() === 'true');
-  });
-  var halaqahTeachers = readSheetObjects('11_HALAQAH_TEACHERS').filter(function(ht) {
-    return ht.event_id === activeId && (ht.active === true || String(ht.active).toLowerCase() === 'true');
-  });
-  var teachers = readSheetObjects('04_MASTER_TEACHERS');
+  return jsonResponse(participants);
+}
 
-  var myAssignments = halaqahTeachers.filter(function(ht) { return ht.teacher_id === teacherId; });
-  if (myAssignments.length === 0) {
-    return jsonResponse({ halaqah: null, students: [], sessions: [], sessionConfigs: [] });
-  }
+function handleGetStudentPlacementBootstrap(payload, authToken) {
+  requireRole(authToken, [ROLES.ADMIN, ROLES.COORDINATOR]);
 
-  var targetHalaqahId = selectedHalaqahId && myAssignments.some(function(a) { return a.halaqah_id === selectedHalaqahId; })
-    ? selectedHalaqahId
-    : myAssignments[0].halaqah_id;
+  var eventObj = resolveEventObjectGS(payload.eventId);
+  var eventId = eventObj ? cleanStringGS(eventObj.event_id) : cleanStringGS(payload.eventId);
 
-  var currentHalaqah = halaqahList.find(function(h) { return h.halaqah_id === targetHalaqahId; });
-  if (!currentHalaqah) {
-    return jsonResponse({ halaqah: null, students: [], sessions: [], sessionConfigs: [] });
-  }
-
-  var teacherObj = teachers.find(function(t) { return t.teacher_id === teacherId; });
-  var allParticipants = readSheetObjects('12_EVENT_PARTICIPANTS').filter(function(p) { return p.event_id === activeId; });
-  var halaqahParticipants = allParticipants.filter(function(p) { return p.halaqah_id === currentHalaqah.halaqah_id; });
-  var studentIdsInHalaqah = {};
-  halaqahParticipants.forEach(function(p) { studentIdsInHalaqah[p.student_id] = true; });
-
-  var students = readSheetObjects('03_MASTER_STUDENTS');
-  var allAssessments = readSheetObjects('13_SESSION_ASSESSMENTS')
-    .filter(function(a) { return a.event_id === activeId && !a.is_deleted && String(a.is_deleted) !== 'true'; });
-
-  var halaqahAssessments = allAssessments.filter(function(a) {
-    return a.halaqah_id === currentHalaqah.halaqah_id || studentIdsInHalaqah[a.student_id];
-  });
-
-  var evals = readSheetObjects('14_FINAL_EVALUATIONS').filter(function(e) { return e.event_id === activeId; });
-
-  var studentMap = {};
-  students.forEach(function(s) { studentMap[s.student_id] = s; });
-
-  var evalMap = {};
-  evals.forEach(function(e) {
-    if (e.student_id) evalMap[e.student_id] = e;
-    if (e.participant_id) evalMap[e.participant_id] = e;
-  });
-
-  var studentAsmsMap = {};
-  halaqahAssessments.forEach(function(a) {
-    if (a.attendance_status === 'PRESENT') {
-      if (!studentAsmsMap[a.student_id]) studentAsmsMap[a.student_id] = [];
-      studentAsmsMap[a.student_id].push(a);
-    }
-  });
-
-  var mappedStudents = halaqahParticipants.map(function(p) {
-    var st = studentMap[p.student_id];
-    var studentEval = evalMap[p.student_id] || evalMap[p.participant_id];
-    
-    var studentAsms = studentAsmsMap[p.student_id] || [];
-    var totalLines = studentAsms.reduce(function(sum, a) { return sum + (Number(a.lines_added) || 0); }, 0);
-
+  var students = readSheetObjects('03_MASTER_STUDENTS').map(function(s) {
     return {
-      student_id: p.student_id,
-      participant_id: p.participant_id,
-      nis: st ? st.nis : '',
-      full_name: st ? st.full_name : 'Siswa',
-      access_code: (userRole === 'ADMIN' && st) ? (st.access_code || '') : '',
-      grade_class: (p.grade_snapshot || '') + ' (' + (p.class_snapshot || '') + ')',
-      targetText: 'Target: ' + (p.target_lines || 0) + ' Baris',
-      totalLinesAdded: totalLines,
-      completionStatus: studentEval ? studentEval.completion_status : 'NOT_EVALUATED'
+      student_id: s.student_id,
+      nis: s.nis,
+      full_name: s.full_name,
+      gender: s.gender,
+      grade_level: s.grade_level,
+      class_name: s.class_name,
+      active: s.active
     };
   });
 
-  var allSessionConfigs = readSheetObjects('09_SESSION_CONFIG').filter(function(sc) { return sc.event_id === activeId; });
-  var sessionConfigs = (currentHalaqah.session_group_id && String(currentHalaqah.session_group_id).trim() !== '')
-    ? allSessionConfigs.filter(function(sc) { return sc.session_group_id === currentHalaqah.session_group_id; })
-    : [];
+  var participants = readSheetObjects('12_EVENT_PARTICIPANTS').filter(function(p) { return cleanStringGS(p.event_id) === eventId; });
+  var halaqahs = readSheetObjects('10_HALAQAH').filter(function(h) {
+    return cleanStringGS(h.event_id) === eventId && isActiveRecordGS(h);
+  });
+
+  return jsonResponse({ event: eventObj, students: students, participants: participants, halaqahs: halaqahs });
+}
+
+function handleBulkRegisterAndAssignStudentsToHalaqah(payload, authToken) {
+  var actor = requireRole(authToken, [ROLES.ADMIN]);
+  var eventId = cleanStringGS(payload.eventId);
+  var studentIds = Array.isArray(payload.studentIds) ? uniqueStringsGS(payload.studentIds) : [];
+  var targetHalaqahId = cleanStringGS(payload.targetHalaqahId);
+
+  if (!eventId) return jsonError('VALIDATION_ERROR', 'eventId wajib diisi.');
+  if (studentIds.length === 0) return jsonError('VALIDATION_ERROR', 'Pilih minimal satu siswa.');
+
+  var eventObj = readSheetObjects('07_EVENTS').find(function(e) { return cleanStringGS(e.event_id) === eventId; });
+  if (!eventObj) return jsonError('NOT_FOUND', 'Kegiatan tidak ditemukan.');
+
+  var halaqahs = readSheetObjects('10_HALAQAH');
+  var targetHalaqah = targetHalaqahId ? halaqahs.find(function(h) { return cleanStringGS(h.halaqah_id) === targetHalaqahId; }) : null;
+  if (targetHalaqahId && !targetHalaqah) return jsonError('NOT_FOUND', 'Halaqah tujuan tidak ditemukan.');
+  if (targetHalaqah && cleanStringGS(targetHalaqah.event_id) !== eventId) return jsonError('VALIDATION_ERROR', 'Halaqah tujuan tidak terdaftar pada kegiatan ini.');
+
+  var allStudents = readSheetObjects('03_MASTER_STUDENTS');
+  var studentMap = {};
+  allStudents.forEach(function(s) { studentMap[cleanStringGS(s.student_id)] = s; });
+
+  var allParticipants = readSheetObjects('12_EVENT_PARTICIPANTS');
+  var participantMap = {};
+  allParticipants.forEach(function(p) {
+    if (cleanStringGS(p.event_id) === eventId) participantMap[cleanStringGS(p.student_id)] = p;
+  });
+
+  var now = nowIsoGS();
+  var toUpsert = [];
+  var createdCount = 0;
+  var updatedCount = 0;
+  var skippedRecords = [];
+
+  studentIds.forEach(function(studentId) {
+    var student = studentMap[studentId];
+    if (!student) {
+      skippedRecords.push({ studentId: studentId, reason: 'Data siswa tidak ditemukan di Master Siswa.' });
+      return;
+    }
+    if (!isActiveRecordGS(student)) {
+      skippedRecords.push({ studentId: studentId, studentName: student.full_name, reason: 'Status siswa tidak aktif di Master Siswa.' });
+      return;
+    }
+    if (targetHalaqah && cleanStringGS(targetHalaqah.gender) && cleanStringGS(student.gender) && upperGS(targetHalaqah.gender) !== upperGS(student.gender)) {
+      skippedRecords.push({
+        studentId: studentId,
+        studentName: student.full_name,
+        reason: 'Gender siswa (' + student.gender + ') tidak sesuai dengan gender halaqah (' + targetHalaqah.gender + ').'
+      });
+      return;
+    }
+
+    var existing = participantMap[studentId];
+    if (existing) {
+      toUpsert.push(Object.assign({}, existing, {
+        halaqah_id: targetHalaqahId,
+        session_group_id: targetHalaqah ? cleanStringGS(targetHalaqah.session_group_id) : cleanStringGS(existing.session_group_id),
+        updated_at: now
+      }));
+      updatedCount++;
+      return;
+    }
+
+    var created = {
+      participant_id: makeIdGS('PART_', 16),
+      event_id: eventId,
+      student_id: student.student_id,
+      class_snapshot: student.class_name || '',
+      grade_snapshot: student.grade_level || '',
+      skill_status_start: '',
+      halaqah_id: targetHalaqahId,
+      session_group_id: targetHalaqah ? cleanStringGS(targetHalaqah.session_group_id) : '',
+      baseline_surah: '',
+      baseline_ayah: '',
+      baseline_note: '',
+      baseline_date: '',
+      target_surah_start: '',
+      target_ayah_start: '',
+      target_surah_end: '',
+      target_ayah_end: '',
+      target_lines: '',
+      target_nuroniyyah_lines: '',
+      target_iqra_pages: '',
+      target_source: 'HALAQAH',
+      target_note: '',
+      assignment_note: '',
+      participant_status: 'ACTIVE',
+      created_at: now,
+      updated_at: now
+    };
+    toUpsert.push(created);
+    participantMap[studentId] = created;
+    createdCount++;
+  });
+
+  batchUpsertObjectsGS('12_EVENT_PARTICIPANTS', ['participant_id'], toUpsert, 'participant_id');
+  addAuditLog('BULK_REGISTER_ASSIGN_HALAQAH', 'PARTICIPANT', targetHalaqahId || eventId, null, {
+    createdCount: createdCount,
+    updatedCount: updatedCount,
+    skippedCount: skippedRecords.length,
+    targetHalaqahId: targetHalaqahId
+  }, null, actor.user_id, eventId);
 
   return jsonResponse({
-    halaqah: {
-      halaqah_id: currentHalaqah.halaqah_id,
-      group_name: currentHalaqah.halaqah_name,
-      teacher_name: teacherObj ? teacherObj.full_name : 'Guru Tahfidz',
-      session_group_id: currentHalaqah.session_group_id
-    },
-    students: mappedStudents,
-    sessions: halaqahAssessments,
-    sessionConfigs: sessionConfigs
+    createdCount: createdCount,
+    updatedCount: updatedCount,
+    skippedCount: skippedRecords.length,
+    skippedStudentIds: skippedRecords.map(function(r) { return r.studentId; }),
+    skippedRecords: skippedRecords
   });
 }
 
-/**
- * Resolve responsible teacher_id for a halaqah from 11_HALAQAH_TEACHERS.
- * Prefer active PRIMARY teacher. If multiple/no primary, allows explicitly selected valid teacher or falls back to first active assigned teacher.
- */
-function resolveResponsibleHalaqahTeacherId(halaqahId, eventId, preferredTeacherId) {
-  var allHts = readSheetObjects('11_HALAQAH_TEACHERS').filter(function(ht) {
-    var isMatch = ht.halaqah_id === halaqahId && (!eventId || ht.event_id === eventId);
-    var isActive = ht.active === true || String(ht.active) === 'true';
-    return isMatch && isActive;
+function handleUpdateParticipantTarget(payload, authToken) {
+  var actor = requireRole(authToken, [ROLES.ADMIN]);
+  var incoming = Object.assign({}, payload.participant || {});
+  var participantId = cleanStringGS(incoming.participant_id || payload.participantId);
+  if (!participantId) return jsonError('VALIDATION_ERROR', 'participant_id wajib diisi.');
+
+  var existing = readSheetObjects('12_EVENT_PARTICIPANTS').find(function(p) { return cleanStringGS(p.participant_id) === participantId; });
+  if (!existing) return jsonError('NOT_FOUND', 'Data peserta tidak ditemukan.');
+
+  var allowedFields = [
+    'skill_status_start',
+    'baseline_surah',
+    'baseline_ayah',
+    'baseline_note',
+    'baseline_date',
+    'target_surah_start',
+    'target_ayah_start',
+    'target_surah_end',
+    'target_ayah_end',
+    'target_lines',
+    'target_nuroniyyah_lines',
+    'target_iqra_pages',
+    'target_source',
+    'target_note',
+    'assignment_note'
+  ];
+
+  var updates = { updated_at: nowIsoGS() };
+  allowedFields.forEach(function(field) {
+    if (incoming[field] !== undefined) updates[field] = incoming[field];
   });
 
-  if (allHts.length === 0) {
-    // If halaqah has no assigned teachers in 11_HALAQAH_TEACHERS, check if preferredTeacherId is a valid Master Teacher
-    if (preferredTeacherId && String(preferredTeacherId).trim() !== '') {
-      var allMasterTeachers = readSheetObjects('04_MASTER_TEACHERS');
-      var validMaster = allMasterTeachers.find(function(t) { return t.teacher_id === preferredTeacherId; });
-      if (validMaster) return validMaster.teacher_id;
-    }
-    return '';
-  }
+  if (updates.skill_status_start !== undefined) updates.skill_status_start = sanitizeSkillStatusGS(updates.skill_status_start);
+  if (updates.target_source !== undefined) updates.target_source = upperGS(updates.target_source) === 'MANUAL' ? 'MANUAL' : 'HALAQAH';
 
-  var primaryTeachers = allHts.filter(function(ht) { return ht.teacher_role === 'PRIMARY'; });
-
-  // If there is exactly one active PRIMARY teacher and no preferred or preferred matches:
-  if (primaryTeachers.length === 1 && !preferredTeacherId) {
-    return primaryTeachers[0].teacher_id;
-  }
-
-  // If preferredTeacherId is provided, check if it's among the active teachers assigned to this halaqah
-  if (preferredTeacherId && String(preferredTeacherId).trim() !== '') {
-    var matchedAssigned = allHts.find(function(ht) { return ht.teacher_id === preferredTeacherId; });
-    if (matchedAssigned) {
-      return matchedAssigned.teacher_id;
-    }
-  }
-
-  // Otherwise fallback to primary teacher if available
-  if (primaryTeachers.length > 0) {
-    return primaryTeachers[0].teacher_id;
-  }
-
-  // Otherwise first active assigned teacher
-  return allHts[0].teacher_id;
+  updateObject('12_EVENT_PARTICIPANTS', 'participant_id', participantId, updates);
+  addAuditLog('UPDATE_BASELINE_TARGET', 'PARTICIPANT', participantId, existing, updates, null, actor.user_id, existing.event_id);
+  return jsonResponse(Object.assign({}, existing, updates));
 }
 
-// Handler for Teacher Workspace Bootstrap (Optimized Single Snapshot)
-function handleGetTeacherWorkspaceBootstrap(payload, authToken) {
-  var sess = requireRole(authToken, ['TEACHER', 'ADMIN', 'COORDINATOR']);
-  var startTime = new Date().getTime();
-  Logger.log('TEACHER WORKSPACE BOOTSTRAP START for ' + sess.user_id + ' (role: ' + sess.role + ')');
+// ====================================================
+// 15. SHARED WORKSPACE BUILDER
+// ====================================================
 
-  // 1. Resolve Event
-  var targetEventId = payload.eventId;
-  var allEvents = readSheetObjects('07_EVENTS');
-  var targetEvent = null;
-  if (targetEventId) {
-    targetEvent = allEvents.find(function(e) { return e.event_id === targetEventId; });
-  }
-  if (!targetEvent) {
-    var configs = readSheetObjects('01_APP_CONFIG');
-    var currConf = configs.find(function(c) { return c.config_key === 'current_event_id'; });
-    var activeId = currConf ? currConf.config_value : '';
-    targetEvent = allEvents.find(function(e) { return e.event_id === activeId; }) ||
-                  allEvents.find(function(e) { return e.status === 'ACTIVE'; }) ||
-                  allEvents[0] || null;
-  }
-  var resolvedEvtId = targetEvent ? targetEvent.event_id : targetEventId;
-  if (!resolvedEvtId) {
-    return jsonResponse({
-      event: null,
-      halaqah: null,
-      availableHalaqahs: [],
-      students: [],
-      sessionConfigs: [],
-      assessments: [],
-      finalEvaluations: [],
-      assignedTeachers: [],
-      serverTimestamp: new Date().toISOString()
-    });
-  }
+function buildTeacherWorkspaceDataGS(session, payload) {
+  payload = payload || {};
 
-  // 2. Read Reference Data (Single Pass)
+  var eventObj = resolveEventObjectGS(payload.eventId);
+  var eventId = eventObj ? cleanStringGS(eventObj.event_id) : cleanStringGS(payload.eventId);
+
+  var empty = {
+    event: eventObj || null,
+    halaqah: null,
+    availableHalaqahs: [],
+    students: [],
+    sessionConfigs: [],
+    assessments: [],
+    finalEvaluations: [],
+    assignedTeachers: [],
+    teacherFilterId: '',
+    serverTimestamp: nowIsoGS()
+  };
+
+  if (!eventId) return empty;
+
   var allHalaqahs = readSheetObjects('10_HALAQAH').filter(function(h) {
-    return h.event_id === resolvedEvtId && (h.active === true || String(h.active).toLowerCase() === 'true');
+    return cleanStringGS(h.event_id) === eventId && isActiveRecordGS(h);
   });
-  var allHalaqahTeachers = readSheetObjects('11_HALAQAH_TEACHERS').filter(function(ht) {
-    return ht.event_id === resolvedEvtId && (ht.active === true || String(ht.active).toLowerCase() === 'true');
+
+  var allAssignments = readSheetObjects('11_HALAQAH_TEACHERS').filter(function(ht) {
+    return cleanStringGS(ht.event_id) === eventId && isActiveRecordGS(ht);
   });
+
   var allTeachers = readSheetObjects('04_MASTER_TEACHERS');
-
   var teacherMap = {};
-  allTeachers.forEach(function(t) { teacherMap[t.teacher_id] = t; });
+  allTeachers.forEach(function(t) { teacherMap[cleanStringGS(t.teacher_id)] = t; });
 
-  // 3. Determine Resolved Teacher ID and Accessible Halaqahs
-  var resolvedTeacherId = null;
-  if (sess.role === 'TEACHER') {
-    resolvedTeacherId = sess.teacher_id || null;
-  } else {
-    // ADMIN or COORDINATOR: payload.teacherId must be used as the resolved teacher identity.
-    if (payload.teacherId && String(payload.teacherId).trim() !== '') {
-      resolvedTeacherId = String(payload.teacherId).trim();
-    } else if (sess.teacher_id && String(sess.teacher_id).trim() !== '') {
-      resolvedTeacherId = String(sess.teacher_id).trim();
-    }
+  var teacherFilterId = resolveWorkspaceTeacherFilterGS(session, payload);
+  var availableHalaqahs = allHalaqahs;
+
+  if (teacherFilterId) {
+    var allowedIds = {};
+    allAssignments.forEach(function(ht) {
+      if (cleanStringGS(ht.teacher_id) === teacherFilterId) allowedIds[cleanStringGS(ht.halaqah_id)] = true;
+    });
+    availableHalaqahs = allHalaqahs.filter(function(h) { return Boolean(allowedIds[cleanStringGS(h.halaqah_id)]); });
   }
 
-  var availableHalaqahs = [];
-  var selectedHalaqah = null;
-
-  if (resolvedTeacherId) {
-    var assignments = allHalaqahTeachers.filter(function(ht) {
-      var isTeacherMatch = ht.teacher_id === resolvedTeacherId;
-      var isEventMatch = ht.event_id === resolvedEvtId;
-      var isActive = ht.active === true || String(ht.active).toLowerCase() === 'true';
-      return isTeacherMatch && isEventMatch && isActive;
-    });
-
-    Logger.log('WORKSPACE teacherId=' + resolvedTeacherId);
-    Logger.log('WORKSPACE eventId=' + resolvedEvtId);
-    Logger.log('WORKSPACE assignments found=' + assignments.length);
-
-    var authorizedHalaqahIds = {};
-    assignments.forEach(function(ht) { authorizedHalaqahIds[ht.halaqah_id] = true; });
-
-    availableHalaqahs = allHalaqahs.filter(function(h) {
-      return authorizedHalaqahIds[h.halaqah_id];
-    });
-
-    if (availableHalaqahs.length === 0) {
-      return jsonResponse({
-        event: targetEvent,
-        halaqah: null,
-        availableHalaqahs: [],
-        students: [],
-        sessionConfigs: [],
-        assessments: [],
-        finalEvaluations: [],
-        assignedTeachers: [],
-        serverTimestamp: new Date().toISOString()
-      });
-    }
-
-    if (payload.halaqahId && authorizedHalaqahIds[payload.halaqahId]) {
-      selectedHalaqah = availableHalaqahs.find(function(h) { return h.halaqah_id === payload.halaqahId; }) || availableHalaqahs[0];
-    } else {
-      selectedHalaqah = availableHalaqahs[0];
-    }
-  } else {
-    // ADMIN or COORDINATOR without specific teacher selected: Access all halaqahs for event
-    availableHalaqahs = allHalaqahs;
-
-    if (availableHalaqahs.length === 0) {
-      return jsonResponse({
-        event: targetEvent,
-        halaqah: null,
-        availableHalaqahs: [],
-        students: [],
-        sessionConfigs: [],
-        assessments: [],
-        finalEvaluations: [],
-        assignedTeachers: [],
-        serverTimestamp: new Date().toISOString()
-      });
-    }
-
-    if (payload.halaqahId) {
-      selectedHalaqah = availableHalaqahs.find(function(h) { return h.halaqah_id === payload.halaqahId; }) || availableHalaqahs[0];
-    } else {
-      selectedHalaqah = availableHalaqahs[0];
-    }
+  if (availableHalaqahs.length === 0) {
+    empty.teacherFilterId = teacherFilterId;
+    return empty;
   }
 
-  if (!selectedHalaqah) {
-    return jsonResponse({
-      event: targetEvent,
-      halaqah: null,
-      availableHalaqahs: availableHalaqahs,
-      students: [],
-      sessionConfigs: [],
-      assessments: [],
-      finalEvaluations: [],
-      assignedTeachers: [],
-      serverTimestamp: new Date().toISOString()
-    });
-  }
+  var requestedHalaqahId = cleanStringGS(payload.halaqahId || payload.selectedHalaqahId);
+  var selectedHalaqah = availableHalaqahs.find(function(h) {
+    return cleanStringGS(h.halaqah_id) === requestedHalaqahId;
+  }) || availableHalaqahs[0];
 
-  // 4. Resolve Assigned Teachers for Selected Halaqah
-  var halaqahAssignments = allHalaqahTeachers.filter(function(ht) {
-    return ht.halaqah_id === selectedHalaqah.halaqah_id;
-  });
+  var selectedId = cleanStringGS(selectedHalaqah.halaqah_id);
+  var halaqahAssignments = allAssignments.filter(function(ht) { return cleanStringGS(ht.halaqah_id) === selectedId; });
 
   var assignedTeachers = halaqahAssignments.map(function(ht) {
-    var tObj = teacherMap[ht.teacher_id];
+    var teacher = teacherMap[cleanStringGS(ht.teacher_id)];
     return {
-      teacher_id: ht.teacher_id,
-      full_name: tObj ? tObj.full_name : 'Guru Tahfidz',
-      short_name: tObj ? (tObj.short_name || '') : '',
-      teacher_role: ht.teacher_role || 'PRIMARY'
+      teacher_id: cleanStringGS(ht.teacher_id),
+      full_name: teacher ? teacher.full_name : 'Guru Tahfidz',
+      short_name: teacher ? teacher.short_name || '' : '',
+      teacher_role: upperGS(ht.teacher_role || 'PRIMARY')
     };
   });
 
-  var primaryAssignment = halaqahAssignments.find(function(ht) { return ht.teacher_role === 'PRIMARY'; }) || halaqahAssignments[0];
-  var primaryTeacherObj = primaryAssignment ? teacherMap[primaryAssignment.teacher_id] : null;
+  var primaryAssignment = halaqahAssignments.find(function(ht) { return upperGS(ht.teacher_role) === 'PRIMARY'; }) || halaqahAssignments[0] || null;
+  var primaryTeacher = primaryAssignment ? teacherMap[cleanStringGS(primaryAssignment.teacher_id)] : null;
+  var effectiveHalaqahTarget = getEffectiveParticipantTargetsGS(null, selectedHalaqah);
 
   var halaqahSummary = {
     halaqah_id: selectedHalaqah.halaqah_id,
-    event_id: resolvedEvtId,
+    event_id: eventId,
     halaqah_name: selectedHalaqah.halaqah_name,
     group_name: selectedHalaqah.halaqah_name,
-    teacher_name: primaryTeacherObj ? primaryTeacherObj.full_name : (assignedTeachers.length > 0 ? assignedTeachers[0].full_name : 'Belum Ditugaskan'),
-    gender: selectedHalaqah.gender || 'IKHWAN',
+    teacher_name: primaryTeacher ? primaryTeacher.full_name : (assignedTeachers.length ? assignedTeachers[0].full_name : 'Belum Ditugaskan'),
+    gender: selectedHalaqah.gender || '',
     grade_group: selectedHalaqah.grade_group || '',
     session_group_id: selectedHalaqah.session_group_id || '',
     location: selectedHalaqah.location || '',
+    target_ziyadah_lines: effectiveHalaqahTarget.ziyadahLines !== null ? effectiveHalaqahTarget.ziyadahLines : undefined,
+    target_nuroniyyah_lines: effectiveHalaqahTarget.nuroniyyahLines !== null ? effectiveHalaqahTarget.nuroniyyahLines : undefined,
+    target_iqra_pages: toNumberOrUndefinedGS(selectedHalaqah.target_iqra_pages),
     active: true
   };
 
-  // 5. Load Participants for Selected Halaqah ONLY
-  var allParticipants = readSheetObjects('12_EVENT_PARTICIPANTS');
-  var targetParticipants = allParticipants.filter(function(p) {
-    return p.event_id === resolvedEvtId && p.halaqah_id === selectedHalaqah.halaqah_id;
+  var participants = readSheetObjects('12_EVENT_PARTICIPANTS').filter(function(p) {
+    return cleanStringGS(p.event_id) === eventId && cleanStringGS(p.halaqah_id) === selectedId;
   });
 
-  var studentIdMap = {};
-  var participantIdMap = {};
-  targetParticipants.forEach(function(p) {
-    studentIdMap[p.student_id] = true;
-    participantIdMap[p.participant_id] = true;
+  var studentIdSet = {};
+  var participantIdSet = {};
+  participants.forEach(function(p) {
+    studentIdSet[cleanStringGS(p.student_id)] = true;
+    participantIdSet[cleanStringGS(p.participant_id)] = true;
   });
 
-  // 6. Load Master Students ONLY for accessible participants in this halaqah (Do NOT load all Master Students)
-  var allStudents = readSheetObjects('03_MASTER_STUDENTS');
   var studentMap = {};
-  allStudents.forEach(function(s) {
-    if (studentIdMap[s.student_id]) {
-      studentMap[s.student_id] = s;
-    }
+  readSheetObjects('03_MASTER_STUDENTS').forEach(function(s) {
+    var sid = cleanStringGS(s.student_id);
+    if (studentIdSet[sid]) studentMap[sid] = s;
   });
 
-  // 7. Load Assessments for target halaqah / students
-  var rawAssessments = readSheetObjects('13_SESSION_ASSESSMENTS');
-  var targetAssessments = rawAssessments.filter(function(a) {
-    var notDeleted = !a.is_deleted && String(a.is_deleted) !== 'true';
-    var isEvt = a.event_id === resolvedEvtId;
-    var isInHalaqah = a.halaqah_id === selectedHalaqah.halaqah_id || studentIdMap[a.student_id];
-    return notDeleted && isEvt && isInHalaqah;
+  var assessments = readSheetObjects('13_SESSION_ASSESSMENTS').filter(function(a) {
+    return !isDeletedRecordGS(a) && cleanStringGS(a.event_id) === eventId && (
+      cleanStringGS(a.halaqah_id) === selectedId || Boolean(studentIdSet[cleanStringGS(a.student_id)])
+    );
   });
 
-  var studentAsmsMap = {};
-  targetAssessments.forEach(function(a) {
-    if (a.attendance_status === 'PRESENT') {
-      if (!studentAsmsMap[a.student_id]) studentAsmsMap[a.student_id] = [];
-      studentAsmsMap[a.student_id].push(a);
-    }
+  var assessmentsByStudent = {};
+  assessments.forEach(function(a) {
+    var sid = cleanStringGS(a.student_id);
+    if (!assessmentsByStudent[sid]) assessmentsByStudent[sid] = [];
+    assessmentsByStudent[sid].push(a);
   });
 
-  // 8. Load Final Evaluations for target participants / students
-  var rawEvaluations = readSheetObjects('14_FINAL_EVALUATIONS');
-  var targetEvaluations = rawEvaluations.filter(function(e) {
-    var isEvt = e.event_id === resolvedEvtId;
-    var matchesStudent = studentIdMap[e.student_id] || participantIdMap[e.participant_id];
-    return isEvt && matchesStudent;
+  var finalEvaluations = readSheetObjects('14_FINAL_EVALUATIONS').filter(function(e) {
+    return cleanStringGS(e.event_id) === eventId && (
+      Boolean(studentIdSet[cleanStringGS(e.student_id)]) || Boolean(participantIdSet[cleanStringGS(e.participant_id)])
+    );
   });
 
-  var evalMap = {};
-  targetEvaluations.forEach(function(e) {
-    if (e.participant_id) evalMap[e.participant_id] = e;
-    if (e.student_id) evalMap[e.student_id] = e;
+  var evaluationMap = {};
+  finalEvaluations.forEach(function(e) {
+    if (cleanStringGS(e.participant_id)) evaluationMap[cleanStringGS(e.participant_id)] = e;
+    if (cleanStringGS(e.student_id)) evaluationMap[cleanStringGS(e.student_id)] = e;
   });
 
-  // 9. Load Session Configs
-  var allSessionConfigs = readSheetObjects('09_SESSION_CONFIG').filter(function(sc) {
-    return sc.event_id === resolvedEvtId;
-  });
-  var targetSessionConfigs = (selectedHalaqah.session_group_id && String(selectedHalaqah.session_group_id).trim() !== '')
-    ? allSessionConfigs.filter(function(sc) { return sc.session_group_id === selectedHalaqah.session_group_id; })
-    : allSessionConfigs;
+  var sessionConfigs = readSheetObjects('09_SESSION_CONFIG').filter(function(sc) { return cleanStringGS(sc.event_id) === eventId; });
+  var sessionGroupId = cleanStringGS(selectedHalaqah.session_group_id);
+  if (sessionGroupId) sessionConfigs = sessionConfigs.filter(function(sc) { return cleanStringGS(sc.session_group_id) === sessionGroupId; });
+  sessionConfigs.sort(function(a, b) { return (Number(a.session_no) || 0) - (Number(b.session_no) || 0); });
 
-  // 10. Map Students with Target & Progress
-  var mappedStudents = targetParticipants.map(function(p) {
-    var st = studentMap[p.student_id];
-    var studentEval = evalMap[p.participant_id] || evalMap[p.student_id];
-    var studentAsms = studentAsmsMap[p.student_id] || [];
-    var totalLines = studentAsms.reduce(function(sum, a) { return sum + (Number(a.lines_added) || 0); }, 0);
+  var mappedStudents = participants.map(function(p) {
+    var sid = cleanStringGS(p.student_id);
+    var student = studentMap[sid];
+    var evaluation = evaluationMap[cleanStringGS(p.participant_id)] || evaluationMap[sid] || null;
+    var progress = summarizeAssessmentsByModeGS(assessmentsByStudent[sid] || []);
+    var effectiveTarget = getEffectiveParticipantTargetsGS(p, selectedHalaqah);
 
     return {
       student_id: p.student_id,
       participant_id: p.participant_id,
-      nis: st ? st.nis : '',
-      full_name: st ? st.full_name : 'Siswa',
-      access_code: (sess.role === 'ADMIN' && st) ? (st.access_code || '') : '',
+      nis: student ? student.nis : '',
+      full_name: student ? student.full_name : 'Siswa',
+      access_code: session.role === ROLES.ADMIN && student ? student.access_code || '' : '',
       grade_snapshot: p.grade_snapshot || '',
       class_snapshot: p.class_snapshot || '',
       grade_class: (p.grade_snapshot || '') + ' (' + (p.class_snapshot || '') + ')',
-      gender: st ? st.gender : (selectedHalaqah.gender || 'IKHWAN'),
-      skill_status_start: p.skill_status_start || 'NON_BBL',
-      baseline_surah: p.baseline_surah != null && p.baseline_surah !== '' ? Number(p.baseline_surah) : undefined,
-      baseline_ayah: p.baseline_ayah != null && p.baseline_ayah !== '' ? Number(p.baseline_ayah) : undefined,
-      target_surah_start: p.target_surah_start != null && p.target_surah_start !== '' ? Number(p.target_surah_start) : undefined,
-      target_ayah_start: p.target_ayah_start != null && p.target_ayah_start !== '' ? Number(p.target_ayah_start) : undefined,
-      target_surah_end: p.target_surah_end != null && p.target_surah_end !== '' ? Number(p.target_surah_end) : undefined,
-      target_ayah_end: p.target_ayah_end != null && p.target_ayah_end !== '' ? Number(p.target_ayah_end) : undefined,
-      target_lines: p.target_lines != null && p.target_lines !== '' ? Number(p.target_lines) : 0,
-      targetText: 'Target: ' + (p.target_lines || 0) + ' Baris',
-      totalLinesAdded: totalLines,
-      completionStatus: studentEval ? studentEval.completion_status : 'NOT_EVALUATED',
+      gender: student ? student.gender : selectedHalaqah.gender || '',
+      skill_status_start: p.skill_status_start
+        ? String(p.skill_status_start).toUpperCase().trim()
+        : '',
+      baseline_surah: toNumberOrUndefinedGS(p.baseline_surah),
+      baseline_ayah: toNumberOrUndefinedGS(p.baseline_ayah),
+      target_surah_start: toNumberOrUndefinedGS(p.target_surah_start),
+      target_ayah_start: toNumberOrUndefinedGS(p.target_ayah_start),
+      target_surah_end: toNumberOrUndefinedGS(p.target_surah_end),
+      target_ayah_end: toNumberOrUndefinedGS(p.target_ayah_end),
+      target_lines: toNumberOrUndefinedGS(p.target_lines),
+      target_nuroniyyah_lines: toNumberOrUndefinedGS(p.target_nuroniyyah_lines),
+      target_iqra_pages: toNumberOrUndefinedGS(p.target_iqra_pages),
+      effective_target_ziyadah_lines: effectiveTarget.ziyadahLines !== null ? effectiveTarget.ziyadahLines : undefined,
+      effective_target_nuroniyyah_lines: effectiveTarget.nuroniyyahLines !== null ? effectiveTarget.nuroniyyahLines : undefined,
+      target_source: upperGS(p.target_source) === 'MANUAL' ? 'MANUAL' : 'HALAQAH',
+      targetText: formatParticipantTargetGS(p, selectedHalaqah),
+      totalLinesAdded: progress.ziyadahLines + progress.nuroniyyahLines,
+      totalZiyadahLinesAdded: progress.ziyadahLines,
+      totalNuroniyyahLinesAdded: progress.nuroniyyahLines,
+      completionStatus: evaluation ? evaluation.completion_status : 'NOT_EVALUATED',
       session_group_id: p.session_group_id || selectedHalaqah.session_group_id || ''
     };
   });
 
-  var totalDuration = new Date().getTime() - startTime;
-  Logger.log('TEACHER WORKSPACE BOOTSTRAP COMPLETE in ' + totalDuration + ' ms');
-
-  return jsonResponse({
-    event: targetEvent,
+  return {
+    event: eventObj,
     halaqah: halaqahSummary,
     availableHalaqahs: availableHalaqahs,
     students: mappedStudents,
-    sessionConfigs: targetSessionConfigs,
-    assessments: targetAssessments,
-    finalEvaluations: targetEvaluations,
+    sessionConfigs: sessionConfigs,
+    assessments: assessments,
+    finalEvaluations: finalEvaluations,
     assignedTeachers: assignedTeachers,
-    serverTimestamp: new Date().toISOString()
-  });
+    teacherFilterId: teacherFilterId,
+    serverTimestamp: nowIsoGS()
+  };
 }
 
-/**
- * Handle bulk save attendance for multiple students for a specific SessionConfig.
- * Preserves Quran progress data for PRESENT if already exists.
- * Marks assessment_status = PENDING for PRESENT without progress, COMPLETED for others.
- */
-function handleBulkSaveSessionAttendance(payload, authToken) {
-  var sess = requireRole(authToken, ['TEACHER', 'ADMIN', 'COORDINATOR']);
-  var sessionConfigId = payload.sessionConfigId;
-  var studentIds = payload.studentIds || [];
-  var rawStatus = payload.attendanceStatus || payload.status || '';
-  var attendanceStatus = String(rawStatus).toUpperCase().trim();
+function handleGetTeacherWorkspaceBootstrap(payload, authToken) {
+  var session = requireRole(authToken, [ROLES.TEACHER, ROLES.ADMIN, ROLES.COORDINATOR]);
+  return jsonResponse(buildTeacherWorkspaceDataGS(session, payload));
+}
 
-  if (!sessionConfigId) {
-    return jsonError('VALIDATION_ERROR', 'sessionConfigId wajib diisi.');
-  }
-  if (!Array.isArray(studentIds) || studentIds.length === 0) {
-    return jsonError('VALIDATION_ERROR', 'Pilih minimal satu siswa untuk mengisi presensi.');
-  }
-
-  var allowedStatuses = ['PRESENT', 'SICK', 'PERMISSION', 'ABSENT'];
-  if (allowedStatuses.indexOf(attendanceStatus) === -1) {
-    return jsonError('VALIDATION_ERROR', 'Status presensi "' + attendanceStatus + '" tidak valid. Pilihan: PRESENT, SICK, PERMISSION, ABSENT.');
-  }
-
-  var allSessionConfigs = readSheetObjects('09_SESSION_CONFIG');
-  var sConfig = allSessionConfigs.find(function(sc) { return sc.session_config_id === sessionConfigId; });
-  if (!sConfig) {
-    return jsonError('NOT_FOUND', 'Konfigurasi sesi tidak ditemukan.');
-  }
-
-  var eventId = sConfig.event_id;
-  var allParticipants = readSheetObjects('12_EVENT_PARTICIPANTS').filter(function(p) { return p.event_id === eventId; });
-
-  var teacherHalaqahIds = null;
-  if (sess.role === 'TEACHER') {
-    if (!sess.teacher_id) {
-      return jsonError('FORBIDDEN', 'Akun Guru Anda tidak memiliki ID Guru yang terhubung.');
-    }
-    teacherHalaqahIds = getTeacherAuthorizedHalaqahIds(sess.teacher_id, eventId);
-  }
-
-  var allAssessments = readSheetObjects('13_SESSION_ASSESSMENTS');
-  var nowIso = new Date().toISOString();
-  var updatedCount = 0;
-  var updatedAssessments = [];
-
-  studentIds.forEach(function(sid) {
-    var participant = allParticipants.find(function(p) { return p.student_id === sid; });
-    if (!participant) return;
-
-    if (sess.role === 'TEACHER' && teacherHalaqahIds && teacherHalaqahIds.indexOf(participant.halaqah_id) === -1) {
-      return; // Unauthorized halaqah for this teacher
-    }
-
-    var existingAsm = allAssessments.find(function(a) {
-      var notDeleted = !a.is_deleted && String(a.is_deleted) !== 'true';
-      return notDeleted &&
-        a.event_id === eventId &&
-        a.participant_id === participant.participant_id &&
-        a.session_config_id === sessionConfigId;
-    });
-
-    var teacherIdToUse = sess.role === 'TEACHER'
-      ? sess.teacher_id
-      : (resolveResponsibleHalaqahTeacherId(participant.halaqah_id, eventId, sess.teacher_id) || sess.teacher_id || sess.user_id);
-
-    var isPresent = attendanceStatus === 'PRESENT';
-
-    if (existingAsm) {
-      var asm = Object.assign({}, existingAsm);
-      asm.attendance_status = attendanceStatus;
-      asm.event_day_id = sConfig.event_day_id;
-      asm.session_no = sConfig.session_no;
-      asm.halaqah_id = participant.halaqah_id;
-      asm.student_id = participant.student_id;
-      asm.teacher_id = asm.teacher_id || teacherIdToUse;
-      asm.updated_at = nowIso;
-      asm.is_deleted = 'FALSE';
-
-      if (isPresent) {
-        var hasQuran = asm.surah_start != null && asm.surah_start !== '' && asm.lines_added != null && asm.lines_added !== '';
-        var hasIqra = asm.iqra_level != null && asm.iqra_level !== '' && asm.iqra_page_start != null && asm.iqra_page_start !== '';
-        asm.assessment_status = (hasQuran || hasIqra) ? 'COMPLETED' : 'PENDING';
-      } else {
-        asm.assessment_status = 'COMPLETED';
-        asm.surah_start = '';
-        asm.ayah_start = '';
-        asm.surah_end = '';
-        asm.ayah_end = '';
-        asm.lines_added = '';
-        asm.iqra_level = '';
-        asm.iqra_page_start = '';
-        asm.iqra_page_end = '';
-      }
-
-      upsertObject('13_SESSION_ASSESSMENTS', ['event_id', 'participant_id', 'session_config_id'], asm, 'assessment_id');
-      updatedAssessments.push(asm);
-      updatedCount++;
-    } else {
-      var newAsmId = 'ASM_' + Utilities.getUuid().replace(/-/g, '').substring(0, 16);
-      var newAsm = {
-        assessment_id: newAsmId,
-        event_id: eventId,
-        event_day_id: sConfig.event_day_id,
-        session_config_id: sConfig.session_config_id,
-        participant_id: participant.participant_id,
-        student_id: participant.student_id,
-        halaqah_id: participant.halaqah_id,
-        session_no: sConfig.session_no,
-        attendance_status: attendanceStatus,
-        assessment_status: isPresent ? 'PENDING' : 'COMPLETED',
-        assessment_mode: '',
-        surah_start: '',
-        ayah_start: '',
-        surah_end: '',
-        ayah_end: '',
-        lines_added: '',
-        iqra_level: '',
-        iqra_page_start: '',
-        iqra_page_end: '',
-        session_note: '',
-        teacher_id: teacherIdToUse,
-        created_at: nowIso,
-        updated_at: nowIso,
-        is_deleted: 'FALSE',
-        deleted_at: '',
-        deleted_by: ''
-      };
-
-      upsertObject('13_SESSION_ASSESSMENTS', ['event_id', 'participant_id', 'session_config_id'], newAsm, 'assessment_id');
-      updatedAssessments.push(newAsm);
-      updatedCount++;
-    }
-  });
-
-  addAuditLog(
-    'BULK_ATTENDANCE',
-    'SESSION_ASSESSMENT',
-    sessionConfigId,
-    null,
-    { sessionConfigId: sessionConfigId, studentCount: updatedCount, status: attendanceStatus },
-    'Presensi massal ' + updatedCount + ' siswa (' + attendanceStatus + ')',
-    sess.user_id,
-    eventId
-  );
+function handleGetMyHalaqahData(payload, authToken) {
+  var session = requireRole(authToken, [ROLES.TEACHER, ROLES.ADMIN, ROLES.COORDINATOR]);
+  var data = buildTeacherWorkspaceDataGS(session, payload);
 
   return jsonResponse({
-    success: true,
-    updatedCount: updatedCount,
-    updatedAssessments: updatedAssessments
+    halaqah: data.halaqah,
+    students: data.students,
+    sessions: data.assessments,
+    assessments: data.assessments,
+    sessionConfigs: data.sessionConfigs,
+    availableHalaqahs: data.availableHalaqahs,
+    finalEvaluations: data.finalEvaluations,
+    assignedTeachers: data.assignedTeachers,
+    teacherFilterId: data.teacherFilterId,
+    event: data.event,
+    serverTimestamp: data.serverTimestamp
   });
 }
 
-// Server-Side Admin Overview Handler
-function handleGetAdminOverview(eventId, authToken) {
-  var sess = requireRole(authToken, ['ADMIN', 'COORDINATOR']);
-  var events = readSheetObjects('07_EVENTS');
-  var configs = readSheetObjects('01_APP_CONFIG');
-  var currConf = configs.find(function(c) { return c.config_key === 'current_event_id'; });
-  var activeId = eventId || (currConf ? currConf.config_value : '') || (events[0] ? events[0].event_id : '');
+// ====================================================
+// 16. ASSESSMENT READS
+// ====================================================
 
-  var activeEvt = events.find(function(e) { return e.event_id === activeId; }) || events[0] || null;
-  if (!activeEvt) {
+function handleGetSessionAssessments(payload, authToken) {
+  var session = requireRole(authToken, [ROLES.TEACHER, ROLES.ADMIN, ROLES.COORDINATOR]);
+  var eventId = resolveRequestedEventId(payload.eventId);
+  var assessments = readSheetObjects('13_SESSION_ASSESSMENTS').filter(function(a) { return !isDeletedRecordGS(a); });
+
+  if (eventId) assessments = assessments.filter(function(a) { return cleanStringGS(a.event_id) === eventId; });
+
+  if (session.role === ROLES.TEACHER) {
+    var allowedHalaqahs = getTeacherAuthorizedHalaqahIds(session.teacher_id, eventId);
+    assessments = assessments.filter(function(a) { return allowedHalaqahs.indexOf(cleanStringGS(a.halaqah_id)) !== -1; });
+  }
+
+  return jsonResponse(assessments);
+}
+
+function handleGetFinalEvaluations(payload, authToken) {
+  var session = requireRole(authToken, [ROLES.TEACHER, ROLES.ADMIN, ROLES.COORDINATOR]);
+  var eventId = resolveRequestedEventId(payload.eventId);
+  var evaluations = readSheetObjects('14_FINAL_EVALUATIONS');
+
+  if (eventId) evaluations = evaluations.filter(function(e) { return cleanStringGS(e.event_id) === eventId; });
+
+  if (session.role === ROLES.TEACHER) {
+    var halaqahIds = getTeacherAuthorizedHalaqahIds(session.teacher_id, eventId);
+    var allowed = {};
+    readSheetObjects('12_EVENT_PARTICIPANTS').forEach(function(p) {
+      if (cleanStringGS(p.event_id) === eventId && halaqahIds.indexOf(cleanStringGS(p.halaqah_id)) !== -1) {
+        allowed[cleanStringGS(p.participant_id)] = true;
+        allowed[cleanStringGS(p.student_id)] = true;
+      }
+    });
+
+    evaluations = evaluations.filter(function(e) {
+      return Boolean(allowed[cleanStringGS(e.participant_id)]) || Boolean(allowed[cleanStringGS(e.student_id)]);
+    });
+  }
+
+  return jsonResponse(evaluations);
+}
+
+// ====================================================
+// 17. ASSESSMENT WRITES
+// ====================================================
+
+function handleSaveSessionAssessment(payload, authToken) {
+  var actor = requireRole(authToken, [ROLES.TEACHER, ROLES.ADMIN]);
+  var assessment = Object.assign({}, payload.assessment || {});
+
+  if (!cleanStringGS(assessment.participant_id)) return jsonError('VALIDATION_ERROR', 'participant_id wajib diisi.');
+
+  var participant = readSheetObjects('12_EVENT_PARTICIPANTS').find(function(p) {
+    return cleanStringGS(p.participant_id) === cleanStringGS(assessment.participant_id);
+  });
+  if (!participant) return jsonError('NOT_FOUND', 'Data peserta tidak ditemukan.');
+
+  assessment.student_id = participant.student_id;
+  assessment.halaqah_id = participant.halaqah_id;
+  assessment.event_id = participant.event_id;
+
+  if (actor.role === ROLES.TEACHER) {
+    var allowedHalaqahs = getTeacherAuthorizedHalaqahIds(actor.teacher_id, participant.event_id);
+    if (allowedHalaqahs.indexOf(cleanStringGS(participant.halaqah_id)) === -1) {
+      return jsonError('FORBIDDEN', 'Anda tidak berwenang mengedit penilaian siswa ini.');
+    }
+    assessment.teacher_id = actor.teacher_id;
+  } else {
+    var preferredTeacherId = cleanStringGS(payload.teacherId) || cleanStringGS(assessment.teacher_id);
+    var responsibleTeacherId = resolveResponsibleHalaqahTeacherId(participant.halaqah_id, participant.event_id, preferredTeacherId);
+    if (!responsibleTeacherId) return jsonError('VALIDATION_ERROR', 'Tidak ada guru penanggung jawab yang aktif untuk halaqah ini.');
+    assessment.teacher_id = responsibleTeacherId;
+  }
+
+  var sessionConfigId = cleanStringGS(assessment.session_config_id);
+  if (!sessionConfigId) return jsonError('VALIDATION_ERROR', 'session_config_id wajib diisi.');
+
+  var sessionConfig = readSheetObjects('09_SESSION_CONFIG').find(function(sc) {
+    return cleanStringGS(sc.session_config_id) === sessionConfigId;
+  });
+  if (!sessionConfig) return jsonError('NOT_FOUND', 'Konfigurasi sesi tidak ditemukan.');
+  if (cleanStringGS(sessionConfig.event_id) !== cleanStringGS(participant.event_id)) {
+    return jsonError('VALIDATION_ERROR', 'Sesi penilaian tidak sesuai dengan event siswa.');
+  }
+
+  var participantGroupId = cleanStringGS(participant.session_group_id);
+  if (participantGroupId && cleanStringGS(sessionConfig.session_group_id) !== participantGroupId) {
+    return jsonError('VALIDATION_ERROR', 'Sesi penilaian tidak sesuai dengan kelompok sesi siswa.');
+  }
+
+  assessment.event_day_id = sessionConfig.event_day_id;
+  assessment.session_no = sessionConfig.session_no;
+
+  var attendance = upperGS(assessment.attendance_status || 'UNASSESSED');
+  if (ATTENDANCE_STATUSES.indexOf(attendance) === -1) {
+    return jsonError('VALIDATION_ERROR', 'Status kehadiran "' + assessment.attendance_status + '" tidak valid.');
+  }
+  assessment.attendance_status = attendance;
+
+  if (attendance === 'PRESENT') {
+    var requestedRawMode = upperGS(assessment.assessment_mode || defaultAssessmentModeForParticipantGS(participant) || ASSESSMENT_MODES.ZIYADAH);
+    if ([ASSESSMENT_MODES.ZIYADAH, ASSESSMENT_MODES.NURONIYYAH, ASSESSMENT_MODES.IQRA].indexOf(requestedRawMode) === -1) {
+      return jsonError('VALIDATION_ERROR', 'Mode penilaian "' + requestedRawMode + '" tidak valid.');
+    }
+
+    if (requestedRawMode === ASSESSMENT_MODES.NURONIYYAH) {
+      if (!cleanStringGS(assessment.nuroniyyah_dars) || !hasValueGS(assessment.lines_added)) {
+        return jsonError('VALIDATION_ERROR', 'Pada mode Nuroniyyah, Ad-Dars dan jumlah penambahan baris wajib diisi.');
+      }
+
+      var nuroniyyahLines = Number(assessment.lines_added);
+      if (!isFinite(nuroniyyahLines) || isNaN(nuroniyyahLines) || nuroniyyahLines < 0) {
+        return jsonError('VALIDATION_ERROR', 'Jumlah baris Nuroniyyah harus berupa angka 0 atau lebih.');
+      }
+
+      assessment.assessment_mode = ASSESSMENT_MODES.NURONIYYAH;
+      assessment.nuroniyyah_dars = cleanStringGS(assessment.nuroniyyah_dars);
+      assessment.lines_added = nuroniyyahLines;
+      clearQuranProgressFieldsGS(assessment);
+      clearLegacyIqraFieldsGS(assessment);
+      assessment.assessment_status = 'COMPLETED';
+    } else if (requestedRawMode === ASSESSMENT_MODES.IQRA) {
+      if (!hasValueGS(assessment.iqra_level) || !hasValueGS(assessment.iqra_page_start)) {
+        return jsonError('VALIDATION_ERROR', 'Data Iqra legacy belum lengkap.');
+      }
+
+      assessment.assessment_mode = ASSESSMENT_MODES.IQRA;
+      assessment.lines_added = hasValueGS(assessment.lines_added) ? Number(assessment.lines_added) : 0;
+      clearQuranProgressFieldsGS(assessment);
+      clearNuroniyyahProgressFieldsGS(assessment);
+      assessment.assessment_status = 'COMPLETED';
+    } else {
+      if (!hasValueGS(assessment.surah_start) || !hasValueGS(assessment.ayah_start) || !hasValueGS(assessment.surah_end) || !hasValueGS(assessment.ayah_end) || !hasValueGS(assessment.lines_added)) {
+        return jsonError('VALIDATION_ERROR', 'Pada mode Hafalan Al-Qur\'an, surah/ayat awal & akhir serta jumlah baris wajib diisi.');
+      }
+
+      var quranFields = ['surah_start', 'ayah_start', 'surah_end', 'ayah_end', 'lines_added'];
+      for (var i = 0; i < quranFields.length; i++) {
+        var numberValue = Number(assessment[quranFields[i]]);
+        if (!isFinite(numberValue) || isNaN(numberValue) || numberValue < 0) {
+          return jsonError('VALIDATION_ERROR', 'Data Hafalan Al-Qur\'an mengandung angka yang tidak valid.');
+        }
+        assessment[quranFields[i]] = numberValue;
+      }
+
+      assessment.assessment_mode = ASSESSMENT_MODES.ZIYADAH;
+      clearNuroniyyahProgressFieldsGS(assessment);
+      clearLegacyIqraFieldsGS(assessment);
+      assessment.assessment_status = 'COMPLETED';
+    }
+  } else if (attendance === 'UNASSESSED') {
+    assessment.assessment_status = 'PENDING';
+    clearAllProgressFieldsGS(assessment);
+  } else {
+    assessment.assessment_status = 'COMPLETED';
+    clearAllProgressFieldsGS(assessment);
+  }
+
+  assessment.updated_at = nowIsoGS();
+  if (!assessment.created_at) assessment.created_at = nowIsoGS();
+  if (!cleanStringGS(assessment.assessment_id)) assessment.assessment_id = makeIdGS('ASM_', 16);
+  assessment.is_deleted = false;
+  assessment.deleted_at = '';
+  assessment.deleted_by = '';
+
+  var status = upsertObject('13_SESSION_ASSESSMENTS', ['event_id', 'participant_id', 'session_config_id'], assessment, 'assessment_id');
+  addAuditLog(status === 'INSERTED' ? 'CREATE_ASSESSMENT' : 'UPDATE_ASSESSMENT', 'SESSION_ASSESSMENT', assessment.assessment_id, null, assessment, null, actor.user_id, assessment.event_id);
+  return jsonResponse(assessment);
+}
+
+function handleBulkSaveSessionAttendance(payload, authToken) {
+  var actor = requireRole(authToken, [ROLES.TEACHER, ROLES.ADMIN]);
+  var sessionConfigId = cleanStringGS(payload.sessionConfigId);
+  var studentIds = Array.isArray(payload.studentIds) ? uniqueStringsGS(payload.studentIds) : [];
+  var attendance = upperGS(payload.attendanceStatus || payload.status);
+
+  if (!sessionConfigId) return jsonError('VALIDATION_ERROR', 'sessionConfigId wajib diisi.');
+  if (studentIds.length === 0) return jsonError('VALIDATION_ERROR', 'Pilih minimal satu siswa.');
+  if (['PRESENT', 'SICK', 'PERMISSION', 'ABSENT'].indexOf(attendance) === -1) return jsonError('VALIDATION_ERROR', 'Status presensi tidak valid.');
+
+  var sessionConfig = readSheetObjects('09_SESSION_CONFIG').find(function(sc) {
+    return cleanStringGS(sc.session_config_id) === sessionConfigId;
+  });
+  if (!sessionConfig) return jsonError('NOT_FOUND', 'Konfigurasi sesi tidak ditemukan.');
+
+  var eventId = cleanStringGS(sessionConfig.event_id);
+  var participants = readSheetObjects('12_EVENT_PARTICIPANTS').filter(function(p) { return cleanStringGS(p.event_id) === eventId; });
+  var participantByStudent = {};
+  participants.forEach(function(p) { participantByStudent[cleanStringGS(p.student_id)] = p; });
+
+  var teacherHalaqahIds = actor.role === ROLES.TEACHER ? getTeacherAuthorizedHalaqahIds(actor.teacher_id, eventId) : null;
+
+  var existingAssessments = readSheetObjects('13_SESSION_ASSESSMENTS');
+  var existingByKey = {};
+  existingAssessments.forEach(function(a) {
+    if (isDeletedRecordGS(a)) return;
+    var key = cleanStringGS(a.event_id) + '|||' + cleanStringGS(a.participant_id) + '|||' + cleanStringGS(a.session_config_id);
+    existingByKey[key] = a;
+  });
+
+  var now = nowIsoGS();
+  var toUpsert = [];
+  var skipped = [];
+
+  studentIds.forEach(function(studentId) {
+    var participant = participantByStudent[studentId];
+    if (!participant) {
+      skipped.push({ studentId: studentId, reason: 'Siswa tidak terdaftar pada event ini.' });
+      return;
+    }
+
+    if (actor.role === ROLES.TEACHER && teacherHalaqahIds.indexOf(cleanStringGS(participant.halaqah_id)) === -1) {
+      skipped.push({ studentId: studentId, reason: 'Guru tidak memiliki akses ke halaqah siswa.' });
+      return;
+    }
+
+    var key = eventId + '|||' + cleanStringGS(participant.participant_id) + '|||' + sessionConfigId;
+    var existing = existingByKey[key];
+    var assessment = existing ? Object.assign({}, existing) : {
+      assessment_id: makeIdGS('ASM_', 16),
+      event_id: eventId,
+      participant_id: participant.participant_id,
+      student_id: participant.student_id,
+      halaqah_id: participant.halaqah_id,
+      session_config_id: sessionConfigId,
+      created_at: now
+    };
+
+    assessment.event_day_id = sessionConfig.event_day_id;
+    assessment.session_no = sessionConfig.session_no;
+    assessment.student_id = participant.student_id;
+    assessment.halaqah_id = participant.halaqah_id;
+    assessment.attendance_status = attendance;
+    assessment.updated_at = now;
+    assessment.is_deleted = false;
+    assessment.deleted_at = '';
+    assessment.deleted_by = '';
+
+    if (actor.role === ROLES.TEACHER) {
+      assessment.teacher_id = actor.teacher_id;
+    } else {
+      var preferredTeacherId = cleanStringGS(payload.teacherId) || cleanStringGS(assessment.teacher_id);
+      assessment.teacher_id = resolveResponsibleHalaqahTeacherId(participant.halaqah_id, eventId, preferredTeacherId);
+      if (!assessment.teacher_id) {
+        skipped.push({ studentId: studentId, reason: 'Tidak ada guru penanggung jawab aktif pada halaqah.' });
+        return;
+      }
+    }
+
+    if (attendance === 'PRESENT') {
+      if (!cleanStringGS(assessment.assessment_mode)) assessment.assessment_mode = defaultAssessmentModeForParticipantGS(participant);
+      assessment.assessment_status = hasCompletedPresentProgressGS(assessment) ? 'COMPLETED' : 'PENDING';
+    } else {
+      assessment.assessment_status = 'COMPLETED';
+      clearAllProgressFieldsGS(assessment);
+    }
+
+    toUpsert.push(assessment);
+  });
+
+  batchUpsertObjectsGS('13_SESSION_ASSESSMENTS', ['event_id', 'participant_id', 'session_config_id'], toUpsert, 'assessment_id');
+
+  addAuditLog('BULK_ATTENDANCE', 'SESSION_ASSESSMENT', sessionConfigId, null, {
+    sessionConfigId: sessionConfigId,
+    studentCount: toUpsert.length,
+    skippedCount: skipped.length,
+    status: attendance
+  }, 'Presensi massal ' + toUpsert.length + ' siswa (' + attendance + ')', actor.user_id, eventId);
+
+  return jsonResponse({
+    updatedCount: toUpsert.length,
+    skippedCount: skipped.length,
+    skippedRecords: skipped,
+    updatedAssessments: toUpsert
+  });
+}
+
+function handleDeleteSessionAssessment(payload, authToken) {
+  var actor = requireRole(authToken, [ROLES.TEACHER, ROLES.ADMIN]);
+  var assessmentId = cleanStringGS(payload.assessmentId);
+  if (!assessmentId) return jsonError('VALIDATION_ERROR', 'assessmentId wajib diisi.');
+
+  var assessment = readSheetObjects('13_SESSION_ASSESSMENTS').find(function(a) { return cleanStringGS(a.assessment_id) === assessmentId; });
+  if (!assessment) return jsonError('NOT_FOUND', 'Penilaian tidak ditemukan.');
+
+  if (actor.role === ROLES.TEACHER) {
+    var allowed = getTeacherAuthorizedHalaqahIds(actor.teacher_id, assessment.event_id);
+    if (allowed.indexOf(cleanStringGS(assessment.halaqah_id)) === -1) return jsonError('FORBIDDEN', 'Anda tidak berwenang menghapus penilaian ini.');
+  }
+
+  updateObject('13_SESSION_ASSESSMENTS', 'assessment_id', assessmentId, {
+    is_deleted: true,
+    deleted_at: nowIsoGS(),
+    deleted_by: actor.user_id
+  });
+  addAuditLog('SOFT_DELETE_ASSESSMENT', 'SESSION_ASSESSMENT', assessmentId, assessment, { is_deleted: true }, null, actor.user_id, assessment.event_id);
+  return jsonResponse({ success: true });
+}
+
+// ====================================================
+// 18. FINAL EVALUATION
+// ====================================================
+
+function handleSaveFinalEvaluation(payload, authToken) {
+  var actor = requireRole(authToken, [ROLES.TEACHER, ROLES.ADMIN]);
+  var evaluation = Object.assign({}, payload.finalEvaluation || {});
+  if (!cleanStringGS(evaluation.participant_id)) return jsonError('VALIDATION_ERROR', 'participant_id wajib diisi.');
+
+  var participant = readSheetObjects('12_EVENT_PARTICIPANTS').find(function(p) {
+    return cleanStringGS(p.participant_id) === cleanStringGS(evaluation.participant_id);
+  });
+  if (!participant) return jsonError('NOT_FOUND', 'Data peserta tidak ditemukan.');
+
+  evaluation.student_id = participant.student_id;
+  evaluation.event_id = participant.event_id;
+
+  if (actor.role === ROLES.TEACHER) {
+    var allowed = getTeacherAuthorizedHalaqahIds(actor.teacher_id, participant.event_id);
+    if (allowed.indexOf(cleanStringGS(participant.halaqah_id)) === -1) return jsonError('FORBIDDEN', 'Anda tidak berwenang mengedit evaluasi akhir siswa ini.');
+    evaluation.evaluator_teacher_id = actor.teacher_id;
+  } else {
+    var preferred = cleanStringGS(payload.teacherId) || cleanStringGS(evaluation.evaluator_teacher_id) || cleanStringGS(evaluation.teacher_id);
+    var responsible = resolveResponsibleHalaqahTeacherId(participant.halaqah_id, participant.event_id, preferred);
+    if (!responsible) return jsonError('VALIDATION_ERROR', 'Tidak ada guru evaluator aktif untuk halaqah ini.');
+    evaluation.evaluator_teacher_id = responsible;
+  }
+  delete evaluation.teacher_id;
+
+  var completion = upperGS(evaluation.completion_status);
+  if (COMPLETION_STATUSES.indexOf(completion) === -1) return jsonError('VALIDATION_ERROR', 'completion_status harus COMPLETE atau INCOMPLETE.');
+  evaluation.completion_status = completion;
+
+  var skillEnd = sanitizeSkillStatusGS(evaluation.skill_status_end);
+  if (!skillEnd) return jsonError('VALIDATION_ERROR', 'skill_status_end harus NON_BBL, BBL, atau BBLS.');
+  evaluation.skill_status_end = skillEnd;
+
+  var affective = upperGS(evaluation.affective_rating);
+  delete evaluation.affective_grade;
+  if (affective && ['A', 'B', 'C', 'D'].indexOf(affective) === -1) return jsonError('VALIDATION_ERROR', 'affective_rating harus A, B, C, D, atau kosong.');
+  evaluation.affective_rating = affective;
+
+  var requiresQuranRange = skillEnd === 'BBL' || skillEnd === 'BBLS';
+  var hasAnyQuranRange = hasValueGS(evaluation.evaluation_surah_start) || hasValueGS(evaluation.evaluation_ayah_start) || hasValueGS(evaluation.evaluation_surah_end) || hasValueGS(evaluation.evaluation_ayah_end);
+
+  if (requiresQuranRange && !(
+    hasValueGS(evaluation.evaluation_surah_start) &&
+    hasValueGS(evaluation.evaluation_ayah_start) &&
+    hasValueGS(evaluation.evaluation_surah_end) &&
+    hasValueGS(evaluation.evaluation_ayah_end)
+  )) {
+    return jsonError('VALIDATION_ERROR', 'Jangkauan surah dan ayat evaluasi akhir wajib diisi untuk status akhir BBL/BBLS.');
+  }
+
+  if (hasAnyQuranRange) {
+    var fields = ['evaluation_surah_start', 'evaluation_ayah_start', 'evaluation_surah_end', 'evaluation_ayah_end'];
+    for (var i = 0; i < fields.length; i++) {
+      if (!hasValueGS(evaluation[fields[i]])) return jsonError('VALIDATION_ERROR', 'Jangkauan evaluasi Al-Qur\'an harus diisi lengkap.');
+      var n = Number(evaluation[fields[i]]);
+      if (!isFinite(n) || isNaN(n) || n < 0) return jsonError('VALIDATION_ERROR', 'Jangkauan evaluasi Al-Qur\'an mengandung angka tidak valid.');
+      evaluation[fields[i]] = n;
+    }
+  } else {
+    evaluation.evaluation_surah_start = '';
+    evaluation.evaluation_ayah_start = '';
+    evaluation.evaluation_surah_end = '';
+    evaluation.evaluation_ayah_end = '';
+  }
+
+  if (!cleanStringGS(evaluation.final_evaluation_id)) evaluation.final_evaluation_id = makeIdGS('FE_', 16);
+  evaluation.updated_at = nowIsoGS();
+  if (!evaluation.created_at) evaluation.created_at = nowIsoGS();
+
+  var status = upsertObject('14_FINAL_EVALUATIONS', ['event_id', 'participant_id'], evaluation, 'final_evaluation_id');
+  addAuditLog(status === 'INSERTED' ? 'SAVE_FINAL_EVALUATION' : 'UPDATE_FINAL_EVALUATION', 'FINAL_EVALUATION', evaluation.final_evaluation_id, null, evaluation, null, actor.user_id, evaluation.event_id);
+  return jsonResponse(evaluation);
+}
+
+// ====================================================
+// 19. ADMIN OVERVIEW
+// ====================================================
+
+function handleGetAdminOverview(eventId, authToken) {
+  requireRole(authToken, [ROLES.ADMIN, ROLES.COORDINATOR]);
+
+  var eventObj = resolveEventObjectGS(eventId);
+  if (!eventObj) {
     return jsonResponse({
       activeEvent: null,
       metrics: { totalStudents: 0, totalHalaqahs: 0, inputCompletionRate: 0 },
@@ -2456,173 +2492,222 @@ function handleGetAdminOverview(eventId, authToken) {
     });
   }
 
-  var participants = readSheetObjects('12_EVENT_PARTICIPANTS').filter(function(p) { return p.event_id === activeEvt.event_id; });
-  var halaqahs = readSheetObjects('10_HALAQAH').filter(function(h) { return h.event_id === activeEvt.event_id; });
-  var sessionConfigs = readSheetObjects('09_SESSION_CONFIG').filter(function(sc) { return sc.event_id === activeEvt.event_id; });
-  var assessments = readSheetObjects('13_SESSION_ASSESSMENTS').filter(function(a) {
-    return a.event_id === activeEvt.event_id && !a.is_deleted && String(a.is_deleted) !== 'true';
+  var resolvedEventId = cleanStringGS(eventObj.event_id);
+  var participants = readSheetObjects('12_EVENT_PARTICIPANTS').filter(function(p) {
+    return cleanStringGS(p.event_id) === resolvedEventId;
   });
-  var halaqahTeachers = readSheetObjects('11_HALAQAH_TEACHERS').filter(function(ht) {
-    return ht.event_id === activeEvt.event_id && (ht.active === true || String(ht.active) === 'true');
+  var halaqahs = readSheetObjects('10_HALAQAH').filter(function(h) {
+    return cleanStringGS(h.event_id) === resolvedEventId && isActiveRecordGS(h);
+  });
+  var sessionConfigs = readSheetObjects('09_SESSION_CONFIG').filter(function(sc) {
+    return cleanStringGS(sc.event_id) === resolvedEventId && isActiveRecordGS(sc);
+  });
+  var assessments = readSheetObjects('13_SESSION_ASSESSMENTS').filter(function(a) {
+    return cleanStringGS(a.event_id) === resolvedEventId && !isDeletedRecordGS(a);
+  });
+  var assignments = readSheetObjects('11_HALAQAH_TEACHERS').filter(function(ht) {
+    return cleanStringGS(ht.event_id) === resolvedEventId && isActiveRecordGS(ht);
   });
   var teachers = readSheetObjects('04_MASTER_TEACHERS');
   var students = readSheetObjects('03_MASTER_STUDENTS');
 
   var teacherMap = {};
-  teachers.forEach(function(t) { teacherMap[t.teacher_id] = t; });
-
+  teachers.forEach(function(t) { teacherMap[cleanStringGS(t.teacher_id)] = t; });
   var halaqahMap = {};
-  halaqahs.forEach(function(h) { halaqahMap[h.halaqah_id] = h; });
-
+  halaqahs.forEach(function(h) { halaqahMap[cleanStringGS(h.halaqah_id)] = h; });
   var studentMap = {};
-  students.forEach(function(s) { studentMap[s.student_id] = s; });
+  students.forEach(function(s) { studentMap[cleanStringGS(s.student_id)] = s; });
 
-  var totalStudents = participants.length;
-  var totalHalaqahs = halaqahs.length;
-
-  var totalExpectedAssessments = 0;
+  var expectedTotal = 0;
   participants.forEach(function(p) {
-    if (p.session_group_id && String(p.session_group_id).trim() !== '') {
-      var activeConfigs = sessionConfigs.filter(function(sc) {
-        return (sc.active === true || String(sc.active) === 'true') && sc.session_group_id === p.session_group_id;
-      });
-      totalExpectedAssessments += activeConfigs.length;
-    }
+    var groupId = cleanStringGS(p.session_group_id);
+    if (!groupId) return;
+    expectedTotal += sessionConfigs.filter(function(sc) {
+      return cleanStringGS(sc.session_group_id) === groupId;
+    }).length;
   });
 
-  var actualAssessmentsCount = assessments.length;
-  var inputCompletionRate = totalExpectedAssessments > 0
-    ? Math.min(100, Number(((actualAssessmentsCount / totalExpectedAssessments) * 100).toFixed(1)))
+  var actualTotal = assessments.length;
+  var completionRate = expectedTotal > 0
+    ? Math.min(100, Number(((actualTotal / expectedTotal) * 100).toFixed(1)))
     : 0;
 
-  var teachersProgress = halaqahTeachers.map(function(ht) {
-    var teacherObj = teacherMap[ht.teacher_id];
-    var halaqahObj = halaqahMap[ht.halaqah_id];
+  var teachersProgress = assignments.map(function(ht) {
+    var halaqahId = cleanStringGS(ht.halaqah_id);
+    var teacher = teacherMap[cleanStringGS(ht.teacher_id)];
+    var halaqah = halaqahMap[halaqahId];
 
-    var groupParticipants = participants.filter(function(p) { return p.halaqah_id === ht.halaqah_id; });
-    var expectedForGroup = 0;
-    groupParticipants.forEach(function(p) {
-      if (p.session_group_id && String(p.session_group_id).trim() !== '') {
-        var configs = sessionConfigs.filter(function(sc) {
-          return (sc.active === true || String(sc.active) === 'true') && sc.session_group_id === p.session_group_id;
-        });
-        expectedForGroup += configs.length;
-      }
+    var groupParticipants = participants.filter(function(p) {
+      return cleanStringGS(p.halaqah_id) === halaqahId;
     });
 
-    var actualForGroup = assessments.filter(function(a) { return a.halaqah_id === ht.halaqah_id; }).length;
-    var percentage = expectedForGroup > 0
-      ? Math.min(100, Math.round((actualForGroup / expectedForGroup) * 100))
-      : 100;
+    var expected = 0;
+    groupParticipants.forEach(function(p) {
+      var groupId = cleanStringGS(p.session_group_id);
+      if (!groupId) return;
+      expected += sessionConfigs.filter(function(sc) {
+        return cleanStringGS(sc.session_group_id) === groupId;
+      }).length;
+    });
+
+    var actual = assessments.filter(function(a) {
+      return cleanStringGS(a.halaqah_id) === halaqahId;
+    }).length;
 
     return {
-      teacherName: teacherObj ? teacherObj.full_name : 'Guru Tahfidz',
-      groupName: halaqahObj ? halaqahObj.halaqah_name : 'Halaqah',
-      completedSessions: actualForGroup,
-      totalSessions: expectedForGroup,
-      percentage: percentage
+      teacherName: teacher ? teacher.full_name : 'Guru Tahfidz',
+      groupName: halaqah ? halaqah.halaqah_name : 'Halaqah',
+      completedSessions: actual,
+      totalSessions: expected,
+      percentage: expected > 0 ? Math.min(100, Math.round((actual / expected) * 100)) : 100
     };
   });
 
   var anomalies = [];
   assessments.forEach(function(a) {
-    var lines = Number(a.lines_added) || 0;
+    if (upperGS(a.attendance_status) !== 'PRESENT') return;
+    var lines = Number(a.lines_added);
+    if (!isFinite(lines) || isNaN(lines)) lines = 0;
+
     if (lines > 40) {
-      var st = studentMap[a.student_id];
+      var student = studentMap[cleanStringGS(a.student_id)];
+      var mode = normalizeAssessmentModeGS(a);
       anomalies.push({
-        studentName: st ? st.full_name : 'Siswa',
+        studentName: student ? student.full_name : 'Siswa',
         sessionNo: a.session_no,
-        description: 'Setoran melampaui ' + lines + ' baris dalam 1 sesi (perlu verifikasi)'
+        mode: mode,
+        description: (mode === ASSESSMENT_MODES.NURONIYYAH ? 'Nuroniyyah' : 'Ziyadah') + ' melampaui ' + lines + ' baris dalam 1 sesi (perlu verifikasi)'
       });
     }
   });
 
   return jsonResponse({
-    activeEvent: activeEvt,
+    activeEvent: eventObj,
     metrics: {
-      totalStudents: totalStudents,
-      totalHalaqahs: totalHalaqahs,
-      inputCompletionRate: inputCompletionRate
+      totalStudents: participants.length,
+      totalHalaqahs: halaqahs.length,
+      inputCompletionRate: completionRate
     },
     teachersProgress: teachersProgress,
     anomalies: anomalies
   });
 }
 
-// Server-Side Completeness Report Handler
-function handleGetCompletenessReport(eventId, authToken) {
-  var sess = requireRole(authToken, ['ADMIN', 'COORDINATOR']);
-  var events = readSheetObjects('07_EVENTS');
-  var configs = readSheetObjects('01_APP_CONFIG');
-  var currConf = configs.find(function(c) { return c.config_key === 'current_event_id'; });
-  var activeId = eventId || (currConf ? currConf.config_value : '') || (events[0] ? events[0].event_id : '');
+// ====================================================
+// 20. COMPLETENESS REPORT
+// ====================================================
 
-  var activeEvt = events.find(function(e) { return e.event_id === activeId; }) || events[0] || null;
-  if (!activeEvt) {
+function handleGetCompletenessReport(eventId, authToken) {
+  requireRole(authToken, [ROLES.ADMIN, ROLES.COORDINATOR]);
+
+  var eventObj = resolveEventObjectGS(eventId);
+  if (!eventObj) {
     return jsonResponse({
       event: null,
-      counts: { totalParticipants: 0, withoutHalaqahCount: 0, withoutSessionGroupCount: 0, withoutBaselineCount: 0, withoutTargetCount: 0, withoutFinalEvalCount: 0 },
-      issues: { withoutHalaqah: [], withoutSessionGroup: [], withoutBaseline: [], withoutTarget: [], withoutFinalEval: [] },
+      counts: {
+        totalParticipants: 0,
+        withoutHalaqahCount: 0,
+        withoutSessionGroupCount: 0,
+        withoutBaselineCount: 0,
+        withoutTargetCount: 0,
+        withoutFinalEvalCount: 0
+      },
+      issues: {
+        withoutHalaqah: [],
+        withoutSessionGroup: [],
+        withoutBaseline: [],
+        withoutTarget: [],
+        withoutFinalEval: []
+      },
       halaqahReports: []
     });
   }
 
-  var participants = readSheetObjects('12_EVENT_PARTICIPANTS').filter(function(p) { return p.event_id === activeEvt.event_id; });
-  var students = readSheetObjects('03_MASTER_STUDENTS');
-  var halaqahs = readSheetObjects('10_HALAQAH').filter(function(h) { return h.event_id === activeEvt.event_id; });
-  var assessments = readSheetObjects('13_SESSION_ASSESSMENTS').filter(function(a) {
-    return a.event_id === activeEvt.event_id && !a.is_deleted && String(a.is_deleted) !== 'true';
+  var resolvedEventId = cleanStringGS(eventObj.event_id);
+  var participants = readSheetObjects('12_EVENT_PARTICIPANTS').filter(function(p) {
+    return cleanStringGS(p.event_id) === resolvedEventId;
   });
-  var evals = readSheetObjects('14_FINAL_EVALUATIONS').filter(function(e) { return e.event_id === activeEvt.event_id; });
-  var sessionConfigs = readSheetObjects('09_SESSION_CONFIG').filter(function(sc) { return sc.event_id === activeEvt.event_id; });
+  var students = readSheetObjects('03_MASTER_STUDENTS');
+  var halaqahs = readSheetObjects('10_HALAQAH').filter(function(h) {
+    return cleanStringGS(h.event_id) === resolvedEventId;
+  });
+  var assessments = readSheetObjects('13_SESSION_ASSESSMENTS').filter(function(a) {
+    return cleanStringGS(a.event_id) === resolvedEventId && !isDeletedRecordGS(a);
+  });
+  var evaluations = readSheetObjects('14_FINAL_EVALUATIONS').filter(function(e) {
+    return cleanStringGS(e.event_id) === resolvedEventId;
+  });
+  var sessionConfigs = readSheetObjects('09_SESSION_CONFIG').filter(function(sc) {
+    return cleanStringGS(sc.event_id) === resolvedEventId && isActiveRecordGS(sc);
+  });
 
   var studentMap = {};
-  students.forEach(function(s) { studentMap[s.student_id] = s; });
+  students.forEach(function(s) { studentMap[cleanStringGS(s.student_id)] = s; });
+  var halaqahMap = {};
+  halaqahs.forEach(function(h) { halaqahMap[cleanStringGS(h.halaqah_id)] = h; });
 
-  var withoutHalaqah = participants.filter(function(p) { return !p.halaqah_id || String(p.halaqah_id).trim() === ''; });
-  var withoutSessionGroup = participants.filter(function(p) { return !p.session_group_id || String(p.session_group_id).trim() === ''; });
-  var withoutBaseline = participants.filter(function(p) { return p.baseline_surah == null || p.baseline_surah === '' || p.baseline_ayah == null || p.baseline_ayah === ''; });
-  var withoutTarget = participants.filter(function(p) { return p.target_surah_start == null || p.target_surah_start === '' || p.target_lines == null || Number(p.target_lines) === 0; });
-  var withoutFinalEval = participants.filter(function(p) { return !evals.some(function(e) { return e.student_id === p.student_id || e.participant_id === p.participant_id; }); });
+  var withoutHalaqah = participants.filter(function(p) { return !cleanStringGS(p.halaqah_id); });
+  var withoutSessionGroup = participants.filter(function(p) { return !cleanStringGS(p.session_group_id); });
+
+  var withoutBaseline = participants.filter(function(p) {
+    var skill = sanitizeSkillStatusGS(p.skill_status_start);
+    if (skill !== 'BBL' && skill !== 'BBLS') return false;
+    return !hasValueGS(p.baseline_surah) || !hasValueGS(p.baseline_ayah);
+  });
+
+  var withoutTarget = participants.filter(function(p) {
+    var halaqah = halaqahMap[cleanStringGS(p.halaqah_id)] || null;
+    var effective = getEffectiveParticipantTargetsGS(p, halaqah);
+    return effective.ziyadahLines === null && effective.nuroniyyahLines === null;
+  });
+
+  var withoutFinalEval = participants.filter(function(p) {
+    return !evaluations.some(function(e) {
+      return cleanStringGS(e.participant_id) === cleanStringGS(p.participant_id) || cleanStringGS(e.student_id) === cleanStringGS(p.student_id);
+    });
+  });
 
   var halaqahReports = halaqahs.map(function(h) {
-    var hParts = participants.filter(function(p) { return p.halaqah_id === h.halaqah_id; });
-    var expectedRecordCount = 0;
-    hParts.forEach(function(p) {
-      if (p.session_group_id && String(p.session_group_id).trim() !== '') {
-        var configsForGroup = sessionConfigs.filter(function(sc) {
-          return (sc.active === true || String(sc.active) === 'true') && sc.session_group_id === p.session_group_id;
-        });
-        expectedRecordCount += configsForGroup.length;
-      }
+    var halaqahId = cleanStringGS(h.halaqah_id);
+    var groupParticipants = participants.filter(function(p) {
+      return cleanStringGS(p.halaqah_id) === halaqahId;
     });
 
-    var actualAsms = assessments.filter(function(a) { return a.halaqah_id === h.halaqah_id; });
-    var missingCount = Math.max(0, expectedRecordCount - actualAsms.length);
-    var percentage = expectedRecordCount > 0 ? Math.round((actualAsms.length / expectedRecordCount) * 100) : 0;
+    var expected = 0;
+    groupParticipants.forEach(function(p) {
+      var groupId = cleanStringGS(p.session_group_id);
+      if (!groupId) return;
+      expected += sessionConfigs.filter(function(sc) {
+        return cleanStringGS(sc.session_group_id) === groupId;
+      }).length;
+    });
+
+    var actual = assessments.filter(function(a) {
+      return cleanStringGS(a.halaqah_id) === halaqahId;
+    }).length;
 
     return {
       halaqah_id: h.halaqah_id,
       halaqah_name: h.halaqah_name,
-      studentCount: hParts.length,
-      submittedSessions: actualAsms.length,
-      expectedSessions: expectedRecordCount,
-      missingCount: missingCount,
-      percentage: Math.min(100, percentage)
+      studentCount: groupParticipants.length,
+      submittedSessions: actual,
+      expectedSessions: expected,
+      missingCount: Math.max(0, expected - actual),
+      percentage: expected > 0 ? Math.min(100, Math.round((actual / expected) * 100)) : 0
     };
   });
 
   function mapStudentIssue(p) {
-    var st = studentMap[p.student_id];
+    var student = studentMap[cleanStringGS(p.student_id)];
     return {
       student_id: p.student_id,
-      name: st ? st.full_name : 'Siswa',
+      name: student ? student.full_name : 'Siswa',
       class: (p.grade_snapshot || '') + ' (' + (p.class_snapshot || '') + ')'
     };
   }
 
   return jsonResponse({
-    event: activeEvt,
+    event: eventObj,
     counts: {
       totalParticipants: participants.length,
       withoutHalaqahCount: withoutHalaqah.length,
@@ -2642,7 +2727,10 @@ function handleGetCompletenessReport(eventId, authToken) {
   });
 }
 
-// Statistical Computation Utilities for Executive Analytics
+// ====================================================
+// 21. ANALYTICS UTILITIES
+// ====================================================
+
 function calculateStatsGS(values) {
   var sanitized = (values || []).filter(function(v) {
     return typeof v === 'number' && isFinite(v) && !isNaN(v) && v >= 0;
@@ -2650,74 +2738,71 @@ function calculateStatsGS(values) {
 
   if (sanitized.length === 0) {
     return {
-      count: 0, totalLines: 0, mean: 0, median: 0, stdDev: 0, cv: 0,
-      min: 0, max: 0, q1: 0, q3: 0, iqr: 0, lowerWhisker: 0, upperWhisker: 0,
-      bottom25Avg: 0, completionRate: 0, outliers: []
+      count: 0,
+      totalLines: 0,
+      mean: 0,
+      median: 0,
+      stdDev: 0,
+      cv: 0,
+      min: 0,
+      max: 0,
+      q1: 0,
+      q3: 0,
+      iqr: 0,
+      lowerWhisker: 0,
+      upperWhisker: 0,
+      bottom25Avg: 0,
+      completionRate: 0,
+      outliers: []
     };
   }
 
   var sorted = sanitized.slice().sort(function(a, b) { return a - b; });
   var count = sorted.length;
-  var totalLines = sorted.reduce(function(acc, v) { return acc + v; }, 0);
-  var mean = totalLines / count;
-
-  var median = 0;
+  var total = sorted.reduce(function(sum, v) { return sum + v; }, 0);
+  var mean = total / count;
   var mid = Math.floor(count / 2);
-  if (count % 2 === 0) {
-    median = (sorted[mid - 1] + sorted[mid]) / 2;
-  } else {
-    median = sorted[mid];
-  }
-
-  var variance = sorted.reduce(function(acc, v) { return acc + Math.pow(v - mean, 2); }, 0) / count;
+  var median = count % 2 === 0 ? (sorted[mid - 1] + sorted[mid]) / 2 : sorted[mid];
+  var variance = sorted.reduce(function(sum, v) { return sum + Math.pow(v - mean, 2); }, 0) / count;
   var stdDev = Math.sqrt(variance);
   var cv = mean > 0 ? stdDev / mean : 0;
 
-  var min = sorted[0];
-  var max = sorted[count - 1];
-
-  function getPercentileGS(arr, p) {
+  function percentile(arr, p) {
     if (arr.length === 0) return 0;
     if (arr.length === 1) return arr[0];
     var idx = (p / 100) * (arr.length - 1);
-    var l = Math.floor(idx);
-    var u = Math.ceil(idx);
-    var w = idx - l;
-    if (u >= arr.length) return arr[arr.length - 1];
-    return arr[l] * (1 - w) + arr[u] * w;
+    var lower = Math.floor(idx);
+    var upper = Math.ceil(idx);
+    var weight = idx - lower;
+    if (upper >= arr.length) return arr[arr.length - 1];
+    return arr[lower] * (1 - weight) + arr[upper] * weight;
   }
 
-  var q1 = getPercentileGS(sorted, 25);
-  var q3 = getPercentileGS(sorted, 75);
+  var q1 = percentile(sorted, 25);
+  var q3 = percentile(sorted, 75);
   var iqr = q3 - q1;
-
   var lowerBound = q1 - 1.5 * iqr;
   var upperBound = q3 + 1.5 * iqr;
   var outliers = sorted.filter(function(v) { return v < lowerBound || v > upperBound; });
-
-  var inBoundValues = sorted.filter(function(v) { return v >= lowerBound && v <= upperBound; });
-  var lowerWhisker = inBoundValues.length > 0 ? inBoundValues[0] : min;
-  var upperWhisker = inBoundValues.length > 0 ? inBoundValues[inBoundValues.length - 1] : max;
-
+  var inBounds = sorted.filter(function(v) { return v >= lowerBound && v <= upperBound; });
   var bottom25Count = Math.max(1, Math.ceil(count * 0.25));
-  var bottom25Values = sorted.slice(0, bottom25Count);
-  var bottom25Avg = bottom25Values.reduce(function(acc, v) { return acc + v; }, 0) / bottom25Values.length;
+  var bottom25 = sorted.slice(0, bottom25Count);
 
   return {
     count: count,
-    totalLines: totalLines,
+    totalLines: total,
     mean: Number(mean.toFixed(2)),
     median: Number(median.toFixed(2)),
     stdDev: Number(stdDev.toFixed(2)),
     cv: Number(cv.toFixed(3)),
-    min: min,
-    max: max,
+    min: sorted[0],
+    max: sorted[count - 1],
     q1: Number(q1.toFixed(2)),
     q3: Number(q3.toFixed(2)),
     iqr: Number(iqr.toFixed(2)),
-    lowerWhisker: lowerWhisker,
-    upperWhisker: upperWhisker,
-    bottom25Avg: Number(bottom25Avg.toFixed(2)),
+    lowerWhisker: inBounds.length ? inBounds[0] : sorted[0],
+    upperWhisker: inBounds.length ? inBounds[inBounds.length - 1] : sorted[count - 1],
+    bottom25Avg: Number((bottom25.reduce(function(sum, v) { return sum + v; }, 0) / bottom25.length).toFixed(2)),
     completionRate: 0,
     outliers: outliers
   };
@@ -2727,49 +2812,52 @@ function getDistributionBucketsGS(values) {
   var sanitized = (values || []).filter(function(v) {
     return typeof v === 'number' && isFinite(v) && !isNaN(v) && v >= 0;
   });
-  var total = sanitized.length || 1;
-  var r0_10 = 0, r11_20 = 0, r21_30 = 0, rOver30 = 0;
+
+  var denominator = sanitized.length || 1;
+  var buckets = [0, 0, 0, 0];
   sanitized.forEach(function(v) {
-    if (v <= 10) r0_10++;
-    else if (v <= 20) r11_20++;
-    else if (v <= 30) r21_30++;
-    else rOver30++;
+    if (v <= 10) buckets[0]++;
+    else if (v <= 20) buckets[1]++;
+    else if (v <= 30) buckets[2]++;
+    else buckets[3]++;
   });
-  return [
-    { range: '0–10 Baris', count: r0_10, percentage: Number(((r0_10 / total) * 100).toFixed(1)) },
-    { range: '11–20 Baris', count: r11_20, percentage: Number(((r11_20 / total) * 100).toFixed(1)) },
-    { range: '21–30 Baris', count: r21_30, percentage: Number(((r21_30 / total) * 100).toFixed(1)) },
-    { range: '> 30 Baris', count: rOver30, percentage: Number(((rOver30 / total) * 100).toFixed(1)) }
-  ];
+
+  var labels = ['0–10 Baris', '11–20 Baris', '21–30 Baris', '> 30 Baris'];
+  return labels.map(function(label, idx) {
+    return {
+      range: label,
+      count: buckets[idx],
+      percentage: Number(((buckets[idx] / denominator) * 100).toFixed(1))
+    };
+  });
 }
 
-function calculateSkillTransitionsGS(participants, evalMap) {
-  var map = {};
+function calculateSkillTransitionsGS(participants, evaluationSkillMap) {
+  var counts = {};
   var notEvaluatedSkillCount = 0;
   var missingSkillStartCount = 0;
 
-  participants.forEach(function(p) {
-    var endSkill = evalMap[p.student_id] || evalMap[p.participant_id];
+  (participants || []).forEach(function(p) {
+    var endSkill = evaluationSkillMap[cleanStringGS(p.student_id)] || evaluationSkillMap[cleanStringGS(p.participant_id)];
     if (!endSkill) {
       notEvaluatedSkillCount++;
       return;
     }
-    var from = p.skill_status_start;
-    if (!from || String(from).trim() === '') {
+
+    var from = sanitizeSkillStatusGS(p.skill_status_start);
+    if (!from) {
       missingSkillStartCount++;
       return;
     }
-    var to = endSkill;
-    var key = from + '->' + to;
-    map[key] = (map[key] || 0) + 1;
+
+    var key = from + '->' + endSkill;
+    counts[key] = (counts[key] || 0) + 1;
   });
 
   var transitions = [];
-  var statuses = ['NON_BBL', 'BBL', 'BBLS'];
-  statuses.forEach(function(from) {
-    statuses.forEach(function(to) {
-      var key = from + '->' + to;
-      transitions.push({ from: from, to: to, count: map[key] || 0 });
+  SKILL_STATUSES.forEach(function(from) {
+    SKILL_STATUSES.forEach(function(to) {
+      transitions.push({ from: from, to: to, count: counts[from + '->' + to] || 0 });
     });
   });
 
@@ -2780,126 +2868,117 @@ function calculateSkillTransitionsGS(participants, evalMap) {
   };
 }
 
-// Server-Side Executive Analytics Handler
-function handleGetExecutiveAnalytics(params, authToken) {
-  requireRole(authToken, ['ADMIN', 'COORDINATOR', 'VIEWER']);
-  var allEvents = readSheetObjects('07_EVENTS');
+// ====================================================
+// 22. EXECUTIVE ANALYTICS
+// ====================================================
 
+function handleGetExecutiveAnalytics(params, authToken) {
+  requireRole(authToken, [ROLES.ADMIN, ROLES.COORDINATOR, ROLES.VIEWER]);
+  params = params || {};
+
+  var allEvents = readSheetObjects('07_EVENTS');
   var filteredEvents = allEvents;
-  if (params && params.academicYearFilter && params.academicYearFilter !== 'ALL') {
-    filteredEvents = filteredEvents.filter(function(e) { return e.academic_year === params.academicYearFilter; });
+  if (cleanStringGS(params.academicYearFilter) && params.academicYearFilter !== 'ALL') {
+    filteredEvents = filteredEvents.filter(function(e) {
+      return cleanStringGS(e.academic_year) === cleanStringGS(params.academicYearFilter);
+    });
   }
 
   var students = readSheetObjects('03_MASTER_STUDENTS');
   var studentMap = {};
-  students.forEach(function(s) { studentMap[s.student_id] = s; });
+  students.forEach(function(s) { studentMap[cleanStringGS(s.student_id)] = s; });
 
-  function filterParticipantsGS(parts) {
+  function filterParticipants(parts) {
     return parts.filter(function(p) {
-      var st = studentMap[p.student_id];
-      if (!st) return false;
+      var student = studentMap[cleanStringGS(p.student_id)];
+      if (!student) return false;
 
-      if (params.gradeFilter && params.gradeFilter !== 'ALL') {
-        if (p.grade_snapshot !== params.gradeFilter && st.grade_level !== params.gradeFilter) return false;
-      }
-      if (params.genderFilter && params.genderFilter !== 'ALL') {
-        if (st.gender !== params.genderFilter) return false;
-      }
-      if (params.halaqahFilter && params.halaqahFilter !== 'ALL') {
-        if (p.halaqah_id !== params.halaqahFilter) return false;
-      }
+      if (params.gradeFilter && params.gradeFilter !== 'ALL' && cleanStringGS(p.grade_snapshot) !== cleanStringGS(params.gradeFilter) && cleanStringGS(student.grade_level) !== cleanStringGS(params.gradeFilter)) return false;
+      if (params.genderFilter && params.genderFilter !== 'ALL' && upperGS(student.gender) !== upperGS(params.genderFilter)) return false;
+      if (params.halaqahFilter && params.halaqahFilter !== 'ALL' && cleanStringGS(p.halaqah_id) !== cleanStringGS(params.halaqahFilter)) return false;
       return true;
     });
   }
 
   var cohortStudentIds = null;
-  if (params.analyticsMode === 'COHORT') {
-    var eventStudentSets = filteredEvents.map(function(evt) {
-      var rawParts = readSheetObjects('12_EVENT_PARTICIPANTS').filter(function(p) { return p.event_id === evt.event_id; });
-      var fp = filterParticipantsGS(rawParts);
-      var setObj = {};
-      fp.forEach(function(p) { setObj[p.student_id] = true; });
-      return setObj;
+  if (upperGS(params.analyticsMode) === 'COHORT') {
+    var eventSets = filteredEvents.map(function(eventObj) {
+      var eventParts = readSheetObjects('12_EVENT_PARTICIPANTS').filter(function(p) {
+        return cleanStringGS(p.event_id) === cleanStringGS(eventObj.event_id);
+      });
+      var filteredParts = filterParticipants(eventParts);
+      var set = {};
+      filteredParts.forEach(function(p) { set[cleanStringGS(p.student_id)] = true; });
+      return set;
     });
 
-    if (eventStudentSets.length > 0) {
-      cohortStudentIds = {};
-      var firstSet = eventStudentSets[0];
-      for (var sid in firstSet) {
-        if (firstSet.hasOwnProperty(sid)) {
-          var inAll = eventStudentSets.every(function(setObj) { return Boolean(setObj[sid]); });
-          if (inAll) cohortStudentIds[sid] = true;
-        }
-      }
-    } else {
-      cohortStudentIds = {};
+    cohortStudentIds = {};
+    if (eventSets.length > 0) {
+      Object.keys(eventSets[0]).forEach(function(studentId) {
+        if (eventSets.every(function(set) { return Boolean(set[studentId]); })) cohortStudentIds[studentId] = true;
+      });
     }
   }
 
   var targetEvent = null;
-  if (params.eventId) {
-    targetEvent = filteredEvents.find(function(e) { return e.event_id === params.eventId; }) ||
-                  allEvents.find(function(e) { return e.event_id === params.eventId; });
+  if (cleanStringGS(params.eventId)) {
+    targetEvent = filteredEvents.find(function(e) { return cleanStringGS(e.event_id) === cleanStringGS(params.eventId); }) ||
+                  allEvents.find(function(e) { return cleanStringGS(e.event_id) === cleanStringGS(params.eventId); });
   }
-  if (!targetEvent) {
-    var currConf = readSheetObjects('01_APP_CONFIG').find(function(c) { return c.config_key === 'current_event_id'; });
-    var activeId = currConf ? currConf.config_value : '';
-    targetEvent = allEvents.find(function(e) { return e.event_id === activeId; }) || allEvents[0] || null;
-  }
+  if (!targetEvent) targetEvent = resolveEventObjectGS('');
+  var targetEventId = targetEvent ? cleanStringGS(targetEvent.event_id) : '';
 
-  var targetEventId = targetEvent ? targetEvent.event_id : null;
+  function computeEventMetrics(eventId) {
+    var rawParticipants = readSheetObjects('12_EVENT_PARTICIPANTS').filter(function(p) {
+      return cleanStringGS(p.event_id) === eventId;
+    });
+    var participants = filterParticipants(rawParticipants);
+    if (cohortStudentIds) participants = participants.filter(function(p) { return Boolean(cohortStudentIds[cleanStringGS(p.student_id)]); });
 
-  function computeEventMetricsGS(evtId) {
-    var rawParts = readSheetObjects('12_EVENT_PARTICIPANTS').filter(function(p) { return p.event_id === evtId; });
-    var participants = filterParticipantsGS(rawParts);
-
-    if (cohortStudentIds) {
-      participants = participants.filter(function(p) { return Boolean(cohortStudentIds[p.student_id]); });
-    }
+    var participantStudentSet = {};
+    participants.forEach(function(p) { participantStudentSet[cleanStringGS(p.student_id)] = true; });
 
     var assessments = readSheetObjects('13_SESSION_ASSESSMENTS').filter(function(a) {
-      return a.event_id === evtId && !a.is_deleted && String(a.is_deleted) !== 'true';
+      return cleanStringGS(a.event_id) === eventId && !isDeletedRecordGS(a) && Boolean(participantStudentSet[cleanStringGS(a.student_id)]);
     });
-    var evaluations = readSheetObjects('14_FINAL_EVALUATIONS').filter(function(e) { return e.event_id === evtId; });
+    var evaluations = readSheetObjects('14_FINAL_EVALUATIONS').filter(function(e) {
+      return cleanStringGS(e.event_id) === eventId;
+    });
 
-    var studentAsmMap = {};
+    var assessmentsByStudent = {};
     assessments.forEach(function(a) {
-      if (!studentAsmMap[a.student_id]) studentAsmMap[a.student_id] = [];
-      studentAsmMap[a.student_id].push(a);
+      var sid = cleanStringGS(a.student_id);
+      if (!assessmentsByStudent[sid]) assessmentsByStudent[sid] = [];
+      assessmentsByStudent[sid].push(a);
     });
 
-    var validProgressLines = [];
-    var missingProgressCount = 0;
+    var ziyadahTotals = [];
+    var nuroniyyahTotals = [];
+    var noAnyProgressCount = 0;
 
     participants.forEach(function(p) {
-      var asms = studentAsmMap[p.student_id];
-      if (asms && asms.length > 0) {
-        var presentAsms = asms.filter(function(a) { return a.attendance_status === 'PRESENT'; });
-        if (presentAsms.length > 0) {
-          var totalLines = presentAsms.reduce(function(sum, a) { return sum + (Number(a.lines_added) || 0); }, 0);
-          validProgressLines.push(totalLines);
-        } else {
-          missingProgressCount++;
-        }
-      } else {
-        missingProgressCount++;
-      }
+      var sid = cleanStringGS(p.student_id);
+      var summary = summarizeAssessmentsByModeGS(assessmentsByStudent[sid] || []);
+      if (summary.ziyadahPresentCount > 0) ziyadahTotals.push(summary.ziyadahLines);
+      if (summary.nuroniyyahPresentCount > 0) nuroniyyahTotals.push(summary.nuroniyyahLines);
+      if (summary.ziyadahPresentCount === 0 && summary.nuroniyyahPresentCount === 0) noAnyProgressCount++;
     });
 
-    var participantCount = participants.length;
-    var validProgressCount = validProgressLines.length;
-
-    var stats = calculateStatsGS(validProgressLines);
-    var distributionBuckets = getDistributionBucketsGS(validProgressLines);
-
-    var evalMap = {};
+    var ziyadahStats = calculateStatsGS(ziyadahTotals);
+    var nuroniyyahStats = calculateStatsGS(nuroniyyahTotals);
+    var skillEndMap = {};
     var completionMap = {};
 
     evaluations.forEach(function(e) {
-      evalMap[e.student_id] = e.skill_status_end;
-      evalMap[e.participant_id] = e.skill_status_end;
-      completionMap[e.student_id] = e.completion_status;
-      completionMap[e.participant_id] = e.completion_status;
+      var skillEnd = sanitizeSkillStatusGS(e.skill_status_end);
+      if (cleanStringGS(e.student_id)) {
+        skillEndMap[cleanStringGS(e.student_id)] = skillEnd;
+        completionMap[cleanStringGS(e.student_id)] = upperGS(e.completion_status);
+      }
+      if (cleanStringGS(e.participant_id)) {
+        skillEndMap[cleanStringGS(e.participant_id)] = skillEnd;
+        completionMap[cleanStringGS(e.participant_id)] = upperGS(e.completion_status);
+      }
     });
 
     var evaluatedCount = 0;
@@ -2908,500 +2987,330 @@ function handleGetExecutiveAnalytics(params, authToken) {
     var incompleteCount = 0;
 
     participants.forEach(function(p) {
-      var compStatus = completionMap[p.student_id] || completionMap[p.participant_id];
-      if (compStatus) {
-        evaluatedCount++;
-        if (compStatus === 'COMPLETE') completedCount++;
-        else incompleteCount++;
-      } else {
+      var status = completionMap[cleanStringGS(p.participant_id)] || completionMap[cleanStringGS(p.student_id)];
+      if (!status) {
         notEvaluatedCount++;
+        return;
       }
+      evaluatedCount++;
+      if (status === 'COMPLETE') completedCount++;
+      else if (status === 'INCOMPLETE') incompleteCount++;
     });
 
-    var evaluationCoverage = participantCount > 0
-      ? Number(((evaluatedCount / participantCount) * 100).toFixed(1))
-      : 0;
+    var evaluationCoverage = participants.length > 0 ? Number(((evaluatedCount / participants.length) * 100).toFixed(1)) : 0;
+    var completionRateAmongEvaluated = evaluatedCount > 0 ? Number(((completedCount / evaluatedCount) * 100).toFixed(1)) : 0;
 
-    var completionRateAmongEvaluated = evaluatedCount > 0
-      ? Number(((completedCount / evaluatedCount) * 100).toFixed(1))
-      : 0;
-
-    stats.completionRate = completionRateAmongEvaluated;
-
-    var resTrans = calculateSkillTransitionsGS(participants, evalMap);
+    ziyadahStats.completionRate = completionRateAmongEvaluated;
+    nuroniyyahStats.completionRate = completionRateAmongEvaluated;
+    var transitionResult = calculateSkillTransitionsGS(participants, skillEndMap);
 
     return {
-      participantCount: participantCount,
-      validProgressCount: validProgressCount,
-      missingProgressCount: missingProgressCount,
+      participantCount: participants.length,
+      validProgressCount: ziyadahTotals.length,
+      missingProgressCount: participants.length - ziyadahTotals.length,
+      stats: ziyadahStats,
+      distributionBuckets: getDistributionBucketsGS(ziyadahTotals),
+
+      ziyadahProgressCount: ziyadahTotals.length,
+      ziyadahMissingCount: participants.length - ziyadahTotals.length,
+      ziyadahStats: ziyadahStats,
+      ziyadahDistributionBuckets: getDistributionBucketsGS(ziyadahTotals),
+
+      nuroniyyahProgressCount: nuroniyyahTotals.length,
+      nuroniyyahMissingCount: participants.length - nuroniyyahTotals.length,
+      nuroniyyahStats: nuroniyyahStats,
+      nuroniyyahDistributionBuckets: getDistributionBucketsGS(nuroniyyahTotals),
+
+      noAnyProgressCount: noAnyProgressCount,
       evaluatedCount: evaluatedCount,
       notEvaluatedCount: notEvaluatedCount,
       evaluationCoverage: evaluationCoverage,
       completedCount: completedCount,
       incompleteCount: incompleteCount,
       completionRateAmongEvaluated: completionRateAmongEvaluated,
-      stats: stats,
-      distributionBuckets: distributionBuckets,
-      skillTransitions: resTrans.transitions,
-      notEvaluatedSkillCount: resTrans.notEvaluatedSkillCount,
+      skillTransitions: transitionResult.transitions,
+      notEvaluatedSkillCount: transitionResult.notEvaluatedSkillCount,
+      missingSkillStartCount: transitionResult.missingSkillStartCount,
       participants: participants
     };
   }
 
-  if (params.analyticsMode === 'ANNUAL') {
-    var sortedEvents = filteredEvents.slice().sort(function(a, b) { return (Number(a.sequence_no) || 0) - (Number(b.sequence_no) || 0); });
-    var annualData = sortedEvents.map(function(evt) {
-      var metrics = computeEventMetricsGS(evt.event_id);
+  var mode = upperGS(params.analyticsMode || 'SINGLE');
+
+  if (mode === 'ANNUAL' || mode === 'COHORT') {
+    var sortedEvents = filteredEvents.slice().sort(function(a, b) {
+      return (Number(a.sequence_no) || 0) - (Number(b.sequence_no) || 0);
+    });
+
+    var series = sortedEvents.map(function(eventObj) {
+      var metrics = computeEventMetrics(cleanStringGS(eventObj.event_id));
       return {
-        eventId: evt.event_id,
-        eventName: evt.event_name,
-        academicYear: evt.academic_year,
-        sequenceNo: evt.sequence_no,
+        eventId: eventObj.event_id,
+        eventName: eventObj.event_name,
+        academicYear: eventObj.academic_year,
+        sequenceNo: eventObj.sequence_no,
         participantCount: metrics.participantCount,
         validProgressCount: metrics.validProgressCount,
         missingProgressCount: metrics.missingProgressCount,
+        stats: metrics.stats,
+        totalLines: metrics.ziyadahStats.totalLines,
+        meanLines: metrics.ziyadahStats.mean,
+        medianLines: metrics.ziyadahStats.median,
+        stdDev: metrics.ziyadahStats.stdDev,
+        cv: metrics.ziyadahStats.cv,
+        ziyadahProgressCount: metrics.ziyadahProgressCount,
+        ziyadahStats: metrics.ziyadahStats,
+        nuroniyyahProgressCount: metrics.nuroniyyahProgressCount,
+        nuroniyyahStats: metrics.nuroniyyahStats,
         evaluatedCount: metrics.evaluatedCount,
         completedCount: metrics.completedCount,
         incompleteCount: metrics.incompleteCount,
         evaluationCoverage: metrics.evaluationCoverage,
-        completionRateAmongEvaluated: metrics.completionRateAmongEvaluated,
-        stats: metrics.stats,
-        totalLines: metrics.stats.totalLines,
-        meanLines: metrics.stats.mean,
-        medianLines: metrics.stats.median,
-        stdDev: metrics.stats.stdDev,
-        cv: metrics.stats.cv
+        completionRateAmongEvaluated: metrics.completionRateAmongEvaluated
       };
     });
 
-    return jsonResponse({
-      mode: 'ANNUAL',
-      eventsCount: sortedEvents.length,
-      annualData: annualData
-    });
-  }
+    if (mode === 'ANNUAL') {
+      return jsonResponse({ mode: 'ANNUAL', eventsCount: sortedEvents.length, annualData: series });
+    }
 
-  if (params.analyticsMode === 'COHORT') {
-    var sortedEvents = filteredEvents.slice().sort(function(a, b) { return (Number(a.sequence_no) || 0) - (Number(b.sequence_no) || 0); });
-    var cohortData = sortedEvents.map(function(evt) {
-      var metrics = computeEventMetricsGS(evt.event_id);
-      return {
-        eventId: evt.event_id,
-        eventName: evt.event_name,
-        academicYear: evt.academic_year,
-        sequenceNo: evt.sequence_no,
-        participantCount: metrics.participantCount,
-        validProgressCount: metrics.validProgressCount,
-        missingProgressCount: metrics.missingProgressCount,
-        evaluatedCount: metrics.evaluatedCount,
-        completedCount: metrics.completedCount,
-        incompleteCount: metrics.incompleteCount,
-        evaluationCoverage: metrics.evaluationCoverage,
-        completionRateAmongEvaluated: metrics.completionRateAmongEvaluated,
-        stats: metrics.stats,
-        totalLines: metrics.stats.totalLines,
-        meanLines: metrics.stats.mean,
-        medianLines: metrics.stats.median,
-        stdDev: metrics.stats.stdDev,
-        cv: metrics.stats.cv
-      };
-    });
-
-    var targetMetrics = targetEventId ? computeEventMetricsGS(targetEventId) : {};
-    var cohortSize = cohortStudentIds ? Object.keys(cohortStudentIds).length : 0;
-
+    var targetMetrics = targetEventId ? computeEventMetrics(targetEventId) : {};
     return jsonResponse(Object.assign({
       mode: 'COHORT',
       eventsCount: sortedEvents.length,
-      cohortSize: cohortSize,
-      cohortData: cohortData,
+      cohortSize: cohortStudentIds ? Object.keys(cohortStudentIds).length : 0,
+      cohortData: series,
       event: targetEvent
     }, targetMetrics));
   }
 
   if (!targetEventId) {
     return jsonResponse({
-      mode: params.analyticsMode || 'SINGLE',
+      mode: 'SINGLE',
       event: null,
       participantCount: 0,
       validProgressCount: 0,
       missingProgressCount: 0,
+      stats: calculateStatsGS([]),
+      distributionBuckets: [],
+      ziyadahProgressCount: 0,
+      ziyadahStats: calculateStatsGS([]),
+      nuroniyyahProgressCount: 0,
+      nuroniyyahStats: calculateStatsGS([]),
       evaluatedCount: 0,
       notEvaluatedCount: 0,
       evaluationCoverage: 0,
       completedCount: 0,
       incompleteCount: 0,
       completionRateAmongEvaluated: 0,
-      stats: calculateStatsGS([]),
-      distributionBuckets: [],
       skillTransitions: [],
       notEvaluatedSkillCount: 0,
+      missingSkillStartCount: 0,
       cohortSize: 0
     });
   }
 
-  var targetMetrics = computeEventMetricsGS(targetEventId);
-  var cohortSizeVal = cohortStudentIds ? Object.keys(cohortStudentIds).length : 0;
-
+  var metrics = computeEventMetrics(targetEventId);
   return jsonResponse(Object.assign({
-    mode: params.analyticsMode || 'SINGLE',
+    mode: 'SINGLE',
     event: targetEvent,
-    cohortSize: cohortSizeVal
-  }, targetMetrics));
+    cohortSize: cohortStudentIds ? Object.keys(cohortStudentIds).length : 0
+  }, metrics));
 }
 
-// Public Student Progress Lookup Handler
+// ====================================================
+// 23. PUBLIC STUDENT PROGRESS
+// ====================================================
+
 function handlePublicStudentProgress(payload) {
-  var accessCode = String(payload.accessCode || '').trim();
+  var accessCode = cleanStringGS(payload.accessCode);
   if (!accessCode) {
     return jsonError('VALIDATION_ERROR', 'Kode Akses wajib diisi untuk melihat perkembangan siswa.');
   }
 
-  var students = readSheetObjects('03_MASTER_STUDENTS');
-  var matchedStudent = students.find(function(s) {
-    var isCode = String(s.access_code || '').trim().toLowerCase() === accessCode.toLowerCase();
-    var isActive = s.active == null || s.active === '' || s.active === true || String(s.active) === 'true' || String(s.active).toUpperCase() === 'ACTIVE';
-    return isCode && isActive;
+  var student = readSheetObjects('03_MASTER_STUDENTS').find(function(s) {
+    return cleanStringGS(s.access_code).toLowerCase() === accessCode.toLowerCase() && isActiveRecordGS(s);
   });
 
-  if (!matchedStudent) {
+  if (!student) {
     return jsonError('NOT_FOUND', 'Kode Akses siswa tidak ditemukan atau data siswa tidak aktif.');
   }
 
-  var events = readSheetObjects('07_EVENTS');
-  var configs = readSheetObjects('01_APP_CONFIG');
-  var currConf = configs.find(function(c) { return c.config_key === 'current_event_id'; });
-  var activeId = (currConf ? currConf.config_value : '') ||
-                 (events.find(function(e) { return e.status === 'ACTIVE'; }) || events[0] || {}).event_id || '';
+  var eventObj = resolveEventObjectGS('');
+  if (!eventObj) return jsonError('NOT_FOUND', 'Kegiatan aktif tidak ditemukan.');
 
-  if (!activeId) {
-    return jsonError('NOT_FOUND', 'Kegiatan tidak aktif atau tidak ditemukan.');
-  }
-
-  var currentEvt = events.find(function(e) { return e.event_id === activeId; });
-  var participants = readSheetObjects('12_EVENT_PARTICIPANTS').filter(function(p) { return p.event_id === activeId; });
-  var participant = participants.find(function(p) { return p.student_id === matchedStudent.student_id; });
+  var eventId = cleanStringGS(eventObj.event_id);
+  var participant = readSheetObjects('12_EVENT_PARTICIPANTS').find(function(p) {
+    return cleanStringGS(p.event_id) === eventId && cleanStringGS(p.student_id) === cleanStringGS(student.student_id);
+  });
 
   if (!participant) {
     return jsonError('NOT_FOUND', 'Siswa tidak terdaftar sebagai peserta pada kegiatan aktif.');
   }
 
   var surahs = readSheetObjects('05_MASTER_SURAHS');
-  function getSurahNameGS(surahNo) {
-    if (!surahNo) return null;
-    var found = surahs.find(function(s) {
-      return Number(s.surah_no || s.surah_number || s.number || s.id) === Number(surahNo);
-    });
-    return found ? (found.surah_name || found.surah_name_latin || found.name) : ('Surah #' + surahNo);
-  }
+  var assessments = readSheetObjects('13_SESSION_ASSESSMENTS').filter(function(a) {
+    return cleanStringGS(a.event_id) === eventId && cleanStringGS(a.student_id) === cleanStringGS(student.student_id) && !isDeletedRecordGS(a);
+  });
 
-  var allAssessments = readSheetObjects('13_SESSION_ASSESSMENTS')
-    .filter(function(a) { return a.event_id === activeId && !a.is_deleted && String(a.is_deleted) !== 'true' && a.student_id === matchedStudent.student_id; });
+  var evaluation = readSheetObjects('14_FINAL_EVALUATIONS').find(function(e) {
+    return cleanStringGS(e.event_id) === eventId && (
+      cleanStringGS(e.student_id) === cleanStringGS(student.student_id) ||
+      cleanStringGS(e.participant_id) === cleanStringGS(participant.participant_id)
+    );
+  });
 
-  var evals = readSheetObjects('14_FINAL_EVALUATIONS').filter(function(e) { return e.event_id === activeId; });
-  var studentEval = evals.find(function(e) { return e.student_id === matchedStudent.student_id || e.participant_id === participant.participant_id; });
+  var progress = summarizeAssessmentsByModeGS(assessments);
+  var gradeClass = participant.grade_snapshot && participant.class_snapshot
+    ? participant.grade_snapshot + ' (' + participant.class_snapshot + ')'
+    : participant.grade_snapshot || participant.class_snapshot || 'Belum tersedia';
 
-  var totalLinesAdded = allAssessments
-    .filter(function(a) { return a.attendance_status === 'PRESENT'; })
-    .reduce(function(sum, a) { return sum + (Number(a.lines_added) || 0); }, 0);
-
-  var gradeClassText = (participant.grade_snapshot && participant.class_snapshot)
-    ? (participant.grade_snapshot + ' (' + participant.class_snapshot + ')')
-    : (participant.grade_snapshot || participant.class_snapshot || 'Belum tersedia');
-
-  var baselineText = participant.baseline_surah
-    ? (getSurahNameGS(participant.baseline_surah) + (participant.baseline_ayah ? (' Ayat ' + participant.baseline_ayah) : ''))
+  var baselineText = hasValueGS(participant.baseline_surah)
+    ? getSurahNameFromListGS(surahs, participant.baseline_surah) + (hasValueGS(participant.baseline_ayah) ? ' Ayat ' + participant.baseline_ayah : '')
     : 'Belum diisi';
 
-  var sessionsList = allAssessments.map(function(a) {
-    var isPresent = a.attendance_status === 'PRESENT';
-    return {
+  var sessionsList = assessments.map(function(a) {
+    var attendance = upperGS(a.attendance_status);
+    var present = attendance === 'PRESENT';
+    var mode = normalizeAssessmentModeGS(a);
+    var rawMode = getRawAssessmentModeGS(a);
+
+    var item = {
       sessionNo: Number(a.session_no) || 0,
-      attendance: a.attendance_status,
-      surahName: isPresent ? getSurahNameGS(a.surah_start) : null,
-      ayahRange: (isPresent && a.ayah_start != null && a.ayah_end != null) ? (a.ayah_start + '–' + a.ayah_end) : null,
-      linesAdded: isPresent ? (Number(a.lines_added) || 0) : null
+      attendance: attendance,
+      mode: present ? mode : null,
+      surahName: null,
+      ayahRange: null,
+      nuroniyyahDars: null,
+      linesAdded: present ? Number(a.lines_added) || 0 : null
     };
+
+    if (!present) return item;
+
+    if (mode === ASSESSMENT_MODES.NURONIYYAH) {
+      item.nuroniyyahDars = rawMode === ASSESSMENT_MODES.IQRA
+        ? buildLegacyIqraLabelGS(a)
+        : cleanStringGS(a.nuroniyyah_dars) || null;
+      return item;
+    }
+
+    item.surahName = getSurahNameFromListGS(surahs, a.surah_start);
+    item.ayahRange = hasValueGS(a.ayah_start) && hasValueGS(a.ayah_end)
+      ? a.ayah_start + '–' + a.ayah_end
+      : null;
+    return item;
   });
 
   sessionsList.sort(function(a, b) { return a.sessionNo - b.sessionNo; });
 
+  var halaqah = readSheetObjects('10_HALAQAH').find(function(h) {
+    return cleanStringGS(h.halaqah_id) === cleanStringGS(participant.halaqah_id);
+  });
+
+  var targetText = formatParticipantTargetGS(participant, halaqah);
+  if (targetText === 'Belum ditentukan') {
+    if (hasValueGS(participant.target_surah_start)) {
+      targetText = getSurahNameFromListGS(surahs, participant.target_surah_start) + ' s/d ' +
+        getSurahNameFromListGS(surahs, participant.target_surah_end || participant.target_surah_start);
+    } else {
+      targetText = 'Belum diisi';
+    }
+  }
+
   return jsonResponse({
-    studentName: matchedStudent.full_name,
-    nis: matchedStudent.nis || '',
-    gradeClass: gradeClassText,
-    eventName: currentEvt ? currentEvt.event_name : 'Rumah Tahfidz',
+    studentName: student.full_name,
+    nis: student.nis || '',
+    gradeClass: gradeClass,
+    eventName: eventObj.event_name || 'Rumah Tahfidz',
     baselineText: baselineText,
-    targetText: participant.target_surah_start ? (getSurahNameGS(participant.target_surah_start) + ' s/d ' + (participant.target_surah_end ? getSurahNameGS(participant.target_surah_end) : getSurahNameGS(participant.target_surah_start))) : 'Belum diisi',
-    targetLines: participant.target_lines || null,
-    totalLinesAdded: totalLinesAdded,
-    completionStatus: studentEval ? studentEval.completion_status : 'NOT_EVALUATED',
+    targetText: targetText,
+    targetLines: toNumberOrUndefinedGS(participant.target_lines) || null,
+    totalLinesAdded: progress.ziyadahLines,
+    totalZiyadahLinesAdded: progress.ziyadahLines,
+    totalNuroniyyahLinesAdded: progress.nuroniyyahLines,
+    completionStatus: evaluation ? evaluation.completion_status : 'NOT_EVALUATED',
     sessions: sessionsList
   });
 }
 
-function generateRandomAccessCodeGS(existingCodes) {
-  var chars = '23456789ABCDEFGHJKMNPQRSTUVWXYZ';
-  var code = '';
-  do {
-    var rand = '';
-    for (var i = 0; i < 6; i++) {
-      rand += chars.charAt(Math.floor(Math.random() * chars.length));
-    }
-    code = 'RT-' + rand;
-  } while (existingCodes && existingCodes.indexOf(code) !== -1);
-  return code;
-}
+// ====================================================
+// 24. DUPLICATE CLEANUP UTILITY
+// ====================================================
 
-/**
- * Handle bulk registration and assignment of students from Master Siswa to Halaqah.
- * Restricted to ADMIN and COORDINATOR.
- */
-function handleBulkRegisterAndAssignStudentsToHalaqah(payload, authToken) {
-  var sess = requireRole(authToken, ['ADMIN', 'COORDINATOR']);
-  var eventId = payload.eventId;
-  var studentIds = payload.studentIds || [];
-  var targetHalaqahId = payload.targetHalaqahId || '';
-
-  var allEvents = readSheetObjects('07_EVENTS');
-  var targetEvent = allEvents.find(function(e) { return e.event_id === eventId; });
-  if (!targetEvent) {
-    return jsonError('NOT_FOUND', 'Kegiatan tidak ditemukan.');
-  }
-
-  var halaqahs = readSheetObjects('10_HALAQAH');
-  var targetHalaqah = null;
-  if (targetHalaqahId) {
-    targetHalaqah = halaqahs.find(function(h) { return h.halaqah_id === targetHalaqahId; });
-    if (!targetHalaqah) {
-      return jsonError('NOT_FOUND', 'Halaqah tujuan tidak ditemukan.');
-    }
-    if (targetHalaqah.event_id !== eventId) {
-      return jsonError('VALIDATION_ERROR', 'Halaqah tujuan tidak terdaftar pada kegiatan ini.');
-    }
-  }
-
-  var allParticipants = readSheetObjects('12_EVENT_PARTICIPANTS');
-  var allStudents = readSheetObjects('03_MASTER_STUDENTS');
-
-  // Build lookup maps for O(1) lookups
-  var studentMap = {};
-  allStudents.forEach(function(s) { studentMap[s.student_id] = s; });
-
-  var participantMap = {};
-  allParticipants.forEach(function(p) {
-    if (p.event_id === eventId) {
-      participantMap[p.student_id] = p;
-    }
-  });
-
-  var createdCount = 0;
-  var updatedCount = 0;
-  var skippedRecords = [];
-
-  studentIds.forEach(function(sid) {
-    var student = studentMap[sid];
-    if (!student) {
-      skippedRecords.push({ studentId: sid, reason: 'Data siswa tidak ditemukan di Master Siswa.' });
-      return;
-    }
-
-    var isStudentActive = student.active == null || student.active === '' || student.active === true || String(student.active) === 'true' || String(student.active).toUpperCase() === 'ACTIVE';
-    if (!isStudentActive) {
-      skippedRecords.push({ studentId: sid, studentName: student.full_name, reason: 'Status siswa tidak aktif di Master Siswa.' });
-      return;
-    }
-
-    if (targetHalaqah && targetHalaqah.gender && student.gender) {
-      var halaqahGenderNorm = String(targetHalaqah.gender).toUpperCase();
-      var studentGenderNorm = String(student.gender).toUpperCase();
-      if (halaqahGenderNorm !== studentGenderNorm) {
-        skippedRecords.push({
-          studentId: sid,
-          studentName: student.full_name,
-          reason: 'Gender siswa (' + student.gender + ') tidak sesuai dengan gender halaqah (' + targetHalaqah.gender + ')'
-        });
-        return;
-      }
-    }
-
-    var participant = participantMap[sid];
-    var nowIso = new Date().toISOString();
-
-    if (participant) {
-      participant.halaqah_id = targetHalaqahId;
-      participant.session_group_id = targetHalaqah ? (targetHalaqah.session_group_id || '') : (participant.session_group_id || '');
-      participant.updated_at = nowIso;
-      upsertObject('12_EVENT_PARTICIPANTS', ['participant_id'], participant, 'participant_id');
-      updatedCount++;
-    } else {
-      var newParticipantId = 'PART_' + Utilities.getUuid().replace(/-/g, '').substring(0, 16);
-      var newParticipant = {
-        participant_id: newParticipantId,
-        event_id: eventId,
-        student_id: student.student_id,
-        class_snapshot: student.class_name || '',
-        grade_snapshot: student.grade_level || '',
-        halaqah_id: targetHalaqahId,
-        session_group_id: targetHalaqah ? (targetHalaqah.session_group_id || '') : '',
-        participant_status: 'ACTIVE',
-        created_at: nowIso,
-        updated_at: nowIso,
-        skill_status_start: '',
-        baseline_surah: '',
-        baseline_ayah: '',
-        baseline_note: '',
-        baseline_date: '',
-        target_surah_start: '',
-        target_ayah_start: '',
-        target_surah_end: '',
-        target_ayah_end: '',
-        target_lines: '',
-        target_note: ''
-      };
-      upsertObject('12_EVENT_PARTICIPANTS', ['participant_id'], newParticipant, 'participant_id');
-      participantMap[sid] = newParticipant;
-      createdCount++;
-    }
-  });
-
-  var skippedStudentIds = skippedRecords.map(function(r) { return r.studentId; });
-  addAuditLog('BULK_REGISTER_ASSIGN_HALAQAH', 'PARTICIPANT', targetHalaqahId || eventId, null, {
-    createdCount: createdCount,
-    updatedCount: updatedCount,
-    skippedCount: skippedRecords.length,
-    targetHalaqahId: targetHalaqahId
-  }, null, sess.user_id, eventId);
-
-  return jsonResponse({
-    createdCount: createdCount,
-    updatedCount: updatedCount,
-    skippedCount: skippedRecords.length,
-    skippedStudentIds: skippedStudentIds,
-    skippedRecords: skippedRecords
-  });
-}
-
-/**
- * Utility function to clean up duplicate active assignments in 11_HALAQAH_TEACHERS.
- * Keeps the oldest assignment active (by created_at ascending), deactivates subsequent duplicates (active = FALSE).
- * Run manually from the Apps Script editor when needed.
- */
 function cleanupDuplicateHalaqahTeacherAssignments() {
-  Logger.log('Starting duplicate cleanup for 11_HALAQAH_TEACHERS...');
-  var allHts = readSheetObjects('11_HALAQAH_TEACHERS');
-
-  // Filter only active assignments
-  var activeHts = allHts.filter(function(item) {
-    return item.active === true || String(item.active).toLowerCase() === 'true';
-  });
-
-  // Group by event_id + halaqah_id + teacher_id
+  var allAssignments = readSheetObjects('11_HALAQAH_TEACHERS');
+  var active = allAssignments.filter(function(item) { return isActiveRecordGS(item); });
   var groups = {};
-  activeHts.forEach(function(item) {
-    var key = String(item.event_id || '').trim() + '|||' + String(item.halaqah_id || '').trim() + '|||' + String(item.teacher_id || '').trim();
-    if (!groups[key]) {
-      groups[key] = [];
-    }
+
+  active.forEach(function(item) {
+    var key = cleanStringGS(item.event_id) + '|||' + cleanStringGS(item.halaqah_id) + '|||' + cleanStringGS(item.teacher_id);
+    if (!groups[key]) groups[key] = [];
     groups[key].push(item);
   });
 
   var duplicateGroupsCount = 0;
   var deactivatedCount = 0;
   var retainedCount = 0;
-  var nowIso = new Date().toISOString();
+  var now = nowIsoGS();
 
-  for (var key in groups) {
-    if (groups.hasOwnProperty(key)) {
-      var list = groups[key];
-      if (list.length > 1) {
-        duplicateGroupsCount++;
-        // Sort by created_at ascending (oldest first)
-        list.sort(function(a, b) {
-          var dateA = a.created_at ? new Date(a.created_at).getTime() : 0;
-          var dateB = b.created_at ? new Date(b.created_at).getTime() : 0;
-          return dateA - dateB;
-        });
-
-        // Retain oldest
-        var kept = list[0];
-        retainedCount++;
-        Logger.log('Group [' + key + '] -> Retaining oldest assignment: ' + kept.assignment_id + ' (created: ' + kept.created_at + ')');
-
-        // Deactivate remaining duplicates
-        for (var i = 1; i < list.length; i++) {
-          var dup = list[i];
-          var ok = updateObject('11_HALAQAH_TEACHERS', 'assignment_id', dup.assignment_id, {
-            active: 'FALSE',
-            updated_at: nowIso
-          });
-          if (ok) {
-            deactivatedCount++;
-            Logger.log('  Deactivated duplicate: ' + dup.assignment_id + ' (created: ' + dup.created_at + ')');
-          } else {
-            Logger.log('  Failed to deactivate duplicate: ' + dup.assignment_id);
-          }
-        }
-      } else if (list.length === 1) {
-        retainedCount++;
-      }
+  Object.keys(groups).forEach(function(key) {
+    var list = groups[key];
+    if (list.length <= 1) {
+      retainedCount += list.length;
+      return;
     }
-  }
 
-  Logger.log('=== CLEANUP SUMMARY ===');
-  Logger.log('Duplicate groups found: ' + duplicateGroupsCount);
-  Logger.log('Assignments deactivated: ' + deactivatedCount);
-  Logger.log('Assignments retained: ' + retainedCount);
-  Logger.log('Cleanup completed successfully.');
+    duplicateGroupsCount++;
+    list.sort(function(a, b) {
+      var aTime = a.created_at ? new Date(a.created_at).getTime() : 0;
+      var bTime = b.created_at ? new Date(b.created_at).getTime() : 0;
+      return aTime - bTime;
+    });
+
+    retainedCount++;
+    for (var i = 1; i < list.length; i++) {
+      if (updateObject('11_HALAQAH_TEACHERS', 'assignment_id', list[i].assignment_id, {
+        active: false,
+        updated_at: now
+      })) deactivatedCount++;
+    }
+  });
+
+  Logger.log(JSON.stringify({
+    duplicateGroupsCount: duplicateGroupsCount,
+    deactivatedCount: deactivatedCount,
+    retainedCount: retainedCount
+  }));
 }
 
-/**
- * Reusable helper: normalizeClockTime(value)
- * Normalizes clock time into strict "HH:mm" (e.g., "08:00", "10:00", "19:15").
- * Supports:
- * - "08:00"
- * - "08:00:00" or "10:00:00"
- * - Date objects from Google Sheets (local time getHours/getMinutes)
- * - Display values from Google Sheets
- * - 12-hour values like "8:00 AM" or "07:15 PM"
- * - ISO datetime strings from previous saves like "1899-12-30T02:52:48.000Z"
- * Returns: "HH:mm" string or "" if invalid. Never converts clock time into an ISO Date.
- */
+// ====================================================
+// 25. TIME NORMALIZATION
+// ====================================================
+
 function normalizeClockTime(value) {
   if (value === undefined || value === null) return '';
+
   if (value instanceof Date) {
-    var h = ('0' + value.getHours()).slice(-2);
-    var m = ('0' + value.getMinutes()).slice(-2);
-    return h + ':' + m;
+    return ('0' + value.getHours()).slice(-2) + ':' + ('0' + value.getMinutes()).slice(-2);
   }
-  var str = String(value).trim();
+
+  var str = cleanStringGS(value);
   if (!str) return '';
 
-  // 1. Check HH:mm or HH:mm:ss or H:mm:ss or H:mm
-  var match = str.match(/^([01]?\d|2[0-3]):([0-5]\d)(?::[0-5]\d)?$/);
-  if (match) {
-    var hour = ('0' + match[1]).slice(-2);
-    var minute = match[2];
-    return hour + ':' + minute;
-  }
+  var match24 = str.match(/^([01]?\d|2[0-3]):([0-5]\d)(?::[0-5]\d)?$/);
+  if (match24) return ('0' + match24[1]).slice(-2) + ':' + match24[2];
 
-  // 2. Check 12-hour format e.g. "8:00 AM", "08:00:00 PM"
   var match12 = str.match(/^([0]?[1-9]|1[0-2]):([0-5]\d)(?::[0-5]\d)?\s*([AP]M)$/i);
   if (match12) {
-    var hourNum = parseInt(match12[1], 10);
-    var isPM = match12[3].toUpperCase() === 'PM';
-    if (isPM && hourNum < 12) hourNum += 12;
-    if (!isPM && hourNum === 12) hourNum = 0;
-    return ('0' + hourNum).slice(-2) + ':' + match12[2];
+    var hour = parseInt(match12[1], 10);
+    var isPM = upperGS(match12[3]) === 'PM';
+    if (isPM && hour < 12) hour += 12;
+    if (!isPM && hour === 12) hour = 0;
+    return ('0' + hour).slice(-2) + ':' + match12[2];
   }
 
-  // 3. Check ISO string like 1899-12-30T08:00:00.000Z or 1899-12-30T02:52:48.000Z
   var matchIso = str.match(/T([01]?\d|2[0-3]):([0-5]\d)/);
-  if (matchIso) {
-    var hourIso = ('0' + matchIso[1]).slice(-2);
-    var minIso = matchIso[2];
-    return hourIso + ':' + minIso;
-  }
+  if (matchIso) return ('0' + matchIso[1]).slice(-2) + ':' + matchIso[2];
 
   return '';
 }
@@ -3410,5 +3319,71 @@ function normalizeTimeFormatGS(timeVal) {
   return normalizeClockTime(timeVal);
 }
 
+// ====================================================
+// 26. MANUAL BACKEND SELF-CHECK
+// ====================================================
 
+/**
+ * Run manually from Apps Script editor after deploying this rewrite.
+ * It does NOT change data. It only logs missing sheets/headers.
+ */
+function backendSelfCheckGS() {
+  var required = {
+    '01_APP_CONFIG': ['config_key', 'config_value'],
+    '03_MASTER_STUDENTS': ['student_id', 'full_name', 'access_code', 'active'],
+    '04_MASTER_TEACHERS': ['teacher_id', 'full_name', 'active'],
+    '05_MASTER_SURAHS': ['surah_no', 'surah_name'],
+    '06_USERS': ['user_id', 'username', 'password_hash', 'display_name', 'role', 'teacher_id', 'active'],
+    '07_EVENTS': ['event_id', 'event_name', 'status'],
+    '07A_EVENT_DAYS': ['event_day_id', 'event_id'],
+    '08_SESSION_GROUPS': ['session_group_id', 'event_id'],
+    '09_SESSION_CONFIG': ['session_config_id', 'event_id', 'session_group_id', 'session_no', 'start_time', 'end_time'],
+    '10_HALAQAH': ['halaqah_id', 'event_id', 'halaqah_name', 'session_group_id', 'active'],
+    '11_HALAQAH_TEACHERS': ['assignment_id', 'event_id', 'halaqah_id', 'teacher_id', 'teacher_role', 'active'],
+    '12_EVENT_PARTICIPANTS': ['participant_id', 'event_id', 'student_id', 'halaqah_id', 'session_group_id', 'skill_status_start', 'target_lines', 'target_source'],
+    '13_SESSION_ASSESSMENTS': ['assessment_id', 'event_id', 'session_config_id', 'participant_id', 'student_id', 'halaqah_id', 'attendance_status', 'assessment_mode', 'lines_added', 'nuroniyyah_dars', 'teacher_id', 'is_deleted'],
+    '14_FINAL_EVALUATIONS': ['final_evaluation_id', 'event_id', 'participant_id', 'student_id', 'completion_status', 'skill_status_end', 'evaluator_teacher_id'],
+    '15_AUDIT_LOG': ['log_id', 'timestamp', 'user_id', 'action', 'entity_type', 'entity_id'],
+    '16_SESSIONS': ['session_token', 'user_id', 'role', 'teacher_id', 'created_at', 'last_seen_at', 'revoked', 'revoked_at']
+  };
 
+  var recommended = {
+    '10_HALAQAH': ['target_ziyadah_lines', 'target_nuroniyyah_lines'],
+    '12_EVENT_PARTICIPANTS': ['target_nuroniyyah_lines', 'target_iqra_pages', 'assignment_note'],
+    '13_SESSION_ASSESSMENTS': ['iqra_level', 'iqra_page_start', 'iqra_page_end']
+  };
+
+  var report = {
+    ok: true,
+    missingSheets: [],
+    missingRequiredHeaders: {},
+    missingRecommendedHeaders: {}
+  };
+
+  Object.keys(required).forEach(function(sheetName) {
+    var sheet = getSpreadsheet().getSheetByName(sheetName);
+    if (!sheet) {
+      report.ok = false;
+      report.missingSheets.push(sheetName);
+      return;
+    }
+
+    var headers = getHeadersGS(sheet);
+    var missing = required[sheetName].filter(function(header) { return headers.indexOf(header) === -1; });
+    if (missing.length) {
+      report.ok = false;
+      report.missingRequiredHeaders[sheetName] = missing;
+    }
+  });
+
+  Object.keys(recommended).forEach(function(sheetName) {
+    var sheet = getSpreadsheet().getSheetByName(sheetName);
+    if (!sheet) return;
+    var headers = getHeadersGS(sheet);
+    var missing = recommended[sheetName].filter(function(header) { return headers.indexOf(header) === -1; });
+    if (missing.length) report.missingRecommendedHeaders[sheetName] = missing;
+  });
+
+  Logger.log(JSON.stringify(report, null, 2));
+  return report;
+}

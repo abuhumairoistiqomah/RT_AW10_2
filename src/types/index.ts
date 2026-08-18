@@ -320,10 +320,13 @@ export interface TeacherStudentSummary {
   target_surah_end?: number;
   target_ayah_end?: number;
   target_lines?: number;
+  target_nuroniyyah_lines?: number;
   target_iqra_pages?: number;
   target_source?: TargetSource;
   targetText: string;
   totalLinesAdded: number;
+  totalZiyadahLinesAdded?: number;
+  totalNuroniyyahLinesAdded?: number;
   completionStatus: string;
   session_group_id?: string;
 }
@@ -341,6 +344,9 @@ export interface TeacherWorkspaceBootstrap {
     grade_group?: string;
     session_group_id?: string;
     location?: string;
+    target_ziyadah_lines?: number;
+    target_nuroniyyah_lines?: number;
+    target_iqra_pages?: number;
     active: boolean;
   } | null;
   availableHalaqahs: Halaqah[];
