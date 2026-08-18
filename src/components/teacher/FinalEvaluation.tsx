@@ -1,11 +1,12 @@
-import React, { useState, useEffect, useMemo } from 'react';
+import React, { useState, useEffect, useMemo, useRef } from 'react';
 import { User, CompletionStatus, SkillStatus } from '../../types';
 import { useTeacherWorkspace } from '../../context/TeacherWorkspaceContext';
 import { TeacherSyncBadge } from './TeacherSyncBadge';
 import { getSurahNameFormatted, validateAyah, formatCurrentProgress } from '../../utils/quran';
+import { Toast } from '../common/Toast';
 import {
   Award, CheckCircle2, Save,
-  AlertCircle, UserCheck, RefreshCw, ArrowRight
+  AlertCircle, UserCheck, RefreshCw, ArrowRight, Loader2
 } from 'lucide-react';
 import { SurahAutocomplete } from '../common/SurahAutocomplete';
 
@@ -31,9 +32,13 @@ export const FinalEvaluation: React.FC<FinalEvaluationProps> = ({ currentUser, i
 
   const [submitting, setSubmitting] = useState<boolean>(false);
 
-  // Success / Error messages
+  // Success / Error messages & Floating Toast
   const [successMsg, setSuccessMsg] = useState<string>('');
   const [errorMsg, setErrorMsg] = useState<string>('');
+  const [toast, setToast] = useState<{ message: string; detail?: string; type: 'success' | 'error' } | null>(null);
+
+  // Ref to form top for smooth scrolling after save
+  const formTopRef = useRef<HTMLDivElement>(null);
 
   // Selected State
   const [selectedStudentId, setSelectedStudentId] = useState<string>(initialStudentId || '');
@@ -217,6 +222,11 @@ export const FinalEvaluation: React.FC<FinalEvaluationProps> = ({ currentUser, i
     const valErr = validateForm();
     if (valErr) {
       setErrorMsg(valErr);
+      setToast({
+        type: 'error',
+        message: 'Validasi formulir tidak lengkap',
+        detail: valErr
+      });
       return;
     }
 
@@ -240,11 +250,35 @@ export const FinalEvaluation: React.FC<FinalEvaluationProps> = ({ currentUser, i
         evaluator_teacher_id: evaluatorTeacherId
       };
 
-      saveFinalEvaluationOptimistic(payload);
+      const saveResult = await saveFinalEvaluationOptimistic(payload);
+      if (saveResult && saveResult.success === false) {
+        throw new Error(saveResult.error || 'Gagal menyimpan evaluasi akhir.');
+      }
 
-      setSuccessMsg(`Evaluasi akhir untuk ${selectedStudent?.full_name || 'siswa'} berhasil disimpan!`);
+      const studentName = selectedStudent?.full_name || 'siswa';
+      setSuccessMsg(`✓ Evaluasi akhir untuk ${studentName} berhasil disimpan!`);
+      setToast({
+        type: 'success',
+        message: '✓ Data berhasil disimpan.',
+        detail: `Evaluasi akhir untuk ${studentName} berhasil disimpan dan disinkronkan.`
+      });
+
+      // Smooth scroll to top of evaluation form
+      setTimeout(() => {
+        formTopRef.current?.scrollIntoView({
+          behavior: 'smooth',
+          block: 'start'
+        });
+      }, 60);
+
     } catch (err: any) {
-      setErrorMsg('Gagal menyimpan evaluasi akhir: ' + (err.message || ''));
+      setErrorMsg('Gagal menyimpan evaluasi akhir: ' + (err.message || 'Silakan coba lagi.'));
+      setToast({
+        type: 'error',
+        message: 'Gagal menyimpan data.',
+        detail: err.message || 'Terjadi kesalahan saat menyimpan evaluasi akhir.'
+      });
+      // Do NOT scroll away on error - preserve form values and teacher position
     } finally {
       setSubmitting(false);
     }
@@ -259,6 +293,11 @@ export const FinalEvaluation: React.FC<FinalEvaluationProps> = ({ currentUser, i
     const valErr = validateForm();
     if (valErr) {
       setErrorMsg(valErr);
+      setToast({
+        type: 'error',
+        message: 'Validasi formulir tidak lengkap',
+        detail: valErr
+      });
       return;
     }
 
@@ -282,18 +321,48 @@ export const FinalEvaluation: React.FC<FinalEvaluationProps> = ({ currentUser, i
         evaluator_teacher_id: evaluatorTeacherId
       };
 
-      saveFinalEvaluationOptimistic(payload);
+      const saveResult = await saveFinalEvaluationOptimistic(payload);
+      if (saveResult && saveResult.success === false) {
+        throw new Error(saveResult.error || 'Gagal menyimpan evaluasi akhir.');
+      }
 
+      const studentName = selectedStudent?.full_name || 'siswa';
       const currentIndex = students.findIndex(s => s.student_id === selectedStudentId);
+
       if (currentIndex >= 0 && currentIndex < students.length - 1) {
         const nextStudent = students[currentIndex + 1];
         setSelectedStudentId(nextStudent.student_id);
-        setSuccessMsg(`Evaluasi ${selectedStudent?.full_name || 'siswa'} tersimpan! Beralih ke: ${nextStudent.full_name}`);
+        setSuccessMsg(`✓ Evaluasi ${studentName} berhasil disimpan. Beralih ke: ${nextStudent.full_name}`);
+        setToast({
+          type: 'success',
+          message: '✓ Data berhasil disimpan.',
+          detail: `Evaluasi akhir ${studentName} tersimpan. Menampilkan formulir: ${nextStudent.full_name}`
+        });
       } else {
-        setSuccessMsg(`Evaluasi ${selectedStudent?.full_name || 'siswa'} tersimpan! Semua siswa dalam halaqah ini telah selesai.`);
+        setSuccessMsg(`✓ Evaluasi ${studentName} berhasil disimpan! (Semua siswa dalam halaqah ini telah dievaluasi)`);
+        setToast({
+          type: 'success',
+          message: '✓ Data berhasil disimpan.',
+          detail: `Evaluasi akhir ${studentName} tersimpan. Semua siswa dalam halaqah ini telah selesai.`
+        });
       }
+
+      // Smooth scroll to top of evaluation form
+      setTimeout(() => {
+        formTopRef.current?.scrollIntoView({
+          behavior: 'smooth',
+          block: 'start'
+        });
+      }, 60);
+
     } catch (err: any) {
-      setErrorMsg('Gagal menyimpan evaluasi akhir: ' + (err.message || ''));
+      setErrorMsg('Gagal menyimpan evaluasi akhir: ' + (err.message || 'Silakan coba lagi.'));
+      setToast({
+        type: 'error',
+        message: 'Gagal menyimpan data.',
+        detail: err.message || 'Terjadi kesalahan saat menyimpan evaluasi akhir.'
+      });
+      // Do NOT scroll away on error - preserve form values and teacher position
     } finally {
       setSubmitting(false);
     }
@@ -388,7 +457,16 @@ export const FinalEvaluation: React.FC<FinalEvaluationProps> = ({ currentUser, i
   }
 
   return (
-    <div className="max-w-4xl mx-auto px-4 py-8 space-y-6 animate-in fade-in">
+    <div className="max-w-4xl mx-auto px-4 py-8 space-y-6 animate-in fade-in relative">
+      {/* Floating Save Toast Notification */}
+      {toast && (
+        <Toast
+          message={toast.message}
+          detail={toast.detail}
+          type={toast.type}
+          onClose={() => setToast(null)}
+        />
+      )}
       
       {/* Top Sync & Action Header */}
       <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-4">
@@ -451,85 +529,88 @@ export const FinalEvaluation: React.FC<FinalEvaluationProps> = ({ currentUser, i
         </div>
       </div>
 
-      {/* Success & Error Alerts */}
-      {successMsg && (
-        <div className="p-4 bg-emerald-50 border border-emerald-200 text-emerald-800 rounded font-semibold text-xs flex items-center space-x-2 border-l-4 border-l-emerald-500">
-          <CheckCircle2 className="w-5 h-5 text-emerald-600 shrink-0" />
-          <span>{successMsg}</span>
-        </div>
-      )}
+      {/* Form Top Anchor for Smooth Scrolling & Student Context */}
+      <div ref={formTopRef} className="scroll-mt-6 space-y-4">
+        {/* Success & Error Alerts */}
+        {successMsg && (
+          <div className="p-4 bg-emerald-50 border border-emerald-200 text-emerald-800 rounded font-semibold text-xs flex items-center space-x-2 border-l-4 border-l-emerald-500">
+            <CheckCircle2 className="w-5 h-5 text-emerald-600 shrink-0" />
+            <span>{successMsg}</span>
+          </div>
+        )}
 
-      {errorMsg && (
-        <div className="p-4 bg-rose-50 border border-rose-200 text-rose-800 rounded font-semibold text-xs flex items-center space-x-2 border-l-4 border-l-rose-500">
-          <AlertCircle className="w-5 h-5 text-rose-600 shrink-0" />
-          <span>{errorMsg}</span>
-        </div>
-      )}
+        {errorMsg && (
+          <div className="p-4 bg-rose-50 border border-rose-200 text-rose-800 rounded font-semibold text-xs flex items-center space-x-2 border-l-4 border-l-rose-500">
+            <AlertCircle className="w-5 h-5 text-rose-600 shrink-0" />
+            <span>{errorMsg}</span>
+          </div>
+        )}
 
-      {/* Student Context Card */}
-      {selectedStudent && (
-        <div className="bg-white p-5 rounded border border-slate-200 shadow-sm space-y-3">
-          <div className="flex items-center justify-between pb-3 border-b border-slate-100">
-            <div>
-              <span className="text-[10px] font-bold uppercase tracking-wider text-blue-600 bg-blue-50 px-2 py-0.5 rounded border border-blue-100">
-                Konteks Perkembangan Siswa
-              </span>
-              <h3 className="text-base font-bold text-slate-900 mt-1">
-                {selectedStudent.full_name} <span className="text-xs font-normal text-slate-500">(NIS: {selectedStudent.nis || 'Belum tersedia'})</span>
-              </h3>
+        {/* Student Context Card */}
+        {selectedStudent && (
+          <div className="bg-white p-5 rounded border border-slate-200 shadow-sm space-y-3">
+            <div className="flex items-center justify-between pb-3 border-b border-slate-100">
+              <div>
+                <span className="text-[10px] font-bold uppercase tracking-wider text-blue-600 bg-blue-50 px-2 py-0.5 rounded border border-blue-100">
+                  Konteks Perkembangan Siswa
+                </span>
+                <h3 className="text-base font-bold text-slate-900 mt-1">
+                  {selectedStudent.full_name} <span className="text-xs font-normal text-slate-500">(NIS: {selectedStudent.nis || 'Belum tersedia'})</span>
+                </h3>
+              </div>
+              <div className="text-right">
+                <span className="text-xs font-bold text-slate-700 block">Kelas</span>
+                <span className="text-xs font-semibold text-slate-500">{selectedStudent.grade_class || 'Belum tersedia'}</span>
+              </div>
             </div>
-            <div className="text-right">
-              <span className="text-xs font-bold text-slate-700 block">Kelas</span>
-              <span className="text-xs font-semibold text-slate-500">{selectedStudent.grade_class || 'Belum tersedia'}</span>
+
+            <div className="grid grid-cols-2 md:grid-cols-4 gap-3 text-xs pt-1">
+              <div className="p-2.5 bg-slate-50 rounded border border-slate-200/80">
+                <span className="text-[10px] uppercase font-bold text-slate-400 block mb-0.5">Kemampuan Awal</span>
+                <span className="font-bold text-slate-800">
+                  {selectedStudent?.skill_status_start === 'NON_BBL' ? 'NON-BBL' : selectedStudent?.skill_status_start === 'BBL' ? 'BBL' : selectedStudent?.skill_status_start === 'BBLS' ? 'BBLS' : 'Belum tersedia'}
+                </span>
+              </div>
+
+              <div className="p-2.5 bg-slate-50 rounded border border-slate-200/80">
+                <span className="text-[10px] uppercase font-bold text-slate-400 block mb-0.5">Baseline Awal</span>
+                <span className="font-bold text-slate-800">
+                  {selectedStudent?.baseline_surah ? `${getSurahNameFormatted(selectedStudent.baseline_surah)} : Ayat ${selectedStudent.baseline_ayah || 1}` : 'Belum tersedia'}
+                </span>
+              </div>
+
+              <div className="p-2.5 bg-slate-50 rounded border border-slate-200/80">
+                <span className="text-[10px] uppercase font-bold text-slate-400 block mb-0.5">Target Kegiatan</span>
+                <span className="font-bold text-slate-800">
+                  {selectedStudent?.targetText || (selectedStudent?.target_lines ? `${selectedStudent.target_lines} Baris` : 'Belum tersedia')}
+                </span>
+              </div>
+
+              <div className="p-2.5 bg-blue-50/60 rounded border border-blue-100">
+                <span className="text-[10px] uppercase font-bold text-blue-600 block mb-0.5">Total Baris Ditambah</span>
+                <span className="font-bold text-blue-900">
+                  {studentMetrics.totalLines > 0 ? `${studentMetrics.totalLines} Baris` : 'Belum tersedia'}
+                </span>
+              </div>
+            </div>
+
+            <div className="flex items-center justify-between text-[11px] text-slate-500 pt-1">
+              <div>
+                <span className="font-semibold text-slate-700">Setoran Terakhir: </span>
+                <span>
+                  {studentMetrics.latestSetoran
+                    ? formatCurrentProgress(studentMetrics.latestSetoran)
+                    : 'Belum ada setoran'}
+                </span>
+              </div>
+              <div>
+                <span className="font-semibold text-slate-700">Cakupan Sesi: </span>
+                <span>{studentMetrics.coverageText}</span>
+              </div>
             </div>
           </div>
-
-          <div className="grid grid-cols-2 md:grid-cols-4 gap-3 text-xs pt-1">
-            <div className="p-2.5 bg-slate-50 rounded border border-slate-200/80">
-              <span className="text-[10px] uppercase font-bold text-slate-400 block mb-0.5">Kemampuan Awal</span>
-              <span className="font-bold text-slate-800">
-                {selectedStudent?.skill_status_start === 'NON_BBL' ? 'NON-BBL' : selectedStudent?.skill_status_start === 'BBL' ? 'BBL' : selectedStudent?.skill_status_start === 'BBLS' ? 'BBLS' : 'Belum tersedia'}
-              </span>
-            </div>
-
-            <div className="p-2.5 bg-slate-50 rounded border border-slate-200/80">
-              <span className="text-[10px] uppercase font-bold text-slate-400 block mb-0.5">Baseline Awal</span>
-              <span className="font-bold text-slate-800">
-                {selectedStudent?.baseline_surah ? `${getSurahNameFormatted(selectedStudent.baseline_surah)} : Ayat ${selectedStudent.baseline_ayah || 1}` : 'Belum tersedia'}
-              </span>
-            </div>
-
-            <div className="p-2.5 bg-slate-50 rounded border border-slate-200/80">
-              <span className="text-[10px] uppercase font-bold text-slate-400 block mb-0.5">Target Kegiatan</span>
-              <span className="font-bold text-slate-800">
-                {selectedStudent?.targetText || (selectedStudent?.target_lines ? `${selectedStudent.target_lines} Baris` : 'Belum tersedia')}
-              </span>
-            </div>
-
-            <div className="p-2.5 bg-blue-50/60 rounded border border-blue-100">
-              <span className="text-[10px] uppercase font-bold text-blue-600 block mb-0.5">Total Baris Ditambah</span>
-              <span className="font-bold text-blue-900">
-                {studentMetrics.totalLines > 0 ? `${studentMetrics.totalLines} Baris` : 'Belum tersedia'}
-              </span>
-            </div>
-          </div>
-
-          <div className="flex items-center justify-between text-[11px] text-slate-500 pt-1">
-            <div>
-              <span className="font-semibold text-slate-700">Setoran Terakhir: </span>
-              <span>
-                {studentMetrics.latestSetoran
-                  ? formatCurrentProgress(studentMetrics.latestSetoran)
-                  : 'Belum ada setoran'}
-              </span>
-            </div>
-            <div>
-              <span className="font-semibold text-slate-700">Cakupan Sesi: </span>
-              <span>{studentMetrics.coverageText}</span>
-            </div>
-          </div>
-        </div>
-      )}
+        )}
+      </div>
 
       {/* Main Form */}
       <form onSubmit={handleSubmit} className="bg-white p-6 md:p-8 rounded border border-slate-200 shadow-sm space-y-6">
@@ -755,7 +836,7 @@ export const FinalEvaluation: React.FC<FinalEvaluationProps> = ({ currentUser, i
             disabled={submitting}
             className="w-full sm:flex-1 py-3.5 bg-purple-600 hover:bg-purple-700 active:bg-purple-800 text-white font-bold text-sm rounded-xl shadow-sm transition flex items-center justify-center space-x-2 disabled:opacity-50 min-h-[44px]"
           >
-            <Save className="w-4 h-4" />
+            {submitting ? <Loader2 className="w-4 h-4 animate-spin" /> : <Save className="w-4 h-4" />}
             <span>{submitting ? 'Menyimpan...' : 'Simpan Evaluasi Akhir'}</span>
           </button>
 
@@ -765,9 +846,9 @@ export const FinalEvaluation: React.FC<FinalEvaluationProps> = ({ currentUser, i
             onClick={handleSaveAndNext}
             className="w-full sm:flex-1 py-3.5 bg-slate-900 hover:bg-slate-800 active:bg-slate-950 text-white font-bold text-sm rounded-xl shadow-sm transition flex items-center justify-center space-x-2 disabled:opacity-50 min-h-[44px]"
           >
-            <Save className="w-4 h-4 text-emerald-400" />
-            <span>Simpan & Siswa Berikutnya</span>
-            <ArrowRight className="w-4 h-4 text-slate-400" />
+            {submitting ? <Loader2 className="w-4 h-4 animate-spin" /> : <Save className="w-4 h-4 text-emerald-400" />}
+            <span>{submitting ? 'Menyimpan...' : 'Simpan & Siswa Berikutnya'}</span>
+            {!submitting && <ArrowRight className="w-4 h-4 text-slate-400" />}
           </button>
         </div>
 

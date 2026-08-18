@@ -378,6 +378,18 @@ export const Administration: React.FC = () => {
     setCopiedLoginInfoToast(false);
   };
 
+  const getLoginCredentialMessageTemplate = (displayName: string, username: string, password: string) => {
+    return `Assalamu'alaikum Ustadz/Ustadzah ${displayName}.
+
+Berikut akun Rumah Tahfidz LMS:
+
+Username: ${username}
+Password: ${password}
+
+Silakan digunakan untuk login ke Rumah Tahfidz LMS dengan alamat: https://rt-aw-10.vercel.app/ .
+Mohon simpan informasi akun ini dan tidak membagikannya kepada orang lain.`;
+  };
+
   const handleCopyCredentialOnlyPassword = async () => {
     if (!credentialSuccessModal?.password) return;
     try {
@@ -392,7 +404,11 @@ export const Administration: React.FC = () => {
 
   const handleCopyLoginInfoTemplate = async () => {
     if (!credentialSuccessModal) return;
-    const templateText = `Assalamu'alaikum Ustadz/Ustadzah ${credentialSuccessModal.displayName}.\n\nBerikut akun Rumah Tahfidz LMS:\n\nUsername: ${credentialSuccessModal.username}\nPassword: ${credentialSuccessModal.password}\n\nSilakan digunakan untuk login ke Rumah Tahfidz LMS.\nMohon simpan informasi akun ini dan tidak membagikannya kepada orang lain.`;
+    const templateText = getLoginCredentialMessageTemplate(
+      credentialSuccessModal.displayName,
+      credentialSuccessModal.username,
+      credentialSuccessModal.password
+    );
     
     try {
       await navigator.clipboard.writeText(templateText);
@@ -406,7 +422,11 @@ export const Administration: React.FC = () => {
 
   const handleShareLoginInfo = async () => {
     if (!credentialSuccessModal) return;
-    const templateText = `Assalamu'alaikum Ustadz/Ustadzah ${credentialSuccessModal.displayName}.\n\nBerikut akun Rumah Tahfidz LMS:\n\nUsername: ${credentialSuccessModal.username}\nPassword: ${credentialSuccessModal.password}\n\nSilakan digunakan untuk login ke Rumah Tahfidz LMS.\nMohon simpan informasi akun ini dan tidak membagikannya kepada orang lain.`;
+    const templateText = getLoginCredentialMessageTemplate(
+      credentialSuccessModal.displayName,
+      credentialSuccessModal.username,
+      credentialSuccessModal.password
+    );
     
     if (navigator.share) {
       try {
@@ -1352,15 +1372,11 @@ export const Administration: React.FC = () => {
                   Format Pesan Template WhatsApp / SMS:
                 </span>
                 <div className="p-3 bg-slate-100 rounded-xl text-slate-700 font-mono text-[11px] leading-relaxed whitespace-pre-line border border-slate-200 select-all">
-{`Assalamu'alaikum Ustadz/Ustadzah ${credentialSuccessModal.displayName}.
-
-Berikut akun Rumah Tahfidz LMS:
-
-Username: ${credentialSuccessModal.username}
-Password: ${credentialSuccessModal.password}
-
-Silakan digunakan untuk login ke Rumah Tahfidz LMS dengan alamat: https://rt-aw-10.vercel.app/ .
-Mohon simpan informasi akun ini dan tidak membagikannya kepada orang lain.`}
+                  {getLoginCredentialMessageTemplate(
+                    credentialSuccessModal.displayName,
+                    credentialSuccessModal.username,
+                    credentialSuccessModal.password
+                  )}
                 </div>
               </div>
 
