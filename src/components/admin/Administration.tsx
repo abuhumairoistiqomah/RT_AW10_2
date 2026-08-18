@@ -378,6 +378,17 @@ export const Administration: React.FC = () => {
     setCopiedLoginInfoToast(false);
   };
 
+  // Lock background body scroll when credential modal is open
+  useEffect(() => {
+    if (credentialSuccessModal?.isOpen) {
+      const originalOverflow = document.body.style.overflow;
+      document.body.style.overflow = 'hidden';
+      return () => {
+        document.body.style.overflow = originalOverflow;
+      };
+    }
+  }, [credentialSuccessModal?.isOpen]);
+
   const getLoginCredentialMessageTemplate = (displayName: string, username: string, password: string) => {
     return `Assalamu'alaikum Ustadz/Ustadzah ${displayName}.
 
@@ -1303,18 +1314,18 @@ Mohon simpan informasi akun ini dan tidak membagikannya kepada orang lain.`;
 
       {/* CREDENTIAL SUCCESS MODAL */}
       {credentialSuccessModal?.isOpen && (
-        <div className="fixed inset-0 z-50 bg-slate-900/60 backdrop-blur-sm flex items-center justify-center p-4">
-          <div className="bg-white rounded-2xl shadow-2xl max-w-lg w-full border border-slate-200 overflow-hidden animate-in fade-in zoom-in-95">
+        <div className="fixed inset-0 z-50 bg-slate-900/60 backdrop-blur-sm flex items-center justify-center p-3 sm:p-4">
+          <div className="bg-white rounded-2xl shadow-2xl w-[calc(100vw-24px)] max-w-[520px] max-h-[90vh] sm:max-h-[85vh] flex flex-col border border-slate-200 overflow-hidden animate-in fade-in zoom-in-95">
             
-            {/* Header */}
-            <div className="bg-emerald-700 text-white p-5 flex items-center justify-between">
-              <div className="flex items-center space-x-3">
-                <div className="w-9 h-9 rounded-xl bg-white/20 text-white flex items-center justify-center font-bold">
-                  <CheckCircle2 className="w-5 h-5" />
+            {/* Header (Fixed) */}
+            <div className="bg-emerald-700 text-white px-4 py-3 sm:px-5 sm:py-3.5 flex items-center justify-between shrink-0">
+              <div className="flex items-center space-x-2.5">
+                <div className="w-8 h-8 rounded-lg bg-white/20 text-white flex items-center justify-center font-bold shrink-0">
+                  <CheckCircle2 className="w-4 h-4" />
                 </div>
                 <div>
-                  <h3 className="font-bold text-sm text-white">{credentialSuccessModal.title}</h3>
-                  <p className="text-[11px] text-emerald-100">
+                  <h3 className="font-bold text-sm text-white leading-tight">{credentialSuccessModal.title}</h3>
+                  <p className="text-[11px] text-emerald-100 leading-tight mt-0.5">
                     Informasi akun siap disalin dan dibagikan
                   </p>
                 </div>
@@ -1322,26 +1333,29 @@ Mohon simpan informasi akun ini dan tidak membagikannya kepada orang lain.`;
               <button
                 type="button"
                 onClick={handleCloseCredentialModal}
-                className="text-emerald-200 hover:text-white transition p-1.5 rounded-lg hover:bg-emerald-800/50"
+                className="text-emerald-200 hover:text-white transition p-1.5 rounded-lg hover:bg-emerald-800/50 shrink-0 ml-2"
+                title="Tutup Modal"
               >
                 <X className="w-5 h-5" />
               </button>
             </div>
 
-            {/* Content */}
-            <div className="p-6 space-y-5 text-xs">
+            {/* Scrollable Modal Body */}
+            <div className="p-4 sm:p-5 space-y-3.5 text-xs overflow-y-auto flex-1 min-h-0">
               <p className="text-slate-600 text-xs leading-relaxed">
                 Akun berhasil disimpan ke sistem. Silakan salin password atau bagikan template informasi login kepada Ustadz/Ustadzah terkait.
               </p>
 
-              {/* Credential Card */}
-              <div className="p-4 bg-slate-50 border border-slate-200 rounded-xl space-y-3">
-                <div className="flex justify-between items-center pb-2 border-b border-slate-200">
+              {/* Compact Credential Card (3 Rows) */}
+              <div className="p-3 bg-slate-50 border border-slate-200 rounded-xl space-y-2 text-xs">
+                <div className="flex justify-between items-center pb-1.5 border-b border-slate-200/80">
                   <span className="text-slate-500 font-medium">Nama Pengguna</span>
-                  <span className="font-bold text-slate-900">{credentialSuccessModal.displayName}</span>
+                  <span className="font-bold text-slate-900 text-right truncate max-w-[240px]">
+                    {credentialSuccessModal.displayName}
+                  </span>
                 </div>
                 
-                <div className="flex justify-between items-center pb-2 border-b border-slate-200">
+                <div className="flex justify-between items-center pb-1.5 border-b border-slate-200/80">
                   <span className="text-slate-500 font-medium">Username</span>
                   <span className="font-mono font-bold text-slate-900 bg-white px-2 py-0.5 rounded border border-slate-200">
                     {credentialSuccessModal.username}
@@ -1350,28 +1364,28 @@ Mohon simpan informasi akun ini dan tidak membagikannya kepada orang lain.`;
 
                 <div className="flex justify-between items-center">
                   <span className="text-slate-500 font-medium">Password Baru</span>
-                  <div className="flex items-center space-x-2">
-                    <span className="font-mono font-bold text-emerald-700 bg-emerald-50 px-2.5 py-1 rounded-lg border border-emerald-200 text-sm tracking-wide">
+                  <div className="flex items-center space-x-1.5">
+                    <span className="font-mono font-bold text-emerald-700 bg-emerald-50 px-2 py-0.5 rounded-lg border border-emerald-200 text-xs sm:text-sm tracking-wide select-all">
                       {showCredentialPassword ? credentialSuccessModal.password : '••••••••••'}
                     </span>
                     <button
                       type="button"
                       onClick={() => setShowCredentialPassword(prev => !prev)}
                       title={showCredentialPassword ? 'Sembunyikan password' : 'Tampilkan password'}
-                      className="p-1.5 text-slate-400 hover:text-slate-700 rounded-lg hover:bg-slate-200/60 transition"
+                      className="p-1 text-slate-400 hover:text-slate-700 rounded-lg hover:bg-slate-200/60 transition"
                     >
-                      {showCredentialPassword ? <EyeOff className="w-4 h-4" /> : <Eye className="w-4 h-4" />}
+                      {showCredentialPassword ? <EyeOff className="w-3.5 h-3.5" /> : <Eye className="w-3.5 h-3.5" />}
                     </button>
                   </div>
                 </div>
               </div>
 
-              {/* Message Template Preview */}
-              <div className="space-y-1.5">
+              {/* Compact Message Template Preview (Bounded Height) */}
+              <div className="space-y-1">
                 <span className="text-[11px] font-bold text-slate-500 uppercase tracking-wider block">
                   Format Pesan Template WhatsApp / SMS:
                 </span>
-                <div className="p-3 bg-slate-100 rounded-xl text-slate-700 font-mono text-[11px] leading-relaxed whitespace-pre-line border border-slate-200 select-all">
+                <div className="p-2.5 bg-slate-100 rounded-xl text-slate-700 font-mono text-[11px] leading-relaxed whitespace-pre-line border border-slate-200 select-all max-h-[135px] overflow-y-auto">
                   {getLoginCredentialMessageTemplate(
                     credentialSuccessModal.displayName,
                     credentialSuccessModal.username,
@@ -1379,22 +1393,25 @@ Mohon simpan informasi akun ini dan tidak membagikannya kepada orang lain.`;
                   )}
                 </div>
               </div>
+            </div>
 
-              {/* Action Buttons */}
-              <div className="grid grid-cols-1 sm:grid-cols-2 gap-2 pt-2">
+            {/* Sticky Action Footer (Always Visible at Bottom) */}
+            <div className="p-3 sm:p-4 bg-slate-50 border-t border-slate-200 space-y-2 shrink-0">
+              {/* Row 1: Copy Actions */}
+              <div className="grid grid-cols-1 sm:grid-cols-2 gap-2">
                 <button
                   type="button"
                   onClick={handleCopyCredentialOnlyPassword}
-                  className="w-full py-2.5 px-3 bg-white border border-slate-300 hover:bg-slate-50 text-slate-700 rounded-xl font-bold transition flex items-center justify-center space-x-1.5 shadow-sm"
+                  className="w-full py-2 px-3 bg-white border border-slate-300 hover:bg-slate-50 active:bg-slate-100 text-slate-700 rounded-xl font-bold transition flex items-center justify-center space-x-1.5 shadow-sm text-xs min-h-[38px]"
                 >
                   {copiedCredentialPasswordToast ? (
                     <>
-                      <Check className="w-4 h-4 text-emerald-600" />
+                      <Check className="w-4 h-4 text-emerald-600 shrink-0" />
                       <span className="text-emerald-700">Password Disalin!</span>
                     </>
                   ) : (
                     <>
-                      <Copy className="w-4 h-4 text-slate-500" />
+                      <Copy className="w-4 h-4 text-slate-500 shrink-0" />
                       <span>Copy Password</span>
                     </>
                   )}
@@ -1403,45 +1420,45 @@ Mohon simpan informasi akun ini dan tidak membagikannya kepada orang lain.`;
                 <button
                   type="button"
                   onClick={handleCopyLoginInfoTemplate}
-                  className="w-full py-2.5 px-3 bg-emerald-600 hover:bg-emerald-500 text-white rounded-xl font-bold transition flex items-center justify-center space-x-1.5 shadow"
+                  className="w-full py-2 px-3 bg-emerald-600 hover:bg-emerald-500 active:bg-emerald-700 text-white rounded-xl font-bold transition flex items-center justify-center space-x-1.5 shadow text-xs min-h-[38px]"
                 >
                   {copiedLoginInfoToast ? (
                     <>
-                      <Check className="w-4 h-4 text-white" />
+                      <Check className="w-4 h-4 text-white shrink-0" />
                       <span>Info Login Disalin!</span>
                     </>
                   ) : (
                     <>
-                      <MessageSquare className="w-4 h-4" />
+                      <MessageSquare className="w-4 h-4 shrink-0" />
                       <span>Salin Info Login</span>
                     </>
                   )}
                 </button>
               </div>
 
-              {typeof navigator !== 'undefined' && !!navigator.share && (
-                <button
-                  type="button"
-                  onClick={handleShareLoginInfo}
-                  className="w-full py-2 px-3 bg-slate-100 hover:bg-slate-200 text-slate-700 rounded-xl font-bold transition flex items-center justify-center space-x-1.5 text-xs"
-                >
-                  <Share2 className="w-3.5 h-3.5" />
-                  <span>Bagikan via Aplikasi Lain</span>
-                </button>
-              )}
+              {/* Row 2: Share & Close Actions */}
+              <div className="flex flex-col sm:flex-row items-center gap-2">
+                {typeof navigator !== 'undefined' && !!navigator.share && (
+                  <button
+                    type="button"
+                    onClick={handleShareLoginInfo}
+                    className="w-full sm:flex-1 py-2 px-3 bg-white border border-slate-300 hover:bg-slate-100 active:bg-slate-200 text-slate-700 rounded-xl font-bold transition flex items-center justify-center space-x-1.5 text-xs shadow-sm min-h-[36px]"
+                  >
+                    <Share2 className="w-3.5 h-3.5 text-slate-500 shrink-0" />
+                    <span>Bagikan via Aplikasi Lain</span>
+                  </button>
+                )}
 
-              {/* Dismiss Button */}
-              <div className="pt-2 border-t border-slate-100 flex justify-end">
                 <button
                   type="button"
                   onClick={handleCloseCredentialModal}
-                  className="px-5 py-2 bg-slate-900 hover:bg-slate-800 text-white rounded-xl font-bold transition text-xs"
+                  className={`w-full ${typeof navigator !== 'undefined' && !!navigator.share ? 'sm:w-auto sm:px-5' : ''} py-2 px-4 bg-slate-900 hover:bg-slate-800 active:bg-slate-950 text-white rounded-xl font-bold transition text-xs flex items-center justify-center min-h-[36px]`}
                 >
                   Selesai & Tutup
                 </button>
               </div>
-
             </div>
+
           </div>
         </div>
       )}

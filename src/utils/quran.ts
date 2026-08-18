@@ -49,15 +49,27 @@ export function getSurahNameFormatted(surahNo?: number | null): string {
  * Rules:
  * 1. If no valid saved progress exists, returns "0" (never undefined, null, Surah #undefined, or NaN).
  * 2. For ZIYADAH: returns e.g. "78. An-Naba' : 1–15 (15 Baris)" when valid fields exist.
- * 3. For IQRA: returns e.g. "Iqra 3 • Halaman 12–15".
- * 4. Treats 0 as a valid numeric value with strict nullish checks.
+ * 3. For NURONIYYAH: returns e.g. "Ad-Dars 6 (8 Baris)" or "Nuroniyyah • Ad-Dars 1 (10 Baris)".
+ * 4. For IQRA (Legacy): returns e.g. "Iqra 3 • Halaman 12–15".
+ * 5. Treats 0 as a valid numeric value with strict nullish checks.
  */
 export function formatCurrentProgress(assessment?: any | null): string {
   if (!assessment || typeof assessment !== 'object') {
     return '0';
   }
 
-  // Check IQRA mode
+  // Check NURONIYYAH mode
+  const isNuroniyyah = assessment.assessment_mode === 'NURONIYYAH' || (assessment.nuroniyyah_dars != null && !assessment.surah_end && !assessment.surah_start);
+  if (isNuroniyyah) {
+    const dars = assessment.nuroniyyah_dars ? String(assessment.nuroniyyah_dars).trim() : 'Nuroniyyah';
+    const lines = assessment.lines_added != null && !isNaN(Number(assessment.lines_added)) ? Number(assessment.lines_added) : null;
+    if (lines != null) {
+      return `${dars} (${lines} Baris)`;
+    }
+    return dars;
+  }
+
+  // Check IQRA mode (Legacy)
   const isIqra = assessment.assessment_mode === 'IQRA' || (assessment.iqra_level != null && !assessment.surah_end && !assessment.surah_start);
   if (isIqra) {
     const level = assessment.iqra_level != null && !isNaN(Number(assessment.iqra_level)) ? Number(assessment.iqra_level) : null;

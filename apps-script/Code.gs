@@ -1478,19 +1478,47 @@ function handlePostAndGetRouter(action, payload, authToken) {
       asm.attendance_status = status;
 
       if (status === 'PRESENT') {
-        if (asm.surah_start == null || asm.surah_start === '' ||
-            asm.ayah_start == null || asm.ayah_start === '' ||
-            asm.surah_end == null || asm.surah_end === '' ||
-            asm.ayah_end == null || asm.ayah_end === '' ||
-            asm.lines_added == null || asm.lines_added === '') {
-          return jsonError('VALIDATION_ERROR', 'Untuk status HADIR (PRESENT), data surah/ayat awal & akhir serta jumlah baris wajib diisi.');
+        var mode = String(asm.assessment_mode || (asm.nuroniyyah_dars ? 'NURONIYYAH' : (asm.iqra_level ? 'IQRA' : 'ZIYADAH'))).toUpperCase().trim();
+        asm.assessment_mode = mode;
+
+        if (mode === 'NURONIYYAH') {
+          if (!asm.nuroniyyah_dars || asm.lines_added == null || asm.lines_added === '') {
+            return jsonError('VALIDATION_ERROR', 'Untuk status HADIR pada mode Nuroniyyah, data Ad-Dars dan jumlah penambahan baris wajib diisi.');
+          }
+          asm.nuroniyyah_dars = String(asm.nuroniyyah_dars);
+          asm.lines_added = Number(asm.lines_added);
+          asm.surah_start = '';
+          asm.ayah_start = '';
+          asm.surah_end = '';
+          asm.ayah_end = '';
+          asm.iqra_level = '';
+          asm.iqra_page_start = '';
+          asm.iqra_page_end = '';
+          asm.assessment_status = 'COMPLETED';
+        } else if (mode === 'IQRA') {
+          asm.lines_added = asm.lines_added != null && asm.lines_added !== '' ? Number(asm.lines_added) : 0;
+          asm.assessment_status = 'COMPLETED';
+        } else {
+          // Default ZIYADAH
+          asm.assessment_mode = 'ZIYADAH';
+          if (asm.surah_start == null || asm.surah_start === '' ||
+              asm.ayah_start == null || asm.ayah_start === '' ||
+              asm.surah_end == null || asm.surah_end === '' ||
+              asm.ayah_end == null || asm.ayah_end === '' ||
+              asm.lines_added == null || asm.lines_added === '') {
+            return jsonError('VALIDATION_ERROR', 'Untuk status HADIR pada mode Hafalan Al-Qur\'an, data surah/ayat awal & akhir serta jumlah baris wajib diisi.');
+          }
+          asm.surah_start = Number(asm.surah_start);
+          asm.ayah_start = Number(asm.ayah_start);
+          asm.surah_end = Number(asm.surah_end);
+          asm.ayah_end = Number(asm.ayah_end);
+          asm.lines_added = Number(asm.lines_added); // preserves explicit 0
+          asm.nuroniyyah_dars = '';
+          asm.iqra_level = '';
+          asm.iqra_page_start = '';
+          asm.iqra_page_end = '';
+          asm.assessment_status = 'COMPLETED';
         }
-        asm.surah_start = Number(asm.surah_start);
-        asm.ayah_start = Number(asm.ayah_start);
-        asm.surah_end = Number(asm.surah_end);
-        asm.ayah_end = Number(asm.ayah_end);
-        asm.lines_added = Number(asm.lines_added); // preserves explicit 0
-        asm.assessment_status = 'COMPLETED';
       } else if (status === 'UNASSESSED') {
         asm.assessment_status = 'PENDING';
         asm.surah_start = '';
@@ -1498,14 +1526,22 @@ function handlePostAndGetRouter(action, payload, authToken) {
         asm.surah_end = '';
         asm.ayah_end = '';
         asm.lines_added = '';
+        asm.nuroniyyah_dars = '';
+        asm.iqra_level = '';
+        asm.iqra_page_start = '';
+        asm.iqra_page_end = '';
       } else {
-        // Clear Quran progress fields for non-PRESENT (do not store 0 for absence)
+        // Clear progress fields for non-PRESENT (do not store 0 for absence)
         asm.assessment_status = 'COMPLETED';
         asm.surah_start = '';
         asm.ayah_start = '';
         asm.surah_end = '';
         asm.ayah_end = '';
         asm.lines_added = '';
+        asm.nuroniyyah_dars = '';
+        asm.iqra_level = '';
+        asm.iqra_page_start = '';
+        asm.iqra_page_end = '';
       }
 
       asm.updated_at = new Date().toISOString();

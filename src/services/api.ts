@@ -5,7 +5,7 @@ import {
   SummaryStats, DistributionBucket, SkillTransition, SkillStatus,
   CompletionStatus, EvaluationState, AttendanceStatus, BulkAssignResult,
   StudentPlacementBootstrap, PlacementStudent, TeacherWorkspaceBootstrap,
-  TeacherStudentSummary
+  TeacherStudentSummary, AssessmentMode, TargetSource
 } from '../types';
 import {
   INITIAL_CONFIGS, INITIAL_LOOKUPS, INITIAL_STUDENTS, INITIAL_TEACHERS,
@@ -1288,7 +1288,7 @@ export class ApiService {
         class_snapshot: p.class_snapshot,
         grade_class: `${p.grade_snapshot || ''} (${p.class_snapshot || ''})`,
         gender: st?.gender || selectedHalaqah.gender || 'IKHWAN',
-        skill_status_start: p.skill_status_start || 'NON_BBL',
+        skill_status_start: (p.skill_status_start && String(p.skill_status_start).trim() !== '' ? (p.skill_status_start as SkillStatus) : undefined),
         baseline_surah: p.baseline_surah,
         baseline_ayah: p.baseline_ayah,
         target_surah_start: p.target_surah_start,
@@ -1580,12 +1580,13 @@ export class ApiService {
       if (existingIdx >= 0) {
         const existing = list[existingIdx];
         const hasQuran = existing.surah_start != null && existing.surah_start !== ('' as any) && existing.lines_added != null;
+        const hasNuroniyyah = (existing.assessment_mode === 'NURONIYYAH' || existing.nuroniyyah_dars != null) && existing.lines_added != null;
         const hasIqra = existing.iqra_level != null && existing.iqra_page_start != null;
 
         const updated: SessionAssessment = {
           ...existing,
           attendance_status: attendanceStatus,
-          assessment_status: isPresent ? ((hasQuran || hasIqra) ? 'COMPLETED' : 'PENDING') : 'COMPLETED',
+          assessment_status: isPresent ? ((hasQuran || hasNuroniyyah || hasIqra) ? 'COMPLETED' : 'PENDING') : 'COMPLETED',
           event_day_id: sConfig.event_day_id,
           session_no: sConfig.session_no,
           halaqah_id: participant.halaqah_id || existing.halaqah_id,
@@ -1598,6 +1599,8 @@ export class ApiService {
             surah_end: undefined,
             ayah_end: undefined,
             lines_added: undefined,
+            assessment_mode: undefined,
+            nuroniyyah_dars: undefined,
             iqra_level: undefined,
             iqra_page_start: undefined,
             iqra_page_end: undefined
@@ -1846,9 +1849,16 @@ export class ApiService {
         return {
           sessionNo: a.session_no,
           attendance: a.attendance_status,
+          assessment_mode: a.assessment_mode,
+          assessmentMode: a.assessment_mode,
+          nuroniyyah_dars: a.nuroniyyah_dars,
+          nuroniyyahDars: a.nuroniyyah_dars,
           surahName: isPresent ? (sObj?.surah_name || (a.surah_start ? `Surah #${a.surah_start}` : null)) : null,
           ayahRange: isPresent && a.ayah_start != null && a.ayah_end != null ? `${a.ayah_start}–${a.ayah_end}` : null,
-          linesAdded: isPresent && a.lines_added != null ? a.lines_added : null
+          linesAdded: isPresent && a.lines_added != null ? a.lines_added : null,
+          iqraLevel: a.iqra_level,
+          iqraPageStart: a.iqra_page_start,
+          iqraPageEnd: a.iqra_page_end
         };
       })
     };
@@ -1986,32 +1996,55 @@ export class ApiService {
     let surah_end: number | undefined;
     let ayah_end: number | undefined;
     let lines_added: number | undefined;
+    let assessment_mode: AssessmentMode | undefined;
+    let nuroniyyah_dars: string | undefined;
 
     if (attendanceStatus === 'PRESENT') {
-      const sStart = payload.surah_start ?? payload.start_surah;
-      const aStart = payload.ayah_start ?? payload.start_ayah;
-      const sEnd = payload.surah_end ?? payload.end_surah;
-      const aEnd = payload.ayah_end ?? payload.end_ayah;
+      const mode: AssessmentMode = payload.assessment_mode || (payload.nuroniyyah_dars ? 'NURONIYYAH' : (payload.iqra_level ? 'IQRA' : 'ZIYADAH'));
+      assessment_mode = mode;
       const rawLines = payload.lines_added ?? payload.totalLines;
 
-      if (sStart == null || aStart == null || sEnd == null || aEnd == null) {
-        throw new Error('Untuk status HADIR, data Surah dan Ayat (awal & akhir) wajib diisi.');
-      }
-      if (rawLines == null) {
-        throw new Error('Untuk status HADIR, jumlah baris (lines_added) wajib diisi.');
-      }
+      if (mode === 'NURONIYYAH') {
+        const dars = payload.nuroniyyah_dars || (payload.iqra_level ? `Ad-Dars ${payload.iqra_level}` : '');
+        if (!dars) {
+          throw new Error('Untuk status HADIR pada mode Nuroniyyah, data Ad-Dars wajib dipilih.');
+        }
+        if (rawLines == null || isNaN(Number(rawLines))) {
+          throw new Error('Untuk status HADIR, jumlah baris (lines_added) wajib diisi.');
+        }
+        nuroniyyah_dars = String(dars);
+        lines_added = Number(rawLines);
+      } else if (mode === 'IQRA') {
+        lines_added = rawLines != null ? Number(rawLines) : 0;
+      } else {
+        // ZIYADAH
+        assessment_mode = 'ZIYADAH';
+        const sStart = payload.surah_start ?? payload.start_surah;
+        const aStart = payload.ayah_start ?? payload.start_ayah;
+        const sEnd = payload.surah_end ?? payload.end_surah;
+        const aEnd = payload.ayah_end ?? payload.end_ayah;
 
-      surah_start = Number(sStart);
-      ayah_start = Number(aStart);
-      surah_end = Number(sEnd);
-      ayah_end = Number(aEnd);
-      lines_added = Number(rawLines);
+        if (sStart == null || aStart == null || sEnd == null || aEnd == null) {
+          throw new Error('Untuk status HADIR pada mode Hafalan Al-Qur\'an, data Surah dan Ayat (awal & akhir) wajib diisi.');
+        }
+        if (rawLines == null || isNaN(Number(rawLines))) {
+          throw new Error('Untuk status HADIR, jumlah baris (lines_added) wajib diisi.');
+        }
+
+        surah_start = Number(sStart);
+        ayah_start = Number(aStart);
+        surah_end = Number(sEnd);
+        ayah_end = Number(aEnd);
+        lines_added = Number(rawLines);
+      }
     } else {
       surah_start = undefined;
       ayah_start = undefined;
       surah_end = undefined;
       ayah_end = undefined;
       lines_added = undefined;
+      assessment_mode = undefined;
+      nuroniyyah_dars = undefined;
     }
 
     const asm: SessionAssessment = {
@@ -2024,6 +2057,8 @@ export class ApiService {
       halaqah_id: participant.halaqah_id,
       session_no: matchingConfig.session_no,
       attendance_status: attendanceStatus,
+      assessment_mode,
+      nuroniyyah_dars,
       surah_start,
       ayah_start,
       surah_end,

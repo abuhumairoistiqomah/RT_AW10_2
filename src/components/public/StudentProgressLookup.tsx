@@ -272,7 +272,7 @@ export const StudentProgressLookup: React.FC<StudentProgressLookupProps> = ({
                         <tr>
                           <th className="py-3 px-4">Sesi Ke</th>
                           <th className="py-3 px-4">Kehadiran</th>
-                          <th className="py-3 px-4">Surah & Ayat Setoran</th>
+                          <th className="py-3 px-4">Materi / Surah Setoran</th>
                           <th className="py-3 px-4 text-right">Penambahan Baris</th>
                         </tr>
                       </thead>
@@ -289,8 +289,10 @@ export const StudentProgressLookup: React.FC<StudentProgressLookupProps> = ({
                             </td>
                             <td className="py-3 px-4 font-medium text-slate-800">
                               {s.attendance === 'PRESENT' ? (
-                                s.assessment_mode === 'IQRA' || s.iqra_level != null ? (
-                                  `Iqra ${s.iqra_level || 1} (Hal. ${s.iqra_page_start || 1}${s.iqra_page_end && s.iqra_page_end !== s.iqra_page_start ? `–${s.iqra_page_end}` : ''})`
+                                s.assessment_mode === 'NURONIYYAH' || s.nuroniyyah_dars ? (
+                                  `Nuroniyyah • ${s.nuroniyyah_dars || 'Ad-Dars'}`
+                                ) : s.assessment_mode === 'IQRA' || s.iqra_level != null ? (
+                                  `Nuroniyyah • Ad-Dars ${s.iqra_level || 1}`
                                 ) : s.surahName ? (
                                   `${s.surahName} (Ayat ${s.ayahRange})`
                                 ) : (
@@ -302,9 +304,7 @@ export const StudentProgressLookup: React.FC<StudentProgressLookupProps> = ({
                             </td>
                             <td className="py-3 px-4 text-right font-bold text-blue-600">
                               {s.attendance === 'PRESENT' ? (
-                                s.assessment_mode === 'IQRA' || s.iqra_level != null ? (
-                                  <span className="text-slate-400 font-normal text-xs">Iqra</span>
-                                ) : s.linesAdded != null ? (
+                                s.linesAdded != null ? (
                                   `+${s.linesAdded} baris`
                                 ) : (
                                   '-'

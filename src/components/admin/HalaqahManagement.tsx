@@ -129,6 +129,7 @@ export const HalaqahManagement: React.FC = () => {
       session_group_id: defaultSessionGroupId,
       location: '',
       target_ziyadah_lines: undefined,
+      target_nuroniyyah_lines: undefined,
       target_iqra_pages: undefined,
       active: true,
       notes: ''
@@ -157,6 +158,9 @@ export const HalaqahManagement: React.FC = () => {
         session_group_id: formData.session_group_id || (sessionGroups[0]?.session_group_id || ''),
         location: formData.location || 'Masjid',
         target_ziyadah_lines: formData.target_ziyadah_lines != null && formData.target_ziyadah_lines !== '' ? Number(formData.target_ziyadah_lines) : undefined,
+        target_nuroniyyah_lines: (formData.target_nuroniyyah_lines != null && formData.target_nuroniyyah_lines !== '') 
+          ? Number(formData.target_nuroniyyah_lines) 
+          : (formData.target_iqra_pages != null && formData.target_iqra_pages !== '' ? Number(formData.target_iqra_pages) : undefined),
         target_iqra_pages: formData.target_iqra_pages != null && formData.target_iqra_pages !== '' ? Number(formData.target_iqra_pages) : undefined,
         active: formData.active !== false,
         notes: formData.notes || '',
@@ -338,13 +342,13 @@ export const HalaqahManagement: React.FC = () => {
                       <Clock className="w-3.5 h-3.5 text-blue-600 shrink-0" />
                       <span>Jadwal Sesi: <strong>{sessionGroup?.group_name || h.session_group_id || 'Belum diatur'}</strong></span>
                     </div>
-                    {(h.target_ziyadah_lines != null || h.target_iqra_pages != null) && (
+                    {(h.target_ziyadah_lines != null || h.target_nuroniyyah_lines != null || h.target_iqra_pages != null) && (
                       <div className="flex items-center space-x-1.5 text-emerald-800 bg-emerald-50/70 px-2 py-1 rounded-lg border border-emerald-200 text-[11px]">
                         <Target className="w-3.5 h-3.5 text-emerald-600 shrink-0" />
                         <span>
                           Target Default: {h.target_ziyadah_lines ? `${h.target_ziyadah_lines} Baris Ziyadah` : ''}
-                          {h.target_ziyadah_lines && h.target_iqra_pages ? ' | ' : ''}
-                          {h.target_iqra_pages ? `${h.target_iqra_pages} Halaman Iqra` : ''}
+                          {h.target_ziyadah_lines && (h.target_nuroniyyah_lines || h.target_iqra_pages) ? ' | ' : ''}
+                          {(h.target_nuroniyyah_lines || h.target_iqra_pages) ? `${h.target_nuroniyyah_lines || h.target_iqra_pages} Baris Nuroniyyah` : ''}
                         </span>
                       </div>
                     )}
@@ -471,7 +475,7 @@ export const HalaqahManagement: React.FC = () => {
                   <span>TARGET KEGIATAN</span>
                 </div>
                 <p className="text-[11px] text-emerald-800 leading-relaxed">
-                  Target default per halaqah. Otomatis diterapkan untuk siswa baru yang ditugaskan ke halaqah ini sesuai status BBL/Iqra mereka.
+                  Target default per halaqah. Otomatis diterapkan untuk siswa baru yang ditugaskan ke halaqah ini sesuai status BBL/Nuroniyyah mereka.
                 </p>
 
                 <div className="grid grid-cols-2 gap-3">
@@ -493,18 +497,25 @@ export const HalaqahManagement: React.FC = () => {
 
                   <div>
                     <label className="block text-[11px] font-bold text-slate-700 mb-1">
-                      Target Iqra (Halaman)
+                      Target Nuroniyyah (Baris)
                     </label>
                     <input
                       type="number"
                       min={0}
                       disabled={isSaving}
-                      value={formData.target_iqra_pages ?? ''}
-                      onChange={(e) => setFormData({ ...formData, target_iqra_pages: e.target.value === '' ? undefined : Number(e.target.value) })}
-                      placeholder="Contoh: 2"
+                      value={formData.target_nuroniyyah_lines ?? formData.target_iqra_pages ?? ''}
+                      onChange={(e) => {
+                        const val = e.target.value === '' ? undefined : Number(e.target.value);
+                        setFormData({ 
+                          ...formData, 
+                          target_nuroniyyah_lines: val,
+                          target_iqra_pages: val 
+                        });
+                      }}
+                      placeholder="Contoh: 10"
                       className="w-full px-3 py-2 bg-white border border-slate-300 rounded-lg text-xs font-semibold focus:ring-2 focus:ring-emerald-500 outline-none disabled:opacity-60"
                     />
-                    <span className="text-[10px] text-slate-500 block mt-0.5">Untuk siswa NON_BBL</span>
+                    <span className="text-[10px] text-slate-500 block mt-0.5">Untuk siswa NON_BBL (Nuroniyyah)</span>
                   </div>
                 </div>
               </div>
