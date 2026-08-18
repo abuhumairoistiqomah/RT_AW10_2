@@ -30,14 +30,18 @@ export const LoginModal: React.FC<LoginModalProps> = ({
   const [suggestions, setSuggestions] = useState<AccountSuggestion[]>([]);
   const [isSearching, setIsSearching] = useState<boolean>(false);
   const [showDropdown, setShowDropdown] = useState<boolean>(false);
+  const [highlightedIndex, setHighlightedIndex] = useState<number>(-1);
   const dropdownRef = useRef<HTMLDivElement>(null);
+  const suggestionsContainerRef = useRef<HTMLDivElement>(null);
   const searchTimeoutRef = useRef<any>(null);
+  const itemRefs = useRef<(HTMLButtonElement | null)[]>([]);
 
   // Debounced search for accounts
   useEffect(() => {
     if (!isOpen) {
       setSuggestions([]);
       setShowDropdown(false);
+      setHighlightedIndex(-1);
       return;
     }
 
@@ -45,6 +49,7 @@ export const LoginModal: React.FC<LoginModalProps> = ({
     if (trimmed.length < 2) {
       setSuggestions([]);
       setShowDropdown(false);
+      setHighlightedIndex(-1);
       return;
     }
 
@@ -56,11 +61,34 @@ export const LoginModal: React.FC<LoginModalProps> = ({
       setIsSearching(true);
       try {
         const results = await ApiService.searchLoginAccounts(trimmed);
-        setSuggestions(results);
-        setShowDropdown(results.length > 0);
+        // Sort results by relevance (exact > starts with > contains)
+        const q = trimmed.toLowerCase();
+        const sorted = [...(results || [])].sort((a, b) => {
+          const aUser = a.username.toLowerCase();
+          const aDisplay = a.display_name.toLowerCase();
+          const bUser = b.username.toLowerCase();
+          const bDisplay = b.display_name.toLowerCase();
+
+          const aExact = aUser === q || aDisplay === q;
+          const bExact = bUser === q || bDisplay === q;
+          if (aExact && !bExact) return -1;
+          if (!aExact && bExact) return 1;
+
+          const aStarts = aUser.startsWith(q) || aDisplay.startsWith(q) || aDisplay.split(/\s+/).some(p => p.startsWith(q));
+          const bStarts = bUser.startsWith(q) || bDisplay.startsWith(q) || bDisplay.split(/\s+/).some(p => p.startsWith(q));
+          if (aStarts && !bStarts) return -1;
+          if (!aStarts && bStarts) return 1;
+
+          return aDisplay.localeCompare(bDisplay);
+        });
+
+        setSuggestions(sorted);
+        setShowDropdown(sorted.length > 0);
+        setHighlightedIndex(-1);
       } catch (e) {
         setSuggestions([]);
         setShowDropdown(false);
+        setHighlightedIndex(-1);
       } finally {
         setIsSearching(false);
       }
@@ -78,6 +106,7 @@ export const LoginModal: React.FC<LoginModalProps> = ({
     const handleClickOutside = (event: MouseEvent) => {
       if (dropdownRef.current && !dropdownRef.current.contains(event.target as Node)) {
         setShowDropdown(false);
+        setHighlightedIndex(-1);
       }
     };
     document.addEventListener('mousedown', handleClickOutside);
@@ -86,15 +115,72 @@ export const LoginModal: React.FC<LoginModalProps> = ({
     };
   }, []);
 
+  // Visual ordering for UPWARD opening dropdown:
+  // Reversing the array places the highest-priority item at the bottom of the dropdown, directly above the search field.
+  const displaySuggestions = [...suggestions].reverse();
+
+  // Ensure scroll position is near the bottom when suggestions appear so most relevant items are immediately visible
+  useEffect(() => {
+    if (showDropdown && suggestionsContainerRef.current) {
+      suggestionsContainerRef.current.scrollTop = suggestionsContainerRef.current.scrollHeight;
+    }
+  }, [showDropdown, suggestions]);
+
+  // Scroll highlighted item into view if keyboard navigation occurs
+  useEffect(() => {
+    if (highlightedIndex >= 0 && itemRefs.current[highlightedIndex]) {
+      itemRefs.current[highlightedIndex]?.scrollIntoView({
+        block: 'nearest'
+      });
+    }
+  }, [highlightedIndex]);
+
   if (!isOpen) return null;
 
   const handleSelectAccount = (account: AccountSuggestion) => {
     setUsername(account.username);
     setShowDropdown(false);
+    setHighlightedIndex(-1);
     // Focus password input after selecting account
     const passInput = document.getElementById('login-password');
     if (passInput) {
       passInput.focus();
+    }
+  };
+
+  const handleKeyDown = (e: React.KeyboardEvent<HTMLInputElement>) => {
+    if (!showDropdown || displaySuggestions.length === 0) {
+      if (e.key === 'ArrowUp' && suggestions.length > 0) {
+        setShowDropdown(true);
+        e.preventDefault();
+      }
+      return;
+    }
+
+    const displayLength = displaySuggestions.length;
+
+    if (e.key === 'ArrowUp') {
+      e.preventDefault();
+      setHighlightedIndex(prev => {
+        if (prev === -1) return displayLength - 1; // start closest to input
+        return prev > 0 ? prev - 1 : 0;
+      });
+    } else if (e.key === 'ArrowDown') {
+      e.preventDefault();
+      setHighlightedIndex(prev => {
+        if (prev === -1) return displayLength - 1;
+        if (prev < displayLength - 1) return prev + 1;
+        return -1; // return focus to input
+      });
+    } else if (e.key === 'Enter') {
+      if (highlightedIndex >= 0 && highlightedIndex < displayLength) {
+        e.preventDefault();
+        handleSelectAccount(displaySuggestions[highlightedIndex]);
+      }
+    } else if (e.key === 'Escape') {
+      e.preventDefault();
+      setShowDropdown(false);
+      setHighlightedIndex(-1);
     }
   };
 
@@ -105,6 +191,7 @@ export const LoginModal: React.FC<LoginModalProps> = ({
     setLoading(true);
     setErrorMsg('');
     setShowDropdown(false);
+    setHighlightedIndex(-1);
 
     try {
       const res = await ApiService.login(username.trim(), password);
@@ -130,15 +217,16 @@ export const LoginModal: React.FC<LoginModalProps> = ({
     setUsername('');
     setShowPassword(false);
     setShowDropdown(false);
+    setHighlightedIndex(-1);
     onClose();
   };
 
   return (
     <div id="login-modal-overlay" className="fixed inset-0 bg-slate-950/70 backdrop-blur-sm z-50 flex items-center justify-center p-4">
-      <div id="login-modal-container" className="bg-white rounded-2xl shadow-2xl max-w-md w-full overflow-hidden border border-slate-200 animate-in fade-in zoom-in-95">
+      <div id="login-modal-container" className="bg-white rounded-2xl shadow-2xl max-w-md w-full border border-slate-200 animate-in fade-in zoom-in-95 relative">
         
         {/* Modal Header */}
-        <div className="bg-slate-900 text-white p-5 flex items-center justify-between border-b border-slate-800">
+        <div className="bg-slate-900 text-white p-5 flex items-center justify-between border-b border-slate-800 rounded-t-2xl">
           <div className="flex items-center space-x-3">
             <div className="w-9 h-9 rounded-xl bg-blue-600 text-white flex items-center justify-center font-bold shadow-sm">
               <KeyRound className="w-5 h-5" />
@@ -173,18 +261,63 @@ export const LoginModal: React.FC<LoginModalProps> = ({
           <form id="login-form" onSubmit={handleLoginSubmit} className="space-y-4">
             
             {/* Account Field with Search Suggestions */}
-            <div className="relative" ref={dropdownRef}>
-              <label htmlFor="login-username" className="block text-xs font-bold uppercase tracking-wider text-slate-600 mb-1.5 flex items-center justify-between">
-                <span>Pilih Akun / Username</span>
+            <div className="space-y-1.5" ref={dropdownRef}>
+              <div className="flex items-center justify-between text-xs font-bold uppercase tracking-wider text-slate-600">
+                <label htmlFor="login-username">Pilih Akun / Username</label>
                 {isSearching && (
                   <span className="text-[10px] text-slate-400 font-normal flex items-center gap-1">
                     <Loader2 className="w-3 h-3 animate-spin text-blue-500" />
                     Mencari...
                   </span>
                 )}
-              </label>
+              </div>
               
-              <div className="relative flex items-center">
+              <div className="relative flex items-center account-search-wrapper">
+                {/* Suggestions Dropdown OPENING UPWARD */}
+                {showDropdown && displaySuggestions.length > 0 && (
+                  <div 
+                    id="login-account-suggestions"
+                    ref={suggestionsContainerRef}
+                    className="account-suggestions absolute left-0 right-0 bottom-[calc(100%+6px)] bg-white border border-slate-200 rounded-xl shadow-2xl z-50 overflow-y-auto divide-y divide-slate-100 animate-in fade-in slide-in-from-bottom-2 duration-150"
+                    style={{ maxHeight: 'min(260px, 42vh)' }}
+                  >
+                    <div className="sticky top-0 bg-slate-50/95 backdrop-blur-xs px-3 py-1.5 text-[10px] font-bold text-slate-500 uppercase tracking-wider border-b border-slate-100 flex items-center justify-between z-10">
+                      <span>Pilih Akun Terdaftar ({displaySuggestions.length})</span>
+                      <span className="text-[9px] font-normal text-slate-400">↑ ↓ Pilih • Enter</span>
+                    </div>
+                    {displaySuggestions.map((acc, index) => {
+                      const isSelected = username.trim().toLowerCase() === acc.username.toLowerCase();
+                      const isHighlighted = highlightedIndex === index;
+                      return (
+                        <button
+                          key={acc.username}
+                          ref={el => { itemRefs.current[index] = el; }}
+                          type="button"
+                          onClick={() => handleSelectAccount(acc)}
+                          onMouseEnter={() => setHighlightedIndex(index)}
+                          className={`w-full text-left px-3.5 py-2.5 transition flex items-center justify-between text-xs cursor-pointer ${
+                            isHighlighted
+                              ? 'bg-blue-50 text-blue-950 font-medium'
+                              : isSelected
+                              ? 'bg-blue-50/60 text-blue-900 font-bold'
+                              : 'text-slate-800 hover:bg-slate-50'
+                          }`}
+                        >
+                          <div className="truncate pr-2">
+                            <div className="font-semibold text-slate-900 truncate">{acc.display_name}</div>
+                            <div className="text-[11px] text-slate-500 font-mono">
+                              Username: <span className="font-bold text-blue-700">{acc.username}</span>
+                            </div>
+                          </div>
+                          {(isSelected || isHighlighted) && (
+                            <Check className={`w-4 h-4 shrink-0 ${isSelected ? 'text-blue-600 font-bold' : 'text-blue-400'}`} />
+                          )}
+                        </button>
+                      );
+                    })}
+                  </div>
+                )}
+
                 <input
                   id="login-username"
                   type="text"
@@ -194,6 +327,7 @@ export const LoginModal: React.FC<LoginModalProps> = ({
                   onChange={e => {
                     setUsername(e.target.value);
                   }}
+                  onKeyDown={handleKeyDown}
                   onFocus={() => {
                     if (suggestions.length > 0) setShowDropdown(true);
                   }}
@@ -203,39 +337,6 @@ export const LoginModal: React.FC<LoginModalProps> = ({
                 />
                 <Search className="w-4 h-4 text-slate-400 absolute left-3 top-1/2 -translate-y-1/2 pointer-events-none" />
               </div>
-
-              {/* Suggestions Dropdown */}
-              {showDropdown && suggestions.length > 0 && (
-                <div 
-                  id="login-account-suggestions"
-                  className="absolute left-0 right-0 top-full mt-1 bg-white border border-slate-200 rounded-xl shadow-xl z-20 max-h-56 overflow-y-auto divide-y divide-slate-100 animate-in fade-in zoom-in-95"
-                >
-                  <div className="p-2 bg-slate-50 text-[10px] font-bold text-slate-500 uppercase tracking-wider">
-                    Pilih Akun Terdaftar ({suggestions.length})
-                  </div>
-                  {suggestions.map((acc) => {
-                    const isSelected = username.trim().toLowerCase() === acc.username.toLowerCase();
-                    return (
-                      <button
-                        key={acc.username}
-                        type="button"
-                        onClick={() => handleSelectAccount(acc)}
-                        className={`w-full text-left px-3.5 py-2.5 hover:bg-blue-50 transition flex items-center justify-between text-xs ${
-                          isSelected ? 'bg-blue-50 text-blue-900 font-bold' : 'text-slate-800'
-                        }`}
-                      >
-                        <div className="truncate pr-2">
-                          <div className="font-semibold text-slate-900 truncate">{acc.display_name}</div>
-                          <div className="text-[11px] text-slate-500 font-mono">Username: <span className="font-bold text-blue-700">{acc.username}</span></div>
-                        </div>
-                        {isSelected && (
-                          <Check className="w-4 h-4 text-blue-600 shrink-0" />
-                        )}
-                      </button>
-                    );
-                  })}
-                </div>
-              )}
             </div>
 
             {/* Password Field */}

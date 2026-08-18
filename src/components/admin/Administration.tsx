@@ -1359,7 +1359,7 @@ Berikut akun Rumah Tahfidz LMS:
 Username: ${credentialSuccessModal.username}
 Password: ${credentialSuccessModal.password}
 
-Silakan digunakan untuk login ke Rumah Tahfidz LMS.
+Silakan digunakan untuk login ke Rumah Tahfidz LMS dengan alamat: https://rt-aw-10.vercel.app/ .
 Mohon simpan informasi akun ini dan tidak membagikannya kepada orang lain.`}
                 </div>
               </div>
