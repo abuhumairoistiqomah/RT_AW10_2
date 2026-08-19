@@ -9,12 +9,13 @@ import {
   Teacher
 } from '../types';
 import { ApiService } from '../services/api';
+import { hasAssessmentContent, deduplicateAssessments } from '../utils/assessmentResolver';
 
 interface TeacherWorkspaceContextType {
   workspace: TeacherWorkspaceBootstrap | null;
   isLoading: boolean;
   isRevalidating: boolean;
-  syncStatus: 'SYNCED' | 'SYNCING' | 'PENDING' | 'ERROR';
+  syncStatus: 'SYNCED' | 'SYNCING' | 'PENDING' | 'OFFLINE' | 'ERROR';
   syncMessage: string;
   lastSyncedAt: Date | null;
   pendingWrites: PendingAssessmentWrite[];
@@ -28,6 +29,7 @@ interface TeacherWorkspaceContextType {
   saveAssessmentOptimistic: (payload: any) => Promise<{ success: boolean; error?: string }>;
   deleteAssessmentOptimistic: (assessmentId: string, participantId?: string, sessionConfigId?: string, studentId?: string) => Promise<{ success: boolean; error?: string }>;
   saveFinalEvaluationOptimistic: (payload: any) => Promise<{ success: boolean; error?: string }>;
+  applyBulkAttendanceOptimistic: (sessionConfigId: string, studentIds: string[], attendanceStatus: 'PRESENT' | 'SICK' | 'PERMISSION' | 'ABSENT') => Promise<{ success: boolean; error?: string }>;
   retryPendingWrites: () => Promise<void>;
 }
 
@@ -220,18 +222,38 @@ export const TeacherWorkspaceProvider: React.FC<{
 
     return students.map(s => {
       const asms = studentAsmsMap.get(s.student_id) || [];
-      const totalLines = asms.reduce((sum, a) => sum + (Number(a.lines_added) || 0), 0);
+      let totalZiyadah = 0;
+      let totalNuroniyyah = 0;
+      let totalIqra = 0;
+
+      asms.forEach(a => {
+        const mode = a.assessment_mode || (a.iqra_level != null ? 'IQRA' : a.nuroniyyah_dars ? 'NURONIYYAH' : 'ZIYADAH');
+        if (mode === 'IQRA') {
+          totalIqra += Number(a.iqra_pages_added) || 0;
+        } else if (mode === 'NURONIYYAH') {
+          totalNuroniyyah += Number(a.lines_added) || 0;
+        } else {
+          totalZiyadah += Number(a.lines_added) || 0;
+        }
+      });
+
       const studentEval = evalMap.get(s.participant_id) || evalMap.get(s.student_id);
       return {
         ...s,
-        totalLinesAdded: totalLines,
+        totalLinesAdded: totalZiyadah,
+        totalZiyadahLinesAdded: totalZiyadah,
+        totalNuroniyyahLinesAdded: totalNuroniyyah,
+        totalIqraPagesAdded: totalIqra,
         completionStatus: studentEval ? studentEval.completion_status : (s.completionStatus || 'NOT_EVALUATED')
       };
     });
   }, []);
 
-  // Update sync status text based on pending writes
+  // Sync status handling based on pending writes and circuit breaker
   useEffect(() => {
+    const cb = ApiService.getCircuitBreakerState();
+    const isOff = cb.isOffline || (typeof navigator !== 'undefined' && !navigator.onLine);
+
     if (pendingWrites.length > 0) {
       const failed = pendingWrites.filter(p => p.status === 'FAILED').length;
       if (failed > 0) {
@@ -241,6 +263,11 @@ export const TeacherWorkspaceProvider: React.FC<{
         setSyncStatus('SYNCING');
         setSyncMessage('Menyinkronkan data...');
       }
+    } else if (isOff) {
+      setSyncStatus('OFFLINE');
+      setSyncMessage(cb.isOffline && cb.remainingCooldownSeconds > 0 
+        ? `Server Offline (${cb.remainingCooldownSeconds}s) - Mode Cache`
+        : 'Mode Offline / Cache');
     } else if (isRevalidating) {
       setSyncStatus('SYNCING');
       setSyncMessage('Memuat pembaruan...');
@@ -297,43 +324,98 @@ export const TeacherWorkspaceProvider: React.FC<{
       // Merge server data with pending writes to protect optimistic changes
       const cacheKey = isTeacher ? (currentUser.teacher_id || '') : (targetTeacherId || '__ADMIN_ALL__');
       const currentPending = loadPendingWrites(cacheKey);
-      let mergedAssessments = [...serverData.assessments];
+      let mergedAssessments = deduplicateAssessments([...serverData.assessments]);
 
       currentPending.forEach(pending => {
         const pPayload = pending.payload;
-        const existingIdx = mergedAssessments.findIndex(a =>
-          a.participant_id === pending.participant_id &&
-          a.session_config_id === pending.session_config_id
-        );
+        const isBulk = pPayload?.action === 'bulkSaveSessionAttendance' || Array.isArray(pPayload?.studentIds);
 
-        const optimisticAsm: SessionAssessment = {
-          assessment_id: pPayload.assessment_id || `ASM-LOCAL-${pending.id}`,
-          event_id: serverData.event?.event_id || '',
-          event_day_id: pPayload.event_day_id || '',
-          session_config_id: pending.session_config_id,
-          participant_id: pending.participant_id,
-          student_id: pending.student_id,
-          halaqah_id: serverData.halaqah?.halaqah_id || '',
-          session_no: pPayload.session_no || 1,
-          attendance_status: pPayload.attendance || 'PRESENT',
-          surah_start: pPayload.start_surah,
-          ayah_start: pPayload.start_ayah,
-          surah_end: pPayload.end_surah,
-          ayah_end: pPayload.end_ayah,
-          lines_added: pPayload.lines_added || 0,
-          session_note: pPayload.notes,
-          teacher_id: pPayload.teacher_id || targetTeacherId || '',
-          is_deleted: false,
-          created_at: new Date(pending.localTimestamp).toISOString(),
-          updated_at: new Date(pending.localTimestamp).toISOString()
-        };
+        if (isBulk) {
+          const sessionConfigId = pending.session_config_id || pPayload.sessionConfigId;
+          const studentIds: string[] = pPayload.studentIds || [];
+          const status = pPayload.attendanceStatus || 'PRESENT';
+          const isPresent = status === 'PRESENT';
+          const sc = serverData.sessionConfigs?.find(c => c.session_config_id === sessionConfigId);
 
-        if (existingIdx >= 0) {
-          mergedAssessments[existingIdx] = optimisticAsm;
+          studentIds.forEach(sid => {
+            const participant = serverData.students.find(s => s.student_id === sid);
+            const existingIdx = mergedAssessments.findIndex(a =>
+              !a.is_deleted &&
+              a.student_id === sid &&
+              a.session_config_id === sessionConfigId
+            );
+
+            if (existingIdx >= 0) {
+              const old = mergedAssessments[existingIdx];
+              mergedAssessments[existingIdx] = {
+                ...old,
+                attendance_status: status,
+                updated_at: new Date(pending.localTimestamp).toISOString()
+              };
+            } else {
+              const optimisticAsm: SessionAssessment = {
+                assessment_id: `ASM-LOCAL-BULK-${pending.id}-${sid.substring(0, 6)}`,
+                event_id: serverData.event?.event_id || '',
+                event_day_id: sc?.event_day_id || '',
+                session_config_id: sessionConfigId,
+                participant_id: participant?.participant_id || '',
+                student_id: sid,
+                halaqah_id: serverData.halaqah?.halaqah_id || '',
+                session_no: sc?.session_no || 1,
+                attendance_status: status,
+                assessment_status: isPresent ? 'PENDING' : 'COMPLETED',
+                teacher_id: pPayload.teacherId || targetTeacherId || '',
+                is_deleted: false,
+                created_at: new Date(pending.localTimestamp).toISOString(),
+                updated_at: new Date(pending.localTimestamp).toISOString()
+              };
+              mergedAssessments.push(optimisticAsm);
+            }
+          });
         } else {
-          mergedAssessments.push(optimisticAsm);
+          const existingIdx = mergedAssessments.findIndex(a =>
+            !a.is_deleted &&
+            ((a.participant_id && a.participant_id === pending.participant_id) || (a.student_id && a.student_id === pending.student_id)) &&
+            (a.session_config_id === pending.session_config_id || a.session_no === pPayload.session_no)
+          );
+
+          const optimisticAsm: SessionAssessment = {
+            assessment_id: pPayload.assessment_id || `ASM-LOCAL-${pending.id}`,
+            event_id: serverData.event?.event_id || '',
+            event_day_id: pPayload.event_day_id || '',
+            session_config_id: pending.session_config_id,
+            participant_id: pending.participant_id,
+            student_id: pending.student_id,
+            halaqah_id: serverData.halaqah?.halaqah_id || '',
+            session_no: pPayload.session_no || 1,
+            attendance_status: pPayload.attendance || 'PRESENT',
+            assessment_mode: pPayload.assessment_mode,
+            surah_start: pPayload.start_surah,
+            ayah_start: pPayload.start_ayah,
+            surah_end: pPayload.end_surah,
+            ayah_end: pPayload.end_ayah,
+            lines_added: pPayload.lines_added || 0,
+            nuroniyyah_dars: pPayload.nuroniyyah_dars,
+            iqra_level: pPayload.iqra_level,
+            iqra_page_start: pPayload.iqra_page_start,
+            iqra_page_end: pPayload.iqra_page_end,
+            iqra_pages_added: pPayload.iqra_pages_added,
+            session_note: pPayload.notes,
+            teacher_id: pPayload.teacher_id || targetTeacherId || '',
+            is_deleted: false,
+            created_at: new Date(pending.localTimestamp).toISOString(),
+            updated_at: new Date(pending.localTimestamp).toISOString()
+          };
+
+          if (existingIdx >= 0) {
+            mergedAssessments[existingIdx] = optimisticAsm;
+          } else {
+            mergedAssessments.push(optimisticAsm);
+          }
         }
       });
+
+      mergedAssessments = deduplicateAssessments(mergedAssessments);
 
       const updatedStudents = recomputeStudentProgress(
         serverData.students,
@@ -358,9 +440,19 @@ export const TeacherWorkspaceProvider: React.FC<{
       setLastSyncedAt(now);
       saveWorkspaceToCache(cacheKey, updatedWorkspace);
     } catch (err: any) {
-      console.warn('Teacher workspace revalidation failed:', err.message);
-      setSyncStatus(pendingWrites.length > 0 ? 'PENDING' : 'ERROR');
-      setSyncMessage(pendingWrites.length > 0 ? `⚠ ${pendingWrites.length} belum tersinkron` : 'Mode Offline / Cache');
+      console.warn('Teacher workspace revalidation failed (retaining cached data):', err.message);
+      const cb = ApiService.getCircuitBreakerState();
+      const isOff = cb.isOffline || (typeof navigator !== 'undefined' && !navigator.onLine);
+      if (pendingWrites.length > 0) {
+        setSyncStatus('PENDING');
+        setSyncMessage(`⚠ ${pendingWrites.length} perubahan belum tersinkron`);
+      } else if (isOff) {
+        setSyncStatus('OFFLINE');
+        setSyncMessage('Mode Offline / Cache (Server tidak merespons)');
+      } else {
+        setSyncStatus('ERROR');
+        setSyncMessage('Koneksi terganggu (Data lokal aman)');
+      }
     } finally {
       setIsLoading(false);
       setIsRevalidating(false);
@@ -388,14 +480,19 @@ export const TeacherWorkspaceProvider: React.FC<{
     }
   }, [effectiveTeacherId, isTeacherOrStaff, isTeacher, currentUser?.teacher_id]);
 
+  // When selectedTeacherId changes, load appropriate pending write queue
+  useEffect(() => {
+    const queueKey = isTeacher ? (currentUser?.teacher_id || '') : (selectedTeacherId || '__ADMIN_ALL__');
+    if (queueKey) {
+      setPendingWrites(loadPendingWrites(queueKey));
+    } else {
+      setPendingWrites([]);
+    }
+  }, [selectedTeacherId, isTeacher, currentUser?.teacher_id]);
+
   // Change teacher explicitly (ADMIN/COORDINATOR)
   const setSelectedTeacherId = useCallback((newTeacherId: string) => {
     if (isTeacher) return; // Strict TEACHER role rule: never change identity
-
-    const oldTeacherId = selectedTeacherId;
-    if (oldTeacherId !== newTeacherId) {
-      clearTeacherWorkspaceCache(oldTeacherId || '__ADMIN_ALL__');
-    }
 
     setSelectedTeacherIdState(newTeacherId);
     setActiveHalaqahId('');
@@ -416,24 +513,62 @@ export const TeacherWorkspaceProvider: React.FC<{
 
     // Preload fresh workspace for selected teacher (or all halaqahs when newTeacherId is empty)
     preloadWorkspace(true, undefined, newTeacherId);
-  }, [isTeacher, selectedTeacherId, preloadWorkspace]);
+  }, [isTeacher, preloadWorkspace]);
 
   // Retry pending write queue
   const retryPendingWrites = useCallback(async () => {
-    if (!effectiveTeacherId || syncInProgressRef.current) return;
-    const currentQueue = loadPendingWrites(effectiveTeacherId);
+    const targetKey = isTeacher ? (currentUser?.teacher_id || '') : (selectedTeacherId || '__ADMIN_ALL__');
+    if (!targetKey || syncInProgressRef.current) return;
+    const currentQueue = loadPendingWrites(targetKey);
     if (currentQueue.length === 0) return;
+
+    if (typeof navigator !== 'undefined' && !navigator.onLine) {
+      setSyncStatus('OFFLINE');
+      setSyncMessage(`Mode Offline (⚠ ${currentQueue.length} belum tersinkron)`);
+      return;
+    }
+
+    const cb = ApiService.getCircuitBreakerState();
+    if (cb.isOffline) {
+      setSyncStatus('OFFLINE');
+      setSyncMessage(`Server Offline (${cb.remainingCooldownSeconds}s) - ⚠ ${currentQueue.length} belum tersinkron`);
+      return;
+    }
 
     syncInProgressRef.current = true;
     setSyncStatus('SYNCING');
     setSyncMessage('Menyinkronkan perubahan...');
 
     const remainingQueue: PendingAssessmentWrite[] = [];
+    let networkFailed = false;
 
     for (const item of currentQueue) {
+      if (networkFailed) {
+        // Pause remainder of batch on transport error to avoid hammering server
+        remainingQueue.push(item);
+        continue;
+      }
       try {
-        await ApiService.submitSessionAssessment(item.payload, currentUser?.user_id);
+        const isBulk = item.payload?.action === 'bulkSaveSessionAttendance' || Array.isArray(item.payload?.studentIds);
+        if (isBulk) {
+          const studentIds: string[] = item.payload.studentIds || [];
+          if (studentIds.length === 0) {
+            // Already compacted to 0 students, skip
+            continue;
+          }
+          await ApiService.bulkSaveSessionAttendance(
+            item.session_config_id || item.payload.sessionConfigId,
+            studentIds,
+            item.payload.attendanceStatus || 'PRESENT',
+            currentUser?.user_id
+          );
+        } else {
+          await ApiService.submitSessionAssessment(item.payload, currentUser?.user_id);
+        }
       } catch (err: any) {
+        if (err instanceof ApiService.NetworkError || err?.isNetworkError) {
+          networkFailed = true;
+        }
         remainingQueue.push({
           ...item,
           status: 'FAILED',
@@ -444,7 +579,7 @@ export const TeacherWorkspaceProvider: React.FC<{
     }
 
     setPendingWrites(remainingQueue);
-    savePendingWrites(effectiveTeacherId, remainingQueue);
+    savePendingWrites(targetKey, remainingQueue);
     syncInProgressRef.current = false;
 
     if (remainingQueue.length === 0) {
@@ -452,10 +587,45 @@ export const TeacherWorkspaceProvider: React.FC<{
       setSyncMessage('✓ Tersinkron');
       setLastSyncedAt(new Date());
     } else {
-      setSyncStatus('PENDING');
+      const isOff = ApiService.getCircuitBreakerState().isOffline || !navigator.onLine;
+      setSyncStatus(isOff ? 'OFFLINE' : 'PENDING');
       setSyncMessage(`⚠ ${remainingQueue.length} perubahan belum tersinkron`);
     }
-  }, [effectiveTeacherId, currentUser?.user_id]);
+  }, [isTeacher, currentUser, selectedTeacherId]);
+
+  // Automatic recovery when network comes back online or app wakes up
+  useEffect(() => {
+    const handleOnlineRecovery = () => {
+      console.log('[Network Resilience] Network/Window restored, triggering revalidation');
+      retryPendingWrites();
+      preloadWorkspace(false);
+    };
+
+    const handleStatusChange = (e: any) => {
+      const detail = e.detail;
+      if (detail?.status === 'ONLINE') {
+        retryPendingWrites();
+      } else if (detail?.status === 'OFFLINE') {
+        if (pendingWrites.length > 0) {
+          setSyncStatus('PENDING');
+          setSyncMessage(`⚠ ${pendingWrites.length} belum tersinkron`);
+        } else {
+          setSyncStatus('OFFLINE');
+          setSyncMessage('Mode Offline / Cache');
+        }
+      }
+    };
+
+    window.addEventListener('online', handleOnlineRecovery);
+    window.addEventListener('rt_app_resumed', handleOnlineRecovery);
+    window.addEventListener('rt_backend_status_change', handleStatusChange);
+
+    return () => {
+      window.removeEventListener('online', handleOnlineRecovery);
+      window.removeEventListener('rt_app_resumed', handleOnlineRecovery);
+      window.removeEventListener('rt_backend_status_change', handleStatusChange);
+    };
+  }, [retryPendingWrites, preloadWorkspace, pendingWrites.length]);
 
   // Optimistic Save Assessment
   const saveAssessmentOptimistic = useCallback(async (payload: any): Promise<{ success: boolean; error?: string }> => {
@@ -500,10 +670,12 @@ export const TeacherWorkspaceProvider: React.FC<{
       ayah_start: payload.start_ayah,
       surah_end: payload.end_surah,
       ayah_end: payload.end_ayah,
-      lines_added: payload.lines_added || 0,
+      lines_added: payload.lines_added !== undefined ? payload.lines_added : 0,
+      nuroniyyah_dars: payload.nuroniyyah_dars,
       iqra_level: payload.iqra_level,
       iqra_page_start: payload.iqra_page_start,
       iqra_page_end: payload.iqra_page_end,
+      iqra_pages_added: payload.iqra_pages_added,
       session_note: payload.notes || '',
       teacher_id: payloadWithTeacher.teacher_id,
       is_deleted: false,
@@ -514,13 +686,16 @@ export const TeacherWorkspaceProvider: React.FC<{
     // 1. Immediately update in-memory assessments
     let newAssessments = [...workspace.assessments];
     const asmIndex = newAssessments.findIndex(a =>
-      a.participant_id === participantId && a.session_config_id === sessionConfigId
+      !a.is_deleted &&
+      ((a.participant_id && a.participant_id === participantId) || (a.student_id && a.student_id === studentId)) &&
+      (a.session_config_id === sessionConfigId || a.session_no === payload.session_no)
     );
     if (asmIndex >= 0) {
       newAssessments[asmIndex] = optimisticAsm;
     } else {
       newAssessments.push(optimisticAsm);
     }
+    newAssessments = deduplicateAssessments(newAssessments);
 
     // 2. Recompute student progress immediately
     const updatedStudents = recomputeStudentProgress(
@@ -540,7 +715,8 @@ export const TeacherWorkspaceProvider: React.FC<{
     setWorkspace(updatedWorkspace);
     saveWorkspaceToCache(cacheKey, updatedWorkspace);
 
-    // 4. Update Pending Write Queue
+    // 4. Update Pending Write Queue with Compaction / Overlap resolution:
+    // Individual action always overrides and removes this student from any pending bulk jobs for this session!
     const queueItemId = `queue-${Date.now()}-${Math.random().toString(36).substring(2, 7)}`;
     const pendingItem: PendingAssessmentWrite = {
       id: queueItemId,
@@ -554,7 +730,31 @@ export const TeacherWorkspaceProvider: React.FC<{
       retryCount: 0
     };
 
-    let nextQueue = pendingWrites.filter(p => !(p.participant_id === participantId && p.session_config_id === sessionConfigId));
+    let currentQueue = loadPendingWrites(cacheKey);
+    let nextQueue: PendingAssessmentWrite[] = [];
+
+    currentQueue.forEach(p => {
+      const isBulk = p.payload?.action === 'bulkSaveSessionAttendance' || Array.isArray(p.payload?.studentIds);
+      if (isBulk && p.session_config_id === sessionConfigId) {
+        // Filter out this student from existing pending bulk jobs
+        const remainingStudents = (p.payload.studentIds || []).filter((sid: string) => sid !== studentId && sid !== participantId);
+        if (remainingStudents.length > 0) {
+          nextQueue.push({
+            ...p,
+            payload: {
+              ...p.payload,
+              studentIds: remainingStudents
+            }
+          });
+        }
+        // If 0 students remaining in bulk job, it is completely removed!
+      } else if (p.participant_id === participantId && p.session_config_id === sessionConfigId) {
+        // Drop older individual write for this student & session
+      } else {
+        nextQueue.push(p);
+      }
+    });
+
     nextQueue.push(pendingItem);
     setPendingWrites(nextQueue);
     savePendingWrites(cacheKey, nextQueue);
@@ -565,7 +765,7 @@ export const TeacherWorkspaceProvider: React.FC<{
     // 5. Send background sync request
     ApiService.submitSessionAssessment(payloadWithTeacher, currentUser.user_id)
       .then(serverAsm => {
-        const finalQueue = loadPendingWrites(cacheKey).filter(p => p.id !== queueItemId && !(p.participant_id === participantId && p.session_config_id === sessionConfigId));
+        const finalQueue = loadPendingWrites(cacheKey).filter(p => p.id !== queueItemId);
         setPendingWrites(finalQueue);
         savePendingWrites(cacheKey, finalQueue);
 
@@ -590,7 +790,7 @@ export const TeacherWorkspaceProvider: React.FC<{
       .catch(err => {
         console.warn('Optimistic assessment write failed to sync:', err.message);
         const failedQueue = loadPendingWrites(cacheKey).map(p => {
-          if (p.id === queueItemId || (p.participant_id === participantId && p.session_config_id === sessionConfigId)) {
+          if (p.id === queueItemId) {
             return { ...p, status: 'FAILED' as const, error: err.message || 'Gagal tersinkron' };
           }
           return p;
@@ -602,7 +802,7 @@ export const TeacherWorkspaceProvider: React.FC<{
       });
 
     return { success: true };
-  }, [currentUser, workspace, pendingWrites, effectiveTeacherId, isTeacher, selectedTeacherId, recomputeStudentProgress]);
+  }, [currentUser, workspace, isTeacher, selectedTeacherId, recomputeStudentProgress]);
 
   // Optimistic Delete Assessment
   const deleteAssessmentOptimistic = useCallback(async (
@@ -637,8 +837,28 @@ export const TeacherWorkspaceProvider: React.FC<{
     setWorkspace(updatedWorkspace);
     saveWorkspaceToCache(cacheKey, updatedWorkspace);
 
-    // Remove from pending write queue if it was pending
-    const remainingQueue = pendingWrites.filter(p => !(participantId && sessionConfigId && p.participant_id === participantId && p.session_config_id === sessionConfigId));
+    // Remove from pending write queue if it was pending (and compact bulk jobs)
+    let currentQueue = loadPendingWrites(cacheKey);
+    let remainingQueue: PendingAssessmentWrite[] = [];
+    currentQueue.forEach(p => {
+      const isBulk = p.payload?.action === 'bulkSaveSessionAttendance' || Array.isArray(p.payload?.studentIds);
+      if (isBulk && sessionConfigId && p.session_config_id === sessionConfigId) {
+        const remainingStudents = (p.payload.studentIds || []).filter((sid: string) => sid !== studentId && sid !== participantId);
+        if (remainingStudents.length > 0) {
+          remainingQueue.push({
+            ...p,
+            payload: {
+              ...p.payload,
+              studentIds: remainingStudents
+            }
+          });
+        }
+      } else if (participantId && sessionConfigId && p.participant_id === participantId && p.session_config_id === sessionConfigId) {
+        // Drop individual job
+      } else {
+        remainingQueue.push(p);
+      }
+    });
     setPendingWrites(remainingQueue);
     savePendingWrites(cacheKey, remainingQueue);
 
@@ -653,7 +873,187 @@ export const TeacherWorkspaceProvider: React.FC<{
       });
 
     return { success: true };
-  }, [currentUser, workspace, pendingWrites, effectiveTeacherId, isTeacher, selectedTeacherId, recomputeStudentProgress]);
+  }, [currentUser, workspace, isTeacher, selectedTeacherId, recomputeStudentProgress]);
+
+  // Optimistic Bulk Attendance (Silent Presensi / Instant "Semua Hadir")
+  const applyBulkAttendanceOptimistic = useCallback(async (
+    sessionConfigId: string,
+    studentIds: string[],
+    attendanceStatus: 'PRESENT' | 'SICK' | 'PERMISSION' | 'ABSENT'
+  ): Promise<{ success: boolean; error?: string }> => {
+    if (!currentUser || !workspace) {
+      return { success: false, error: 'Sesi guru belum siap.' };
+    }
+    if (!sessionConfigId || studentIds.length === 0) {
+      return { success: false, error: 'Pilih sesi dan minimal satu siswa.' };
+    }
+
+    const currentTeacherId = isTeacher
+      ? (currentUser.teacher_id || '')
+      : (selectedTeacherId || workspace.assignedTeachers?.[0]?.teacher_id || '');
+    const cacheKey = isTeacher ? (currentUser.teacher_id || '') : (selectedTeacherId || '__ADMIN_ALL__');
+
+    const eventId = workspace.event?.event_id || '';
+    const nowIso = new Date().toISOString();
+    const matchingConfig = workspace.sessionConfigs.find(sc => sc.session_config_id === sessionConfigId);
+
+    // 1. Immediately update in-memory assessments (preserving all Quran/Nuroniyyah/Iqra progress)
+    let updatedAssessments = [...workspace.assessments];
+
+    studentIds.forEach(sid => {
+      const participant = workspace.students.find(s => s.student_id === sid);
+      const existingIdx = updatedAssessments.findIndex(a =>
+        !a.is_deleted &&
+        a.student_id === sid &&
+        a.session_config_id === sessionConfigId
+      );
+
+      const isPresent = attendanceStatus === 'PRESENT';
+
+      if (existingIdx >= 0) {
+        const existing = updatedAssessments[existingIdx];
+        const hasContent = hasAssessmentContent(existing);
+
+        const updated: SessionAssessment = {
+          ...existing,
+          attendance_status: attendanceStatus,
+          assessment_status: isPresent ? (hasContent ? 'COMPLETED' : 'PENDING') : 'COMPLETED',
+          updated_at: nowIso
+        };
+        updatedAssessments[existingIdx] = updated;
+      } else {
+        const newAsm: SessionAssessment = {
+          assessment_id: `ASM-LOCAL-BULK-${Date.now()}-${sid.substring(0, 6)}`,
+          event_id: eventId,
+          event_day_id: matchingConfig?.event_day_id || '',
+          session_config_id: sessionConfigId,
+          participant_id: participant?.participant_id || '',
+          student_id: sid,
+          halaqah_id: workspace.halaqah?.halaqah_id || '',
+          session_no: matchingConfig?.session_no || 1,
+          attendance_status: attendanceStatus,
+          assessment_status: isPresent ? 'PENDING' : 'COMPLETED',
+          teacher_id: currentTeacherId,
+          is_deleted: false,
+          created_at: nowIso,
+          updated_at: nowIso
+        };
+        updatedAssessments.push(newAsm);
+      }
+    });
+
+    updatedAssessments = deduplicateAssessments(updatedAssessments);
+
+    // 2. Recompute student progress immediately
+    const updatedStudents = recomputeStudentProgress(
+      workspace.students,
+      updatedAssessments,
+      workspace.finalEvaluations
+    );
+
+    const updatedWorkspace: TeacherWorkspaceBootstrap = {
+      ...workspace,
+      assessments: updatedAssessments,
+      students: updatedStudents,
+      lastSyncedAt: nowIso
+    };
+
+    // 3. Update React state & cache immediately
+    setWorkspace(updatedWorkspace);
+    saveWorkspaceToCache(cacheKey, updatedWorkspace);
+
+    // 4. Update Pending Write Queue with Compaction / Overlap resolution
+    const queueItemId = `bulk-${Date.now()}-${Math.random().toString(36).substring(2, 7)}`;
+    const newBulkItem: PendingAssessmentWrite = {
+      id: queueItemId,
+      event_id: eventId,
+      participant_id: '__BULK__',
+      session_config_id: sessionConfigId,
+      student_id: '__BULK__',
+      payload: {
+        action: 'bulkSaveSessionAttendance',
+        sessionConfigId,
+        studentIds: [...studentIds],
+        attendanceStatus,
+        teacherId: currentTeacherId,
+        actorUserId: currentUser.user_id
+      },
+      localTimestamp: Date.now(),
+      status: 'SYNCING',
+      retryCount: 0
+    };
+
+    let currentQueue = loadPendingWrites(cacheKey);
+    let nextQueue: PendingAssessmentWrite[] = [];
+
+    // Compact existing queue:
+    // If an older bulk job has the SAME session_config_id, remove any overlapping studentIds from it
+    currentQueue.forEach(p => {
+      const isBulk = p.payload?.action === 'bulkSaveSessionAttendance' || Array.isArray(p.payload?.studentIds);
+      if (isBulk && p.session_config_id === sessionConfigId) {
+        const remainingStudents = (p.payload.studentIds || []).filter((sid: string) => !studentIds.includes(sid));
+        if (remainingStudents.length > 0) {
+          nextQueue.push({
+            ...p,
+            payload: {
+              ...p.payload,
+              studentIds: remainingStudents
+            }
+          });
+        }
+      } else {
+        nextQueue.push(p);
+      }
+    });
+
+    nextQueue.push(newBulkItem);
+    setPendingWrites(nextQueue);
+    savePendingWrites(cacheKey, nextQueue);
+
+    setSyncStatus('SYNCING');
+    setSyncMessage('Menyinkronkan data presensi...');
+
+    // 5. Trigger silent background sync
+    ApiService.bulkSaveSessionAttendance(
+      sessionConfigId,
+      studentIds,
+      attendanceStatus,
+      currentUser.user_id
+    )
+      .then(() => {
+        // Remove this bulk item on success
+        const finalQueue = loadPendingWrites(cacheKey).filter(p => p.id !== queueItemId);
+        setPendingWrites(finalQueue);
+        savePendingWrites(cacheKey, finalQueue);
+
+        if (finalQueue.length === 0) {
+          setSyncStatus('SYNCED');
+          setSyncMessage('✓ Tersinkron');
+          setLastSyncedAt(new Date());
+        }
+      })
+      .catch(err => {
+        console.warn('Optimistic bulk attendance write failed to sync silently:', err.message);
+        const isOff = ApiService.getCircuitBreakerState().isOffline || !navigator.onLine;
+        const failedQueue = loadPendingWrites(cacheKey).map(p => {
+          if (p.id === queueItemId) {
+            return { ...p, status: 'FAILED' as const, error: err.message || 'Gagal tersinkron' };
+          }
+          return p;
+        });
+        setPendingWrites(failedQueue);
+        savePendingWrites(cacheKey, failedQueue);
+        if (isOff) {
+          setSyncStatus('OFFLINE');
+          setSyncMessage('Mode Offline — data tetap tersimpan di perangkat');
+        } else {
+          setSyncStatus('PENDING');
+          setSyncMessage(`⚠ ${failedQueue.length} perubahan belum tersinkron`);
+        }
+      });
+
+    return { success: true };
+  }, [currentUser, workspace, isTeacher, selectedTeacherId, recomputeStudentProgress]);
 
   // Optimistic Save Final Evaluation
   const saveFinalEvaluationOptimistic = useCallback(async (payload: any): Promise<{ success: boolean; error?: string }> => {
@@ -792,6 +1192,7 @@ export const TeacherWorkspaceProvider: React.FC<{
         saveAssessmentOptimistic,
         deleteAssessmentOptimistic,
         saveFinalEvaluationOptimistic,
+        applyBulkAttendanceOptimistic,
         retryPendingWrites
       }}
     >

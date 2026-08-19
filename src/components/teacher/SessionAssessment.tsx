@@ -5,6 +5,7 @@ import { useTeacherWorkspace } from '../../context/TeacherWorkspaceContext';
 import { TeacherSyncBadge } from './TeacherSyncBadge';
 import { getSurahByNo, getSurahNameFormatted, validateAyah, formatCurrentProgress } from '../../utils/quran';
 import { formatSessionOptionLabel, sortSessionConfigs, isFinalEvaluationSession as checkIsFinalEvaluationSession } from '../../utils/sessionFormatter';
+import { resolveCanonicalAssessment, resolveAuthoritativeMode } from '../../utils/assessmentResolver';
 import { SessionSummaryCard } from '../common/SessionSummaryCard';
 import { Toast } from '../common/Toast';
 import {
@@ -72,6 +73,7 @@ export const SessionAssessment: React.FC<SessionAssessmentProps> = ({
   const [iqraLevel, setIqraLevel] = useState<number | undefined>(undefined);
   const [iqraPageStart, setIqraPageStart] = useState<string>('');
   const [iqraPageEnd, setIqraPageEnd] = useState<string>('');
+  const [iqraPagesAdded, setIqraPagesAdded] = useState<string>('');
   const [notes, setNotes] = useState<string>('');
 
   // Edit Mode Tracker
@@ -178,6 +180,7 @@ export const SessionAssessment: React.FC<SessionAssessmentProps> = ({
   }, [selectedSessionConfig, availableSessionConfigs]);
 
   const [savingPresensi, setSavingPresensi] = useState<boolean>(false);
+  const hydratedKeyRef = useRef<string>('');
 
   // Draft Key Generator
   const getDraftKey = useCallback(() => {
@@ -189,19 +192,31 @@ export const SessionAssessment: React.FC<SessionAssessmentProps> = ({
   }, [currentUser, workspace?.event?.event_id, selectedStudentId, selectedSessionConfigId]);
 
   // Mode change handler: clears fields of other mode
-  const handleModeChange = (newMode: 'ZIYADAH' | 'NURONIYYAH') => {
+  const handleModeChange = (newMode: 'ZIYADAH' | 'NURONIYYAH' | 'IQRA') => {
     if (newMode === assessmentMode) return;
     setAssessmentMode(newMode);
-    if (newMode === 'NURONIYYAH') {
-      setStartSurah(undefined);
-      setStartAyah('');
-      setEndSurah(undefined);
-      setEndAyah('');
-    } else {
+    if (newMode === 'ZIYADAH') {
       setNuroniyyahDars('');
       setIqraLevel(undefined);
       setIqraPageStart('');
       setIqraPageEnd('');
+      setIqraPagesAdded('');
+    } else if (newMode === 'NURONIYYAH') {
+      setStartSurah(undefined);
+      setStartAyah('');
+      setEndSurah(undefined);
+      setEndAyah('');
+      setIqraLevel(undefined);
+      setIqraPageStart('');
+      setIqraPageEnd('');
+      setIqraPagesAdded('');
+    } else if (newMode === 'IQRA') {
+      setStartSurah(undefined);
+      setStartAyah('');
+      setEndSurah(undefined);
+      setEndAyah('');
+      setNuroniyyahDars('');
+      setLinesAdded('');
     }
   };
 
@@ -209,53 +224,70 @@ export const SessionAssessment: React.FC<SessionAssessmentProps> = ({
   useEffect(() => {
     if (!selectedStudentId || !selectedSessionConfig) return;
 
+    const currentKey = `${selectedStudentId}::${selectedSessionConfig.session_config_id}`;
+    // If already hydrated for this student & session, don't reset form on background revalidation
+    if (hydratedKeyRef.current === currentKey) {
+      return;
+    }
+    hydratedKeyRef.current = currentKey;
+
     const renderStart = performance.now();
     setSuccessMsg('');
     setErrorMsg('');
 
-    // Check if real assessment exists in DB/storage for this student & session
-    const existing = assessments.find(a =>
-      !a.is_deleted &&
-      a.student_id === selectedStudentId &&
-      (a.session_config_id === selectedSessionConfig.session_config_id || a.session_no === selectedSessionConfig.session_no)
-    );
+    // Check if canonical assessment exists for this student & session
+    const existing = resolveCanonicalAssessment(assessments, {
+      eventId: workspace?.event?.event_id,
+      participantId: selectedStudent?.participant_id,
+      studentId: selectedStudentId,
+      sessionConfigId: selectedSessionConfig.session_config_id,
+      sessionNo: selectedSessionConfig.session_no
+    });
 
     if (existing) {
       setExistingAssessmentId(existing.assessment_id);
       setAttendance(existing.attendance_status || 'PRESENT');
 
-      // Map legacy IQRA to NURONIYYAH in UI
-      const existingMode = (existing.assessment_mode === 'NURONIYYAH' || existing.nuroniyyah_dars)
-        ? 'NURONIYYAH'
-        : (existing.assessment_mode === 'IQRA' || existing.iqra_level != null || existing.iqra_page_start != null)
-          ? 'NURONIYYAH'
-          : 'ZIYADAH';
+      const existingMode = resolveAuthoritativeMode(existing);
       setAssessmentMode(existingMode);
 
-      if (existingMode === 'NURONIYYAH') {
-        const dars = existing.nuroniyyah_dars || (existing.iqra_level ? `Ad-Dars ${existing.iqra_level}` : '');
-        setNuroniyyahDars(dars);
-        setLinesAdded(existing.lines_added != null ? String(existing.lines_added) : '');
+      if (existingMode === 'IQRA') {
+        setIqraLevel(existing.iqra_level !== undefined && existing.iqra_level !== null && existing.iqra_level !== ('' as any) ? Number(existing.iqra_level) : undefined);
+        setIqraPageStart(existing.iqra_page_start !== undefined && existing.iqra_page_start !== null ? String(existing.iqra_page_start) : '');
+        setIqraPageEnd(existing.iqra_page_end !== undefined && existing.iqra_page_end !== null ? String(existing.iqra_page_end) : '');
+        setIqraPagesAdded(existing.iqra_pages_added !== undefined && existing.iqra_pages_added !== null ? String(existing.iqra_pages_added) : '');
+        setLinesAdded('');
+        setNuroniyyahDars('');
         setStartSurah(undefined);
         setStartAyah('');
         setEndSurah(undefined);
         setEndAyah('');
-        setIqraLevel(existing.iqra_level != null ? Number(existing.iqra_level) : undefined);
-        setIqraPageStart(existing.iqra_page_start != null ? String(existing.iqra_page_start) : '');
-        setIqraPageEnd(existing.iqra_page_end != null ? String(existing.iqra_page_end) : '');
+      } else if (existingMode === 'NURONIYYAH') {
+        setNuroniyyahDars(existing.nuroniyyah_dars || '');
+        setLinesAdded(existing.lines_added !== undefined && existing.lines_added !== null && existing.lines_added !== ('' as any) ? String(existing.lines_added) : '');
+        setStartSurah(undefined);
+        setStartAyah('');
+        setEndSurah(undefined);
+        setEndAyah('');
+        setIqraLevel(undefined);
+        setIqraPageStart('');
+        setIqraPageEnd('');
+        setIqraPagesAdded('');
       } else {
-        setStartSurah(existing.surah_start);
-        setStartAyah(existing.ayah_start ? String(existing.ayah_start) : '');
-        setEndSurah(existing.surah_end);
-        setEndAyah(existing.ayah_end ? String(existing.ayah_end) : '');
-        setLinesAdded(existing.lines_added != null ? String(existing.lines_added) : '');
+        // ZIYADAH
+        setStartSurah(existing.surah_start !== undefined && existing.surah_start !== null && existing.surah_start !== ('' as any) ? Number(existing.surah_start) : undefined);
+        setStartAyah(existing.ayah_start !== undefined && existing.ayah_start !== null && existing.ayah_start !== ('' as any) ? String(existing.ayah_start) : '');
+        setEndSurah(existing.surah_end !== undefined && existing.surah_end !== null && existing.surah_end !== ('' as any) ? Number(existing.surah_end) : undefined);
+        setEndAyah(existing.ayah_end !== undefined && existing.ayah_end !== null && existing.ayah_end !== ('' as any) ? String(existing.ayah_end) : '');
+        setLinesAdded(existing.lines_added !== undefined && existing.lines_added !== null && existing.lines_added !== ('' as any) ? String(existing.lines_added) : '');
         setNuroniyyahDars('');
         setIqraLevel(undefined);
         setIqraPageStart('');
         setIqraPageEnd('');
+        setIqraPagesAdded('');
       }
       setNotes(existing.session_note || '');
-      console.log(`[PERF] Loaded assessment form in ${(performance.now() - renderStart).toFixed(2)}ms`);
+      console.log(`[PERF] Loaded canonical assessment form in ${(performance.now() - renderStart).toFixed(2)}ms`);
       return;
     }
 
@@ -267,17 +299,30 @@ export const SessionAssessment: React.FC<SessionAssessmentProps> = ({
     ApiService.getDraftLocal(draftKey).then(draft => {
       if (draft) {
         setAttendance(draft.attendance || 'UNASSESSED');
-        const draftMode = (draft.assessmentMode === 'NURONIYYAH' || draft.assessmentMode === 'IQRA')
-          ? 'NURONIYYAH'
-          : (draft.assessmentMode || (selectedStudent?.skill_status_start === 'NON_BBL' ? 'NURONIYYAH' : 'ZIYADAH'));
+        const draftMode = draft.assessmentMode || (selectedStudent?.skill_status_start === 'NON_BBL' ? 'NURONIYYAH' : 'ZIYADAH');
         setAssessmentMode(draftMode);
-        if (draftMode === 'NURONIYYAH') {
-          setNuroniyyahDars(draft.nuroniyyahDars || (draft.iqraLevel ? `Ad-Dars ${draft.iqraLevel}` : ''));
+        if (draftMode === 'IQRA') {
+          setIqraLevel(draft.iqraLevel);
+          setIqraPageStart(draft.iqraPageStart || '');
+          setIqraPageEnd(draft.iqraPageEnd || '');
+          setIqraPagesAdded(draft.iqraPagesAdded || '');
+          setLinesAdded('');
+          setNuroniyyahDars('');
+          setStartSurah(undefined);
+          setStartAyah('');
+          setEndSurah(undefined);
+          setEndAyah('');
+        } else if (draftMode === 'NURONIYYAH') {
+          setNuroniyyahDars(draft.nuroniyyahDars || '');
           setLinesAdded(draft.linesAdded || '');
           setStartSurah(undefined);
           setStartAyah('');
           setEndSurah(undefined);
           setEndAyah('');
+          setIqraLevel(undefined);
+          setIqraPageStart('');
+          setIqraPageEnd('');
+          setIqraPagesAdded('');
         } else {
           setStartSurah(draft.startSurah);
           setStartAyah(draft.startAyah || '');
@@ -285,6 +330,10 @@ export const SessionAssessment: React.FC<SessionAssessmentProps> = ({
           setEndAyah(draft.endAyah || '');
           setLinesAdded(draft.linesAdded || '');
           setNuroniyyahDars('');
+          setIqraLevel(undefined);
+          setIqraPageStart('');
+          setIqraPageEnd('');
+          setIqraPagesAdded('');
         }
         setNotes(draft.notes || '');
         return;
@@ -294,30 +343,45 @@ export const SessionAssessment: React.FC<SessionAssessmentProps> = ({
       setAttendance('UNASSESSED');
       setNotes('');
 
-      // New assessment default: NON_BBL -> 'NURONIYYAH', else 'ZIYADAH'
-      const defaultMode = selectedStudent?.skill_status_start === 'NON_BBL' ? 'NURONIYYAH' : 'ZIYADAH';
-      setAssessmentMode(defaultMode);
-
       // Smart start suggestion from previous session assessment or baseline
       const prevSessionNo = selectedSessionConfig.session_no - 1;
-      const prevAssessment = assessments.find(a =>
-        !a.is_deleted &&
-        a.student_id === selectedStudentId &&
-        a.session_no === prevSessionNo &&
-        a.attendance_status === 'PRESENT'
-      );
+      const prevAssessment = resolveCanonicalAssessment(assessments, {
+        eventId: workspace?.event?.event_id,
+        participantId: selectedStudent?.participant_id,
+        studentId: selectedStudentId,
+        sessionNo: prevSessionNo
+      });
 
-      if (defaultMode === 'NURONIYYAH') {
+      // New assessment default: check previous assessment mode first, otherwise NON_BBL -> 'NURONIYYAH', else 'ZIYADAH'
+      const defaultMode: 'ZIYADAH' | 'NURONIYYAH' | 'IQRA' = prevAssessment
+        ? resolveAuthoritativeMode(prevAssessment)
+        : (selectedStudent?.skill_status_start === 'NON_BBL' ? 'NURONIYYAH' : 'ZIYADAH');
+      setAssessmentMode(defaultMode);
+
+      if (defaultMode === 'IQRA') {
         setStartSurah(undefined);
         setStartAyah('');
         setEndSurah(undefined);
         setEndAyah('');
         setLinesAdded('');
+        setNuroniyyahDars('');
+        setIqraLevel(prevAssessment?.iqra_level ? Number(prevAssessment.iqra_level) : 1);
+        setIqraPageStart(prevAssessment?.iqra_page_end ? String(prevAssessment.iqra_page_end) : '');
+        setIqraPageEnd('');
+        setIqraPagesAdded('');
+      } else if (defaultMode === 'NURONIYYAH') {
+        setStartSurah(undefined);
+        setStartAyah('');
+        setEndSurah(undefined);
+        setEndAyah('');
+        setLinesAdded('');
+        setIqraLevel(undefined);
+        setIqraPageStart('');
+        setIqraPageEnd('');
+        setIqraPagesAdded('');
 
         if (prevAssessment && (prevAssessment.assessment_mode === 'NURONIYYAH' || prevAssessment.nuroniyyah_dars)) {
           setNuroniyyahDars(prevAssessment.nuroniyyah_dars || '');
-        } else if (prevAssessment && (prevAssessment.assessment_mode === 'IQRA' || prevAssessment.iqra_level != null)) {
-          setNuroniyyahDars(`Ad-Dars ${prevAssessment.iqra_level || 1}`);
         } else {
           setNuroniyyahDars('Ad-Dars 1');
         }
@@ -326,6 +390,7 @@ export const SessionAssessment: React.FC<SessionAssessmentProps> = ({
         setIqraLevel(undefined);
         setIqraPageStart('');
         setIqraPageEnd('');
+        setIqraPagesAdded('');
 
         if (prevAssessment && prevAssessment.surah_end && prevAssessment.ayah_end) {
           const lastSurahObj = getSurahByNo(prevAssessment.surah_end);
@@ -362,7 +427,7 @@ export const SessionAssessment: React.FC<SessionAssessmentProps> = ({
       }
       console.log(`[PERF] Prepared new assessment form in ${(performance.now() - renderStart).toFixed(2)}ms`);
     });
-  }, [selectedStudentId, selectedSessionConfig, assessments, selectedStudent, getDraftKey]);
+  }, [selectedStudentId, selectedSessionConfig, assessments, selectedStudent, getDraftKey, workspace?.event?.event_id]);
 
   // Auto-save local draft when fields change (if not in existing assessment edit mode)
   useEffect(() => {
@@ -372,20 +437,24 @@ export const SessionAssessment: React.FC<SessionAssessmentProps> = ({
     const draftData = {
       attendance,
       assessmentMode,
-      nuroniyyahDars: (assessmentMode === 'NURONIYYAH' || assessmentMode === 'IQRA') ? nuroniyyahDars : '',
+      nuroniyyahDars: assessmentMode === 'NURONIYYAH' ? nuroniyyahDars : '',
+      iqraLevel: assessmentMode === 'IQRA' ? iqraLevel : undefined,
+      iqraPageStart: assessmentMode === 'IQRA' ? iqraPageStart : '',
+      iqraPageEnd: assessmentMode === 'IQRA' ? iqraPageEnd : '',
+      iqraPagesAdded: assessmentMode === 'IQRA' ? iqraPagesAdded : '',
       startSurah: assessmentMode === 'ZIYADAH' ? startSurah : undefined,
       startAyah: assessmentMode === 'ZIYADAH' ? startAyah : '',
       endSurah: assessmentMode === 'ZIYADAH' ? endSurah : undefined,
       endAyah: assessmentMode === 'ZIYADAH' ? endAyah : '',
-      linesAdded,
+      linesAdded: assessmentMode !== 'IQRA' ? linesAdded : '',
       notes
     };
     ApiService.saveDraftLocal(draftKey, draftData);
-  }, [attendance, assessmentMode, startSurah, startAyah, endSurah, endAyah, linesAdded, nuroniyyahDars, notes, selectedStudentId, selectedSessionConfig, existingAssessmentId, getDraftKey]);
+  }, [attendance, assessmentMode, startSurah, startAyah, endSurah, endAyah, linesAdded, nuroniyyahDars, iqraLevel, iqraPageStart, iqraPageEnd, iqraPagesAdded, notes, selectedStudentId, selectedSessionConfig, existingAssessmentId, getDraftKey]);
 
   // Student progress statistics calculation
   const studentStats = useMemo(() => {
-    if (!selectedStudentId) return { totalLines: 0, sessionCount: 0, latestSetoran: null };
+    if (!selectedStudentId) return { totalLines: 0, totalZiyadahLines: 0, totalNuroniyyahLines: 0, totalIqraPages: 0, sessionCount: 0, latestSetoran: null };
 
     const studentAssessments = assessments.filter(a =>
       !a.is_deleted &&
@@ -393,14 +462,29 @@ export const SessionAssessment: React.FC<SessionAssessmentProps> = ({
       a.attendance_status === 'PRESENT'
     );
 
-    const totalLines = studentAssessments
-      .reduce((sum, a) => sum + (a.lines_added || 0), 0);
+    let totalZiyadah = 0;
+    let totalNuroniyyah = 0;
+    let totalIqra = 0;
+
+    studentAssessments.forEach(a => {
+      const mode = a.assessment_mode || (a.iqra_level != null ? 'IQRA' : a.nuroniyyah_dars ? 'NURONIYYAH' : 'ZIYADAH');
+      if (mode === 'IQRA') {
+        totalIqra += Number(a.iqra_pages_added) || 0;
+      } else if (mode === 'NURONIYYAH') {
+        totalNuroniyyah += Number(a.lines_added) || 0;
+      } else {
+        totalZiyadah += Number(a.lines_added) || 0;
+      }
+    });
 
     const sorted = studentAssessments.slice().sort((a, b) => b.session_no - a.session_no);
     const latest = sorted[0] || null;
 
     return {
-      totalLines,
+      totalLines: totalZiyadah,
+      totalZiyadahLines: totalZiyadah,
+      totalNuroniyyahLines: totalNuroniyyah,
+      totalIqraPages: totalIqra,
       sessionCount: studentAssessments.length,
       latestSetoran: latest
     };
@@ -418,7 +502,7 @@ export const SessionAssessment: React.FC<SessionAssessmentProps> = ({
       return 'Pilih status kehadiran siswa terlebih dahulu.';
     }
 
-    // If final evaluation session, Ziyadah / Nuroniyyah fields are not required
+    // If final evaluation session, Ziyadah / Nuroniyyah / Iqra fields are not required
     if (isFinalEvaluationSession) {
       return null;
     }
@@ -449,12 +533,25 @@ export const SessionAssessment: React.FC<SessionAssessmentProps> = ({
         if (linesAdded === '' || Number(linesAdded) < 0) {
           return 'Jumlah penambahan baris setoran baru wajib diisi (minimal 0).';
         }
-      } else if (assessmentMode === 'NURONIYYAH' || assessmentMode === 'IQRA') {
+      } else if (assessmentMode === 'NURONIYYAH') {
         if (!nuroniyyahDars || !nuroniyyahDars.trim()) {
           return 'Ad-Dars Nuroniyyah (1–17) wajib dipilih atau diisi.';
         }
         if (linesAdded === '' || Number(linesAdded) < 0) {
           return 'Jumlah penambahan baris Nuroniyyah wajib diisi (minimal 0).';
+        }
+      } else if (assessmentMode === 'IQRA') {
+        if (!iqraLevel || Number(iqraLevel) < 1 || Number(iqraLevel) > 6) {
+          return 'Jilid Iqra\' (1–6) wajib dipilih.';
+        }
+        if (!iqraPageStart || Number(iqraPageStart) < 1) {
+          return 'Halaman awal Iqra\' harus angka positif.';
+        }
+        if (!iqraPageEnd || Number(iqraPageEnd) < 1) {
+          return 'Halaman akhir Iqra\' harus angka positif.';
+        }
+        if (iqraPagesAdded === '' || Number(iqraPagesAdded) < 0) {
+          return 'Jumlah penambahan halaman Iqra\' wajib diisi (minimal 0).';
         }
       }
     }
@@ -484,7 +581,8 @@ export const SessionAssessment: React.FC<SessionAssessmentProps> = ({
 
       const isPresent = attendance === 'PRESENT';
       const isZiyadah = !isFinalEvaluationSession && isPresent && assessmentMode === 'ZIYADAH';
-      const isNuroniyyah = !isFinalEvaluationSession && isPresent && (assessmentMode === 'NURONIYYAH' || assessmentMode === 'IQRA');
+      const isNuroniyyah = !isFinalEvaluationSession && isPresent && assessmentMode === 'NURONIYYAH';
+      const isIqra = !isFinalEvaluationSession && isPresent && assessmentMode === 'IQRA';
 
       const payload = {
         student_id: selectedStudentId,
@@ -492,13 +590,17 @@ export const SessionAssessment: React.FC<SessionAssessmentProps> = ({
         session_config_id: selectedSessionConfig?.session_config_id,
         session_no: selectedSessionConfig?.session_no,
         attendance: attendance,
-        assessment_mode: isFinalEvaluationSession ? undefined : (isPresent ? (assessmentMode === 'IQRA' ? 'NURONIYYAH' : assessmentMode) : undefined),
+        assessment_mode: isFinalEvaluationSession ? undefined : (isPresent ? assessmentMode : undefined),
         start_surah: isZiyadah ? Number(startSurah) : undefined,
         start_ayah: isZiyadah ? Number(startAyah) : undefined,
         end_surah: isZiyadah ? Number(endSurah) : undefined,
         end_ayah: isZiyadah ? Number(endAyah) : undefined,
-        lines_added: (isZiyadah || isNuroniyyah) && linesAdded !== '' ? Number(linesAdded) : 0,
+        lines_added: (isZiyadah || isNuroniyyah) && linesAdded !== '' ? Number(linesAdded) : undefined,
         nuroniyyah_dars: isNuroniyyah ? nuroniyyahDars : undefined,
+        iqra_level: isIqra ? Number(iqraLevel) : undefined,
+        iqra_page_start: isIqra ? Number(iqraPageStart) : undefined,
+        iqra_page_end: isIqra ? Number(iqraPageEnd) : undefined,
+        iqra_pages_added: isIqra ? Number(iqraPagesAdded) : undefined,
         notes: notes,
         teacher_id: teacherIdToUse
       };
@@ -617,6 +719,7 @@ export const SessionAssessment: React.FC<SessionAssessmentProps> = ({
       setIqraLevel(undefined);
       setIqraPageStart('');
       setIqraPageEnd('');
+      setIqraPagesAdded('');
       setNotes('');
     } catch (err: any) {
       setErrorMsg('Gagal menghapus penilaian: ' + (err.message || ''));
@@ -1159,11 +1262,11 @@ export const SessionAssessment: React.FC<SessionAssessmentProps> = ({
             <label className="block text-xs font-bold uppercase tracking-wider text-slate-600 mb-2">
               Mode Pembelajaran
             </label>
-            <div className="grid grid-cols-2 gap-2 max-w-xs">
+            <div className="grid grid-cols-3 gap-2 max-w-md">
               <button
                 type="button"
                 onClick={() => handleModeChange('ZIYADAH')}
-                className={`py-2.5 px-4 text-xs font-bold rounded transition border text-center ${
+                className={`py-2.5 px-3 text-xs font-bold rounded transition border text-center ${
                   assessmentMode === 'ZIYADAH'
                     ? 'bg-blue-600 text-white border-blue-600 shadow-sm'
                     : 'bg-slate-100 text-slate-700 border-slate-300 hover:bg-slate-200'
@@ -1174,24 +1277,41 @@ export const SessionAssessment: React.FC<SessionAssessmentProps> = ({
               <button
                 type="button"
                 onClick={() => handleModeChange('NURONIYYAH')}
-                className={`py-2.5 px-4 text-xs font-bold rounded transition border text-center ${
-                  assessmentMode === 'NURONIYYAH' || assessmentMode === 'IQRA'
+                className={`py-2.5 px-3 text-xs font-bold rounded transition border text-center ${
+                  assessmentMode === 'NURONIYYAH'
                     ? 'bg-blue-600 text-white border-blue-600 shadow-sm'
                     : 'bg-slate-100 text-slate-700 border-slate-300 hover:bg-slate-200'
                 }`}
               >
                 Nuroniyyah
               </button>
+              <button
+                type="button"
+                onClick={() => handleModeChange('IQRA')}
+                className={`py-2.5 px-3 text-xs font-bold rounded transition border text-center ${
+                  assessmentMode === 'IQRA'
+                    ? 'bg-blue-600 text-white border-blue-600 shadow-sm'
+                    : 'bg-slate-100 text-slate-700 border-slate-300 hover:bg-slate-200'
+                }`}
+              >
+                Iqra&apos;
+              </button>
             </div>
           </div>
         )}
 
-        {/* Setoran Hafalan / Pembelajaran Nuroniyyah Fields (ONLY for HADIR and NOT Final Evaluation) */}
+        {/* Setoran Hafalan / Pembelajaran Nuroniyyah / Iqra Fields (ONLY for HADIR and NOT Final Evaluation) */}
         {!isFinalEvaluationSession && attendance === 'PRESENT' && (
           <div className="space-y-5 pt-2 border-t border-slate-100 animate-in fade-in">
             <h4 className="font-bold text-xs uppercase text-slate-700 tracking-wider flex items-center space-x-1.5">
               <Layers className="w-4 h-4 text-blue-600" />
-              <span>{assessmentMode === 'ZIYADAH' ? 'Detail Setoran Hafalan Al-Qur\'an' : 'Detail Pembelajaran Nuroniyyah'}</span>
+              <span>
+                {assessmentMode === 'ZIYADAH'
+                  ? 'Detail Setoran Hafalan Al-Qur\'an'
+                  : assessmentMode === 'NURONIYYAH'
+                  ? 'Detail Pembelajaran Nuroniyyah'
+                  : 'Detail Pembelajaran Iqra\''}
+              </span>
             </h4>
             
             {/* ZIYADAH MODE */}
@@ -1267,7 +1387,7 @@ export const SessionAssessment: React.FC<SessionAssessmentProps> = ({
             )}
 
             {/* NURONIYYAH MODE */}
-            {(assessmentMode === 'NURONIYYAH' || assessmentMode === 'IQRA') && (
+            {assessmentMode === 'NURONIYYAH' && (
               <div className="space-y-4 p-4 bg-slate-50 border border-slate-200 rounded-lg">
                 {/* 17 Ad-Dars Selector */}
                 <div>
@@ -1317,6 +1437,83 @@ export const SessionAssessment: React.FC<SessionAssessmentProps> = ({
                       className="w-24 px-3 py-1.5 bg-white border border-blue-300 font-bold text-sm text-blue-900 text-center rounded focus:outline-none focus:ring-2 focus:ring-blue-500"
                     />
                     <span className="text-xs font-bold text-blue-900">Baris</span>
+                  </div>
+                </div>
+              </div>
+            )}
+
+            {/* IQRA MODE */}
+            {assessmentMode === 'IQRA' && (
+              <div className="space-y-4 p-4 bg-slate-50 border border-slate-200 rounded-lg">
+                {/* Iqra Jilid (1-6) Selector */}
+                <div>
+                  <label className="block text-[11px] font-semibold text-slate-600 mb-1.5">
+                    Jilid Iqra&apos; (1–6)
+                  </label>
+                  <div className="grid grid-cols-6 gap-2 max-w-sm">
+                    {[1, 2, 3, 4, 5, 6].map((lvl) => (
+                      <button
+                        type="button"
+                        key={lvl}
+                        onClick={() => setIqraLevel(lvl)}
+                        className={`py-2 px-2 text-xs font-bold rounded transition border text-center ${
+                          iqraLevel === lvl
+                            ? 'bg-blue-600 text-white border-blue-600 shadow-sm'
+                            : 'bg-white text-slate-700 border-slate-300 hover:bg-slate-100'
+                        }`}
+                      >
+                        Jilid {lvl}
+                      </button>
+                    ))}
+                  </div>
+                </div>
+
+                {/* Iqra Start & End Pages */}
+                <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
+                  <div>
+                    <label className="block text-[11px] font-semibold text-slate-600 mb-1">
+                      Halaman Awal
+                    </label>
+                    <input
+                      type="number"
+                      min={1}
+                      value={iqraPageStart}
+                      onChange={(e) => setIqraPageStart(e.target.value)}
+                      placeholder="mis: 1"
+                      className="w-full px-3 py-2 bg-white border border-slate-300 rounded text-xs font-semibold text-slate-900 focus:outline-none focus:ring-2 focus:ring-blue-500"
+                    />
+                  </div>
+                  <div>
+                    <label className="block text-[11px] font-semibold text-slate-600 mb-1">
+                      Halaman Akhir
+                    </label>
+                    <input
+                      type="number"
+                      min={1}
+                      value={iqraPageEnd}
+                      onChange={(e) => setIqraPageEnd(e.target.value)}
+                      placeholder="mis: 5"
+                      className="w-full px-3 py-2 bg-white border border-slate-300 rounded text-xs font-semibold text-slate-900 focus:outline-none focus:ring-2 focus:ring-blue-500"
+                    />
+                  </div>
+                </div>
+
+                {/* Total Pages Added for Iqra */}
+                <div className="flex flex-col sm:flex-row items-start sm:items-center justify-between p-4 bg-blue-50/60 border border-blue-200 rounded-lg gap-3">
+                  <div>
+                    <span className="text-xs font-bold text-blue-900 block">Penambahan Halaman Belajar Baru</span>
+                    <p className="text-[11px] text-blue-700">Jumlah halaman Iqra&apos; tuntas dipelajari pada sesi ini</p>
+                  </div>
+                  <div className="flex items-center space-x-2 shrink-0">
+                    <input
+                      type="number"
+                      min={0}
+                      value={iqraPagesAdded}
+                      onChange={(e) => setIqraPagesAdded(e.target.value)}
+                      placeholder="0"
+                      className="w-24 px-3 py-1.5 bg-white border border-blue-300 font-bold text-sm text-blue-900 text-center rounded focus:outline-none focus:ring-2 focus:ring-blue-500"
+                    />
+                    <span className="text-xs font-bold text-blue-900">Halaman</span>
                   </div>
                 </div>
               </div>

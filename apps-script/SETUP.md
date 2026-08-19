@@ -62,7 +62,7 @@ Follow these steps to deploy the real Google Spreadsheet backend for the Rumah T
 ## 4. Connect Frontend
 1. Open `.env` or set environment variables in your deployment platform (Vercel / Cloud Run):
    ```env
-   VITE_API_URL=https://script.google.com/macros/s/AKfycbzfLeDLKXwFMeaN-z0zyDmi7MdNX6WwK_l7bCfk5AwL_OF42-j5d1Mms5LE4p4B68Lb7Q/exec
+   VITE_API_URL=https://script.google.com/macros/s/AKfycbxtv8UjLBbu44AEC9fMLJLDfJpNnB6eg_VExDu2iWgKb4kqNGIwSN1TIQWfa9TU5Xu1WA/exec
    VITE_USE_MOCK_DATA=false
    ```
 2. Restart or rebuild the frontend application.

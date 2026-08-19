@@ -1,6 +1,6 @@
 import React from 'react';
 import { useTeacherWorkspace } from '../../context/TeacherWorkspaceContext';
-import { RefreshCw, CheckCircle2, AlertTriangle, Clock } from 'lucide-react';
+import { RefreshCw, CheckCircle2, AlertTriangle, Clock, WifiOff, CloudOff } from 'lucide-react';
 
 export const TeacherSyncBadge: React.FC = () => {
   const {
@@ -26,11 +26,14 @@ export const TeacherSyncBadge: React.FC = () => {
             ? 'bg-emerald-50 text-emerald-800 border border-emerald-200/80'
             : syncStatus === 'SYNCING'
             ? 'bg-blue-50 text-blue-800 border border-blue-200/80'
+            : syncStatus === 'OFFLINE'
+            ? 'bg-slate-100 text-slate-800 border border-slate-300'
             : 'bg-amber-50 text-amber-900 border border-amber-300'
         }`}
       >
         {syncStatus === 'SYNCED' && <CheckCircle2 className="w-3.5 h-3.5 text-emerald-600" />}
         {syncStatus === 'SYNCING' && <RefreshCw className="w-3.5 h-3.5 text-blue-600 animate-spin" />}
+        {syncStatus === 'OFFLINE' && <WifiOff className="w-3.5 h-3.5 text-slate-600" />}
         {(syncStatus === 'PENDING' || syncStatus === 'ERROR') && (
           <AlertTriangle className="w-3.5 h-3.5 text-amber-600" />
         )}
@@ -46,12 +49,16 @@ export const TeacherSyncBadge: React.FC = () => {
       )}
 
       {/* Retry Failed / Pending button */}
-      {pendingWrites.some(p => p.status === 'FAILED') && (
+      {(pendingWrites.length > 0 || syncStatus === 'OFFLINE' || syncStatus === 'ERROR') && (
         <button
-          onClick={() => retryPendingWrites()}
-          className="px-2.5 py-1 bg-amber-600 hover:bg-amber-700 text-white rounded text-[11px] font-bold shadow-sm transition"
+          onClick={() => {
+            retryPendingWrites();
+            refreshWorkspace();
+          }}
+          disabled={isRevalidating}
+          className="px-2.5 py-1 bg-amber-600 hover:bg-amber-700 text-white rounded text-[11px] font-bold shadow-sm transition disabled:opacity-50"
         >
-          Coba Lagi
+          {pendingWrites.length > 0 ? `Sinkronkan (${pendingWrites.length})` : 'Coba Hubungkan'}
         </button>
       )}
 

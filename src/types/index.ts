@@ -199,6 +199,7 @@ export interface SessionAssessment {
   iqra_level?: number;
   iqra_page_start?: number;
   iqra_page_end?: number;
+  iqra_pages_added?: number;
   session_note?: string;
   teacher_id: string;
   is_deleted: boolean;
@@ -327,6 +328,7 @@ export interface TeacherStudentSummary {
   totalLinesAdded: number;
   totalZiyadahLinesAdded?: number;
   totalNuroniyyahLinesAdded?: number;
+  totalIqraPagesAdded?: number;
   completionStatus: string;
   session_group_id?: string;
 }

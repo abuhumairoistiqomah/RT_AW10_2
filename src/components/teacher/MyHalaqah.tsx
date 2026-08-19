@@ -5,6 +5,7 @@ import { TeacherSyncBadge } from './TeacherSyncBadge';
 import { ApiService } from '../../services/api';
 import { formatSessionOptionLabel, sortSessionConfigs, isFinalEvaluationSession as checkIsFinalEvaluationSession } from '../../utils/sessionFormatter';
 import { formatSkillBadgeText, formatSplitProgressDisplay } from '../../utils/targetUtils';
+import { hasAssessmentContent } from '../../utils/assessmentResolver';
 import { SessionSummaryCard } from '../common/SessionSummaryCard';
 import { StudentSessionHistoryModal } from './StudentSessionHistoryModal';
 import {
@@ -29,13 +30,13 @@ export const MyHalaqah: React.FC<MyHalaqahProps> = ({ currentUser, onNavigateToA
     selectedTeacherId,
     setSelectedTeacherId,
     availableTeachers,
+    applyBulkAttendanceOptimistic,
     refreshWorkspace
   } = useTeacherWorkspace();
 
   const [selectedSessionId, setSelectedSessionId] = useState<string>('');
   const [selectedStudentIds, setSelectedStudentIds] = useState<string[]>([]);
   const [selectedStudentForHistory, setSelectedStudentForHistory] = useState<TeacherStudentSummary | null>(null);
-  const [isSavingBulk, setIsSavingBulk] = useState<boolean>(false);
   const [bulkFeedback, setBulkFeedback] = useState<{ type: 'success' | 'error'; message: string } | null>(null);
   const [eventDays, setEventDays] = useState<EventDay[]>(workspace?.eventDays || []);
 
@@ -92,13 +93,11 @@ export const MyHalaqah: React.FC<MyHalaqahProps> = ({ currentUser, onNavigateToA
 
     workspace.assessments.forEach(a => {
       if (!a.is_deleted && a.session_config_id === selectedSessionId) {
-        const hasQuran = a.surah_start != null && a.surah_start !== ('' as any) && a.lines_added != null && a.lines_added !== ('' as any);
-        const hasNuroniyyah = (a.assessment_mode === 'NURONIYYAH' || a.nuroniyyah_dars != null) && a.lines_added != null && a.lines_added !== ('' as any);
-        const hasIqra = a.iqra_level != null && a.iqra_level !== ('' as any) && a.iqra_page_start != null && a.iqra_page_start !== ('' as any);
+        const hasContent = hasAssessmentContent(a);
         map.set(a.student_id, {
           attendance_status: a.attendance_status,
           assessment_status: a.assessment_status,
-          hasProgress: hasQuran || hasNuroniyyah || hasIqra || (a.lines_added != null && Number(a.lines_added) > 0)
+          hasProgress: hasContent
         });
       }
     });
@@ -126,7 +125,7 @@ export const MyHalaqah: React.FC<MyHalaqahProps> = ({ currentUser, onNavigateToA
     );
   };
 
-  // Bulk Attendance Action Handler
+  // Bulk Attendance Action Handler (Optimistic & Silent)
   const handleBulkAttendance = async (status: 'PRESENT' | 'SICK' | 'PERMISSION' | 'ABSENT', targetStudentIds?: string[]) => {
     const studentIdsToSubmit = targetStudentIds || selectedStudentIds;
 
@@ -140,7 +139,6 @@ export const MyHalaqah: React.FC<MyHalaqahProps> = ({ currentUser, onNavigateToA
       return;
     }
 
-    setIsSavingBulk(true);
     setBulkFeedback(null);
 
     const statusLabels: Record<string, string> = {
@@ -150,30 +148,21 @@ export const MyHalaqah: React.FC<MyHalaqahProps> = ({ currentUser, onNavigateToA
       ABSENT: 'Alpa'
     };
 
-    try {
-      const res = await ApiService.bulkSaveSessionAttendance(
-        selectedSessionId,
-        studentIdsToSubmit,
-        status,
-        currentUser?.user_id
-      );
+    const count = studentIdsToSubmit.length;
+    const res = await applyBulkAttendanceOptimistic(selectedSessionId, studentIdsToSubmit, status);
 
-      await refreshWorkspace();
-      
+    if (res.success) {
       setBulkFeedback({
         type: 'success',
-        message: `Presensi [${statusLabels[status]}] untuk ${res.updatedCount || studentIdsToSubmit.length} siswa berhasil disimpan.`
+        message: `Presensi [${statusLabels[status]}] untuk ${count} siswa berhasil diterapkan.`
       });
-      
-      // Clear selection after successful bulk save
+      // Clear selection after applying bulk save
       setSelectedStudentIds([]);
-    } catch (err: any) {
+    } else {
       setBulkFeedback({
         type: 'error',
-        message: err.message || 'Gagal menyimpan presensi massal. Silakan coba lagi.'
+        message: res.error || 'Gagal menyimpan presensi massal. Silakan coba lagi.'
       });
-    } finally {
-      setIsSavingBulk(false);
     }
   };
 
@@ -457,11 +446,11 @@ export const MyHalaqah: React.FC<MyHalaqahProps> = ({ currentUser, onNavigateToA
               </span>
               <button
                 type="button"
-                disabled={isSavingBulk || students.length === 0 || !selectedSessionId}
+                disabled={students.length === 0 || !selectedSessionId}
                 onClick={handleAllPresentShortcut}
                 className="px-3 py-1.5 bg-slate-800 hover:bg-slate-900 active:bg-slate-950 disabled:opacity-50 disabled:cursor-not-allowed text-white font-bold text-xs rounded-lg shadow-2xs transition flex items-center space-x-1.5 shrink-0"
               >
-                {isSavingBulk ? <Loader2 className="w-3.5 h-3.5 animate-spin" /> : <CheckCircle2 className="w-3.5 h-3.5 text-emerald-400" />}
+                <CheckCircle2 className="w-3.5 h-3.5 text-emerald-400" />
                 <span>Semua Hadir</span>
               </button>
             </div>
@@ -489,17 +478,17 @@ export const MyHalaqah: React.FC<MyHalaqahProps> = ({ currentUser, onNavigateToA
               </span>
               <button
                 type="button"
-                disabled={isSavingBulk || selectedStudentIds.length === 0 || !selectedSessionId}
+                disabled={selectedStudentIds.length === 0 || !selectedSessionId}
                 onClick={() => handleBulkAttendance('PRESENT')}
                 className="min-h-[42px] sm:min-h-0 px-3 py-2 sm:py-1.5 bg-emerald-600 hover:bg-emerald-700 active:bg-emerald-800 disabled:opacity-50 disabled:cursor-not-allowed text-white font-bold text-xs rounded-lg shadow-xs transition flex items-center justify-center space-x-1.5"
               >
-                {isSavingBulk ? <Loader2 className="w-3.5 h-3.5 animate-spin" /> : <Check className="w-3.5 h-3.5" />}
+                <Check className="w-3.5 h-3.5" />
                 <span>Hadir ({selectedStudentIds.length})</span>
               </button>
 
               <button
                 type="button"
-                disabled={isSavingBulk || selectedStudentIds.length === 0 || !selectedSessionId}
+                disabled={selectedStudentIds.length === 0 || !selectedSessionId}
                 onClick={() => handleBulkAttendance('SICK')}
                 className="min-h-[42px] sm:min-h-0 px-3 py-2 sm:py-1.5 bg-amber-500 hover:bg-amber-600 active:bg-amber-700 disabled:opacity-50 disabled:cursor-not-allowed text-white font-bold text-xs rounded-lg shadow-xs transition flex items-center justify-center space-x-1.5"
               >
@@ -508,7 +497,7 @@ export const MyHalaqah: React.FC<MyHalaqahProps> = ({ currentUser, onNavigateToA
 
               <button
                 type="button"
-                disabled={isSavingBulk || selectedStudentIds.length === 0 || !selectedSessionId}
+                disabled={selectedStudentIds.length === 0 || !selectedSessionId}
                 onClick={() => handleBulkAttendance('PERMISSION')}
                 className="min-h-[42px] sm:min-h-0 px-3 py-2 sm:py-1.5 bg-blue-600 hover:bg-blue-700 active:bg-blue-800 disabled:opacity-50 disabled:cursor-not-allowed text-white font-bold text-xs rounded-lg shadow-xs transition flex items-center justify-center space-x-1.5"
               >
@@ -517,7 +506,7 @@ export const MyHalaqah: React.FC<MyHalaqahProps> = ({ currentUser, onNavigateToA
 
               <button
                 type="button"
-                disabled={isSavingBulk || selectedStudentIds.length === 0 || !selectedSessionId}
+                disabled={selectedStudentIds.length === 0 || !selectedSessionId}
                 onClick={() => handleBulkAttendance('ABSENT')}
                 className="min-h-[42px] sm:min-h-0 px-3 py-2 sm:py-1.5 bg-rose-600 hover:bg-rose-700 active:bg-rose-800 disabled:opacity-50 disabled:cursor-not-allowed text-white font-bold text-xs rounded-lg shadow-xs transition flex items-center justify-center space-x-1.5"
               >

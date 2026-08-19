@@ -18,14 +18,12 @@ import {
   X,
   Calendar,
   Clock,
-  BookOpen,
   CheckCircle2,
   AlertCircle,
   Award,
   Sparkles,
   HelpCircle,
   FileText,
-  User,
   GraduationCap
 } from 'lucide-react';
 
@@ -39,6 +37,47 @@ interface StudentSessionHistoryModalProps {
   onClose: () => void;
   onNavigateToAssessment?: (studentId: string, sessionNo?: number) => void;
   onNavigateToEvaluation?: (studentId: string, sessionConfigId?: string) => void;
+}
+
+type DisplayAssessmentMode = 'ZIYADAH' | 'NURONIYYAH' | 'IQRA';
+
+/**
+ * Explicit assessment_mode is authoritative.
+ * Legacy fields are only used when assessment_mode is empty.
+ */
+function resolveAssessmentModeForDisplay(
+  assessment?: SessionAssessment | null
+): DisplayAssessmentMode {
+  if (!assessment) return 'ZIYADAH';
+
+  const explicitMode = String(assessment.assessment_mode || '')
+    .trim()
+    .toUpperCase();
+
+  if (
+    explicitMode === 'ZIYADAH' ||
+    explicitMode === 'NURONIYYAH' ||
+    explicitMode === 'IQRA'
+  ) {
+    return explicitMode as DisplayAssessmentMode;
+  }
+
+  // Legacy fallback ONLY when assessment_mode is blank.
+  const hasIqra =
+    assessment.iqra_level != null ||
+    assessment.iqra_page_start != null ||
+    assessment.iqra_page_end != null ||
+    assessment.iqra_pages_added != null;
+
+  if (hasIqra) return 'IQRA';
+
+  const hasNuroniyyah =
+    assessment.nuroniyyah_dars != null &&
+    String(assessment.nuroniyyah_dars).trim() !== '';
+
+  if (hasNuroniyyah) return 'NURONIYYAH';
+
+  return 'ZIYADAH';
 }
 
 export const StudentSessionHistoryModal: React.FC<StudentSessionHistoryModalProps> = ({
@@ -74,14 +113,38 @@ export const StudentSessionHistoryModal: React.FC<StudentSessionHistoryModalProp
     );
   }, [finalEvaluations, student.student_id, student.participant_id]);
 
-  // Map each session config to the student's assessment
+  // Map each session config to the student's assessment.
+  // IMPORTANT: exact session_config_id wins.
+  // Legacy fallback by session_no is allowed ONLY if the assessment itself has no session_config_id.
   const sessionRows = useMemo(() => {
+    const studentAssessments = (assessments || []).filter(a => {
+      if (a.is_deleted) return false;
+
+      const sameStudent =
+        a.student_id === student.student_id ||
+        Boolean(
+          student.participant_id &&
+          a.participant_id === student.participant_id
+        );
+
+      return sameStudent;
+    });
+
     return studentSessionConfigs.map(sc => {
-      const asm = (assessments || []).find(
-        a => !a.is_deleted &&
-          a.student_id === student.student_id &&
-          (a.session_config_id === sc.session_config_id || Number(a.session_no) === Number(sc.session_no))
+      // 1. Exact session_config_id ALWAYS wins.
+      let asm = studentAssessments.find(
+        a => a.session_config_id === sc.session_config_id
       );
+
+      // 2. Legacy fallback by session_no ONLY when the assessment
+      //    itself has no session_config_id.
+      if (!asm) {
+        asm = studentAssessments.find(
+          a =>
+            (!a.session_config_id || String(a.session_config_id).trim() === '') &&
+            Number(a.session_no) === Number(sc.session_no)
+        );
+      }
 
       const isFinal = isFinalEvaluationSession(sc, studentSessionConfigs);
       const dayLabel = getSessionDayLabel(sc.event_day_id, eventDays);
@@ -95,7 +158,13 @@ export const StudentSessionHistoryModal: React.FC<StudentSessionHistoryModalProp
         timeRange
       };
     });
-  }, [studentSessionConfigs, assessments, student.student_id, eventDays]);
+  }, [
+    studentSessionConfigs,
+    assessments,
+    student.student_id,
+    student.participant_id,
+    eventDays
+  ]);
 
   // Summary Metrics calculation (Strict rules: based on assessment_mode, NOT on skill_status)
   const summaryMetrics = useMemo(() => {
@@ -106,6 +175,7 @@ export const StudentSessionHistoryModal: React.FC<StudentSessionHistoryModalProp
     let unassessedCount = 0;
     let totalHafalanLines = 0;
     let totalNuroniyyahLines = 0;
+    let totalIqraPages = 0;
 
     sessionRows.forEach(({ assessment }) => {
       if (!assessment || !assessment.attendance_status) {
@@ -114,22 +184,34 @@ export const StudentSessionHistoryModal: React.FC<StudentSessionHistoryModalProp
       }
 
       switch (assessment.attendance_status) {
-        case 'PRESENT':
+        case 'PRESENT': {
           presentCount++;
-          const lines = assessment.lines_added != null && !isNaN(Number(assessment.lines_added))
-            ? Number(assessment.lines_added)
-            : 0;
 
-          const isNuroniyyah = assessment.assessment_mode === 'NURONIYYAH' ||
-            Boolean(assessment.nuroniyyah_dars && !assessment.surah_start && !assessment.surah_end);
+          const lines =
+            assessment.lines_added != null &&
+            !isNaN(Number(assessment.lines_added))
+              ? Number(assessment.lines_added)
+              : 0;
 
-          if (isNuroniyyah) {
+          const iqraPages =
+            assessment.iqra_pages_added != null &&
+            !isNaN(Number(assessment.iqra_pages_added))
+              ? Number(assessment.iqra_pages_added)
+              : 0;
+
+          const mode = resolveAssessmentModeForDisplay(assessment);
+
+          if (mode === 'IQRA') {
+            totalIqraPages += iqraPages;
+          } else if (mode === 'NURONIYYAH') {
             totalNuroniyyahLines += lines;
           } else {
-            // Default is ZIYADAH / Hafalan Al-Qur'an
             totalHafalanLines += lines;
           }
+
           break;
+        }
+
         case 'SICK':
           sickCount++;
           break;
@@ -153,7 +235,8 @@ export const StudentSessionHistoryModal: React.FC<StudentSessionHistoryModalProp
       absentCount,
       unassessedCount,
       totalHafalanLines,
-      totalNuroniyyahLines
+      totalNuroniyyahLines,
+      totalIqraPages
     };
   }, [sessionRows]);
 
@@ -242,14 +325,66 @@ export const StudentSessionHistoryModal: React.FC<StudentSessionHistoryModalProp
     }
   };
 
-  // Format Qur'an / Nuroniyyah assessment progress detail
+  // Format Qur'an / Nuroniyyah / Iqra assessment progress detail
   const renderProgressDetail = (asm: SessionAssessment) => {
-    const isNuroniyyah = asm.assessment_mode === 'NURONIYYAH' ||
-      Boolean(asm.nuroniyyah_dars && !asm.surah_start && !asm.surah_end);
+    const mode = resolveAssessmentModeForDisplay(asm);
 
-    if (isNuroniyyah) {
+    if (mode === 'IQRA') {
+      const levelText = asm.iqra_level ? `Jilid ${asm.iqra_level}` : null;
+      const pages = asm.iqra_pages_added != null && !isNaN(Number(asm.iqra_pages_added))
+        ? Number(asm.iqra_pages_added)
+        : null;
+
+      let pageRange = '';
+      if (asm.iqra_page_start != null && asm.iqra_page_end != null) {
+        pageRange = asm.iqra_page_start === asm.iqra_page_end
+          ? `Hal ${asm.iqra_page_start}`
+          : `Hal ${asm.iqra_page_start}–${asm.iqra_page_end}`;
+      } else if (asm.iqra_page_end != null) {
+        pageRange = `Hal ${asm.iqra_page_end}`;
+      } else if (asm.iqra_page_start != null) {
+        pageRange = `Hal ${asm.iqra_page_start}`;
+      }
+
+      if (!levelText && pages == null) {
+        return (
+          <div className="text-xs text-slate-400 italic">
+            Belum ada rincian setoran
+          </div>
+        );
+      }
+
+      return (
+        <div className="space-y-1">
+          <div className="flex flex-wrap items-center gap-2">
+            <span className="px-2 py-0.5 bg-blue-50 text-blue-700 border border-blue-200 text-[11px] font-bold rounded">
+              Iqra&apos;
+            </span>
+            {levelText && (
+              <span className="font-bold text-slate-800 text-xs sm:text-sm">
+                {levelText} {pageRange ? `(${pageRange})` : ''}
+              </span>
+            )}
+          </div>
+
+          {pages != null ? (
+            <div className="text-xs font-bold text-blue-600">
+              +{pages} Halaman
+            </div>
+          ) : (
+            <div className="text-[11px] text-slate-400 italic">
+              Jumlah halaman belum diisi
+            </div>
+          )}
+        </div>
+      );
+    }
+
+    if (mode === 'NURONIYYAH') {
       const darsText = asm.nuroniyyah_dars ? asm.nuroniyyah_dars.trim() : null;
-      const lines = asm.lines_added != null && !isNaN(Number(asm.lines_added)) ? Number(asm.lines_added) : null;
+      const lines = asm.lines_added != null && !isNaN(Number(asm.lines_added))
+        ? Number(asm.lines_added)
+        : null;
 
       if (!darsText && lines == null) {
         return (
@@ -271,6 +406,7 @@ export const StudentSessionHistoryModal: React.FC<StudentSessionHistoryModalProp
               </span>
             )}
           </div>
+
           {lines != null ? (
             <div className="text-xs font-bold text-indigo-600">
               +{lines} Baris
@@ -287,7 +423,9 @@ export const StudentSessionHistoryModal: React.FC<StudentSessionHistoryModalProp
     // Mode Hafalan Al-Qur'an (ZIYADAH)
     const surahNo = asm.surah_end || asm.surah_start;
     const hasSurah = surahNo != null && !isNaN(Number(surahNo)) && Number(surahNo) > 0;
-    const lines = asm.lines_added != null && !isNaN(Number(asm.lines_added)) ? Number(asm.lines_added) : null;
+    const lines = asm.lines_added != null && !isNaN(Number(asm.lines_added))
+      ? Number(asm.lines_added)
+      : null;
 
     if (!hasSurah && lines == null) {
       return (
@@ -300,7 +438,9 @@ export const StudentSessionHistoryModal: React.FC<StudentSessionHistoryModalProp
     let surahName = '';
     if (hasSurah) {
       const sObj = getSurahByNo(Number(surahNo));
-      surahName = sObj ? `${sObj.surah_no}. ${sObj.surah_name}` : `Surah #${surahNo}`;
+      surahName = sObj
+        ? `${sObj.surah_no}. ${sObj.surah_name}`
+        : `Surah #${surahNo}`;
     }
 
     let ayahRange = '';
@@ -320,12 +460,14 @@ export const StudentSessionHistoryModal: React.FC<StudentSessionHistoryModalProp
           <span className="px-2 py-0.5 bg-emerald-50 text-emerald-700 border border-emerald-200 text-[11px] font-bold rounded">
             Hafalan Al-Qur'an
           </span>
+
           {surahName && (
             <span className="font-bold text-slate-800 text-xs sm:text-sm">
               {surahName} {ayahRange ? `: ${ayahRange}` : ''}
             </span>
           )}
         </div>
+
         {lines != null ? (
           <div className="text-xs font-bold text-emerald-600">
             +{lines} Baris
@@ -350,10 +492,8 @@ export const StudentSessionHistoryModal: React.FC<StudentSessionHistoryModalProp
       aria-labelledby="modal-history-title"
     >
       <div className="max-h-[85vh] sm:max-h-[90vh] flex flex-col bg-white rounded-2xl shadow-2xl border border-slate-200 w-full max-w-3xl overflow-hidden transition-all my-auto">
-        
-        {/* ============================================================ */}
+
         {/* MODAL HEADER (Sticky Top) */}
-        {/* ============================================================ */}
         <div className="sticky top-0 z-20 bg-slate-900 text-white px-4 sm:px-6 py-4 border-b border-slate-800 flex items-start justify-between gap-3 shrink-0">
           <div className="min-w-0 flex-1 space-y-1.5">
             <div className="flex items-center gap-2">
@@ -361,6 +501,7 @@ export const StudentSessionHistoryModal: React.FC<StudentSessionHistoryModalProp
                 <FileText className="w-3.5 h-3.5 text-blue-400" />
                 <span>Riwayat Sesi Siswa</span>
               </span>
+
               <span className="text-xs text-slate-400 font-mono">
                 NIS: {student.nis || '-'}
               </span>
@@ -370,7 +511,6 @@ export const StudentSessionHistoryModal: React.FC<StudentSessionHistoryModalProp
               {student.full_name}
             </h2>
 
-            {/* Student Metadata Info Badges */}
             <div className="flex flex-wrap items-center gap-x-3 gap-y-1.5 text-xs text-slate-300 pt-0.5">
               <div className="flex items-center gap-1">
                 <span className="text-slate-400">Kelas:</span>
@@ -395,7 +535,6 @@ export const StudentSessionHistoryModal: React.FC<StudentSessionHistoryModalProp
             </div>
           </div>
 
-          {/* Close Button */}
           <button
             type="button"
             onClick={onClose}
@@ -406,24 +545,22 @@ export const StudentSessionHistoryModal: React.FC<StudentSessionHistoryModalProp
           </button>
         </div>
 
-        {/* ============================================================ */}
-        {/* MODAL BODY (Internally Scrollable) */}
-        {/* ============================================================ */}
+        {/* MODAL BODY */}
         <div className="overflow-y-auto p-4 sm:p-6 space-y-5 flex-1 min-h-0 bg-slate-50/50">
 
-          {/* 1. TOP SUMMARY METRICS (Section 11) */}
+          {/* 1. TOP SUMMARY METRICS */}
           <div className="bg-white rounded-xl p-3.5 sm:p-4 border border-slate-200 shadow-2xs space-y-3">
             <div className="flex items-center justify-between">
               <h3 className="text-xs font-bold text-slate-700 uppercase tracking-wider flex items-center gap-1.5">
                 <Sparkles className="w-3.5 h-3.5 text-blue-600" />
                 <span>Ringkasan Kehadiran & Capaian</span>
               </h3>
+
               <span className="text-[11px] font-semibold text-slate-500">
                 Target: <strong>{student.targetText || '-'}</strong>
               </span>
             </div>
 
-            {/* Metrics Chips Grid */}
             <div className="grid grid-cols-2 sm:grid-cols-5 gap-2">
               <div className="bg-slate-50 p-2.5 rounded-lg border border-slate-100 text-center">
                 <div className="text-[10px] uppercase font-bold text-slate-400">Total Sesi</div>
@@ -451,8 +588,8 @@ export const StudentSessionHistoryModal: React.FC<StudentSessionHistoryModalProp
               </div>
             </div>
 
-            {/* Line Progress Totals (Strictly partitioned by mode) */}
-            <div className="pt-2 border-t border-slate-100 grid grid-cols-1 sm:grid-cols-2 gap-2 text-xs">
+            {/* Progress Totals: Ziyadah, Nuroniyyah, Iqra */}
+            <div className="pt-2 border-t border-slate-100 grid grid-cols-1 sm:grid-cols-3 gap-2 text-xs">
               <div className="flex items-center justify-between bg-emerald-50/50 px-3 py-2 rounded-lg border border-emerald-100">
                 <span className="font-semibold text-emerald-900">Total Baris Hafalan Al-Qur'an:</span>
                 <strong className="text-emerald-700 font-bold text-sm">
@@ -466,10 +603,17 @@ export const StudentSessionHistoryModal: React.FC<StudentSessionHistoryModalProp
                   +{summaryMetrics.totalNuroniyyahLines} Baris
                 </strong>
               </div>
+
+              <div className="flex items-center justify-between bg-blue-50/50 px-3 py-2 rounded-lg border border-blue-100">
+                <span className="font-semibold text-blue-900">Total Halaman Iqra&apos;:</span>
+                <strong className="text-blue-700 font-bold text-sm">
+                  +{summaryMetrics.totalIqraPages} Halaman
+                </strong>
+              </div>
             </div>
           </div>
 
-          {/* 2. SESSIONS TIMELINE / CARDS LIST (Sections 3, 4, 5, 6, 7, 8, 9, 10) */}
+          {/* 2. SESSIONS TIMELINE / CARDS LIST */}
           <div className="space-y-3">
             <div className="flex items-center justify-between">
               <h3 className="text-xs font-bold text-slate-700 uppercase tracking-wider flex items-center gap-1.5">
@@ -483,7 +627,7 @@ export const StudentSessionHistoryModal: React.FC<StudentSessionHistoryModalProp
                 <Calendar className="w-8 h-8 mx-auto text-slate-400" />
                 <p className="text-xs font-bold">Tidak ada sesi aktif yang ditemukan.</p>
                 <p className="text-[11px] text-slate-400">
-                  Belum ada konfigurasi sesi aktif untuk kelompok jadwal santri ini.
+                  Belum ada konfigurasi sesi aktif untuk kelompok jadwal siswa ini.
                 </p>
               </div>
             ) : (
@@ -500,17 +644,18 @@ export const StudentSessionHistoryModal: React.FC<StudentSessionHistoryModalProp
                         : 'border-slate-200 hover:border-slate-300'
                     }`}
                   >
-                    {/* Session Card Header */}
                     <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-2 border-b border-slate-100 pb-2.5">
                       <div className="flex items-center gap-2">
                         <span className="w-7 h-7 bg-slate-900 text-white rounded-lg flex items-center justify-center text-xs font-bold shrink-0">
                           {sessionConfig.session_no}
                         </span>
+
                         <div>
                           <div className="flex items-center gap-2">
                             <h4 className="text-xs sm:text-sm font-bold text-slate-900">
                               Sesi {sessionConfig.session_no}
                             </h4>
+
                             {isFinal && (
                               <span className="px-2 py-0.5 bg-purple-100 text-purple-800 border border-purple-200 text-[10px] font-bold rounded-md flex items-center gap-1">
                                 <Award className="w-3 h-3 text-purple-600" />
@@ -518,6 +663,7 @@ export const StudentSessionHistoryModal: React.FC<StudentSessionHistoryModalProp
                               </span>
                             )}
                           </div>
+
                           <div className="flex items-center gap-2 text-[11px] text-slate-500 font-medium mt-0.5">
                             <span>{dayLabel}</span>
                             {timeRange && (
@@ -533,7 +679,6 @@ export const StudentSessionHistoryModal: React.FC<StudentSessionHistoryModalProp
                         </div>
                       </div>
 
-                      {/* Attendance Badge & Quick Action */}
                       <div className="flex items-center gap-2 self-start sm:self-auto">
                         {renderAttendanceBadge(assessment?.attendance_status)}
 
@@ -552,7 +697,6 @@ export const StudentSessionHistoryModal: React.FC<StudentSessionHistoryModalProp
                       </div>
                     </div>
 
-                    {/* Progress Detail Section */}
                     {isPresent ? (
                       <div className="bg-slate-50/80 rounded-lg p-3 border border-slate-100">
                         {renderProgressDetail(assessment!)}
@@ -561,7 +705,7 @@ export const StudentSessionHistoryModal: React.FC<StudentSessionHistoryModalProp
                       <div className="text-xs text-slate-500 bg-slate-50/60 p-2.5 rounded-lg border border-slate-100 flex items-center gap-2">
                         <AlertCircle className="w-3.5 h-3.5 text-slate-400 shrink-0" />
                         <span>
-                          Siswa tidak hadir ({renderAttendanceBadge(assessment?.attendance_status)}). Tidak ada penambahan baris setoran.
+                          Siswa tidak hadir ({renderAttendanceBadge(assessment?.attendance_status)}). Tidak ada penambahan setoran.
                         </span>
                       </div>
                     ) : (
@@ -570,20 +714,19 @@ export const StudentSessionHistoryModal: React.FC<StudentSessionHistoryModalProp
                       </div>
                     )}
 
-                    {/* Session Note (if provided) */}
                     {assessment?.session_note && assessment.session_note.trim() !== '' && (
                       <div className="bg-amber-50/60 text-amber-900 border border-amber-200/70 p-2.5 rounded-lg text-xs space-y-1">
                         <div className="font-bold text-[10px] uppercase text-amber-800 flex items-center gap-1">
                           <FileText className="w-3 h-3" />
                           <span>Catatan Guru:</span>
                         </div>
+
                         <p className="text-slate-700 leading-relaxed pl-4">
                           {assessment.session_note}
                         </p>
                       </div>
                     )}
 
-                    {/* Final Evaluation Subsection (Only on the last active session) */}
                     {isFinal && (
                       <div className="mt-3 pt-3 border-t border-purple-200/80 bg-purple-50/40 -mx-4 -mb-4 p-4 rounded-b-xl space-y-2.5">
                         <div className="flex items-center justify-between">
@@ -591,6 +734,7 @@ export const StudentSessionHistoryModal: React.FC<StudentSessionHistoryModalProp
                             <GraduationCap className="w-4 h-4 text-purple-700" />
                             <span>Hasil Evaluasi Akhir</span>
                           </div>
+
                           {finalEval && (
                             <span className={`px-2 py-0.5 rounded text-[10px] font-bold border ${
                               finalEval.completion_status === 'COMPLETE'
@@ -610,8 +754,12 @@ export const StudentSessionHistoryModal: React.FC<StudentSessionHistoryModalProp
                                 {(() => {
                                   const sStart = getSurahByNo(finalEval.evaluation_surah_start);
                                   const sEnd = getSurahByNo(finalEval.evaluation_surah_end);
-                                  const startTxt = sStart ? `${sStart.surah_name} : ${finalEval.evaluation_ayah_start}` : `Surah #${finalEval.evaluation_surah_start}`;
-                                  const endTxt = sEnd ? `${sEnd.surah_name} : ${finalEval.evaluation_ayah_end}` : `Surah #${finalEval.evaluation_surah_end}`;
+                                  const startTxt = sStart
+                                    ? `${sStart.surah_name} : ${finalEval.evaluation_ayah_start}`
+                                    : `Surah #${finalEval.evaluation_surah_start}`;
+                                  const endTxt = sEnd
+                                    ? `${sEnd.surah_name} : ${finalEval.evaluation_ayah_end}`
+                                    : `Surah #${finalEval.evaluation_surah_end}`;
                                   return `${startTxt} s/d ${endTxt}`;
                                 })()}
                               </p>
@@ -625,6 +773,7 @@ export const StudentSessionHistoryModal: React.FC<StudentSessionHistoryModalProp
                                     Skor: {finalEval.final_score}
                                   </span>
                                 )}
+
                                 {finalEval.affective_rating && (
                                   <span className="font-semibold text-slate-700 bg-slate-100 px-2 py-0.5 rounded">
                                     Predikat: {finalEval.affective_rating}
@@ -645,8 +794,9 @@ export const StudentSessionHistoryModal: React.FC<StudentSessionHistoryModalProp
                         ) : (
                           <div className="flex items-center justify-between bg-white p-2.5 rounded-lg border border-purple-100 text-xs">
                             <span className="text-slate-500 italic">
-                              Form evaluasi akhir belum diisi untuk santri ini.
+                              Form evaluasi akhir belum diisi untuk siswa ini.
                             </span>
+
                             {onNavigateToEvaluation && (
                               <button
                                 type="button"
@@ -670,13 +820,12 @@ export const StudentSessionHistoryModal: React.FC<StudentSessionHistoryModalProp
           </div>
         </div>
 
-        {/* ============================================================ */}
         {/* MODAL FOOTER */}
-        {/* ============================================================ */}
         <div className="px-4 sm:px-6 py-3 bg-white border-t border-slate-200 flex items-center justify-between shrink-0">
           <div className="text-xs text-slate-500">
             Total Sesi: <strong>{sessionRows.length} Sesi</strong>
           </div>
+
           <button
             type="button"
             onClick={onClose}
@@ -685,7 +834,6 @@ export const StudentSessionHistoryModal: React.FC<StudentSessionHistoryModalProp
             Tutup
           </button>
         </div>
-
       </div>
     </div>
   );
