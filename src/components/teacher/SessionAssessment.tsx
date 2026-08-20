@@ -220,6 +220,24 @@ export const SessionAssessment: React.FC<SessionAssessmentProps> = ({
     }
   };
 
+  // Attendance and setoran are independent.
+  // Auto-suggested start fields do not count as setoran by themselves.
+  const hasSetoranInput = useCallback((): boolean => {
+    if (assessmentMode === 'ZIYADAH') {
+      // endAyah and/or linesAdded indicate the teacher is actually entering setoran.
+      // startSurah/startAyah/endSurah may be auto-suggested from previous progress.
+      return endAyah !== '' || linesAdded !== '';
+    }
+
+    if (assessmentMode === 'NURONIYYAH') {
+      // Ad-Dars can be auto-filled, so linesAdded is the actual trigger.
+      return linesAdded !== '';
+    }
+
+    // Iqra level/start page may be auto-suggested. End page or pages added means input started.
+    return iqraPageEnd !== '' || iqraPagesAdded !== '';
+  }, [assessmentMode, endAyah, linesAdded, iqraPageEnd, iqraPagesAdded]);
+
   // Populate Form when Student or Session Changes (Navigation)
   useEffect(() => {
     if (!selectedStudentId || !selectedSessionConfig) return;
@@ -456,10 +474,12 @@ export const SessionAssessment: React.FC<SessionAssessmentProps> = ({
   const studentStats = useMemo(() => {
     if (!selectedStudentId) return { totalLines: 0, totalZiyadahLines: 0, totalNuroniyyahLines: 0, totalIqraPages: 0, sessionCount: 0, latestSetoran: null };
 
+    // IMPORTANT: attendance-only PRESENT rows are not setoran/progress records.
     const studentAssessments = assessments.filter(a =>
       !a.is_deleted &&
       a.student_id === selectedStudentId &&
-      a.attendance_status === 'PRESENT'
+      a.attendance_status === 'PRESENT' &&
+      String(a.assessment_status || '').toUpperCase() === 'COMPLETED'
     );
 
     let totalZiyadah = 0;
@@ -507,7 +527,9 @@ export const SessionAssessment: React.FC<SessionAssessmentProps> = ({
       return null;
     }
 
-    if (attendance === 'PRESENT') {
+    // NEW RULE: PRESENT can be saved without setoran.
+    // Only validate detail fields when a complete setoran is going to be submitted.
+    if (attendance === 'PRESENT' && hasSetoranInput()) {
       if (assessmentMode === 'ZIYADAH') {
         if (!startSurah) {
           return 'Surah awal setoran wajib dipilih.';
@@ -580,9 +602,10 @@ export const SessionAssessment: React.FC<SessionAssessmentProps> = ({
       const teacherIdToUse = currentUser?.teacher_id || currentUser?.user_id || '';
 
       const isPresent = attendance === 'PRESENT';
-      const isZiyadah = !isFinalEvaluationSession && isPresent && assessmentMode === 'ZIYADAH';
-      const isNuroniyyah = !isFinalEvaluationSession && isPresent && assessmentMode === 'NURONIYYAH';
-      const isIqra = !isFinalEvaluationSession && isPresent && assessmentMode === 'IQRA';
+      const hasSetoran = !isFinalEvaluationSession && isPresent && hasSetoranInput();
+      const isZiyadah = hasSetoran && assessmentMode === 'ZIYADAH';
+      const isNuroniyyah = hasSetoran && assessmentMode === 'NURONIYYAH';
+      const isIqra = hasSetoran && assessmentMode === 'IQRA';
 
       const payload = {
         student_id: selectedStudentId,
@@ -590,7 +613,8 @@ export const SessionAssessment: React.FC<SessionAssessmentProps> = ({
         session_config_id: selectedSessionConfig?.session_config_id,
         session_no: selectedSessionConfig?.session_no,
         attendance: attendance,
-        assessment_mode: isFinalEvaluationSession ? undefined : (isPresent ? assessmentMode : undefined),
+        // PRESENT without a complete setoran intentionally sends no assessment mode/content.
+        assessment_mode: hasSetoran ? assessmentMode : undefined,
         start_surah: isZiyadah ? Number(startSurah) : undefined,
         start_ayah: isZiyadah ? Number(startAyah) : undefined,
         end_surah: isZiyadah ? Number(endSurah) : undefined,
@@ -617,6 +641,7 @@ export const SessionAssessment: React.FC<SessionAssessmentProps> = ({
 
       const studentName = selectedStudent?.full_name || 'siswa';
       const sessionNo = selectedSessionConfig?.session_no;
+      const savedKind = hasSetoran ? 'penilaian' : 'presensi';
 
       // Handle nextAction & set messages
       if (nextAction === 'NEXT_STUDENT') {
@@ -624,18 +649,22 @@ export const SessionAssessment: React.FC<SessionAssessmentProps> = ({
         if (currentIdx >= 0 && currentIdx < students.length - 1) {
           const nextStudent = students[currentIdx + 1];
           setSelectedStudentId(nextStudent.student_id);
-          setSuccessMsg(`✓ Data penilaian ${studentName} berhasil disimpan. Beralih ke: ${nextStudent.full_name}`);
+          setSuccessMsg(`✓ Data ${savedKind} ${studentName} berhasil disimpan. Beralih ke: ${nextStudent.full_name}`);
           setToast({
             type: 'success',
             message: '✓ Data berhasil disimpan.',
-            detail: `Penilaian sesi #${sessionNo} untuk ${studentName} tersimpan. Menampilkan formulir: ${nextStudent.full_name}`
+            detail: hasSetoran
+              ? `Penilaian sesi #${sessionNo} untuk ${studentName} tersimpan. Menampilkan formulir: ${nextStudent.full_name}`
+              : `Presensi sesi #${sessionNo} untuk ${studentName} tersimpan tanpa setoran. Menampilkan formulir: ${nextStudent.full_name}`
           });
         } else {
-          setSuccessMsg(`✓ Data penilaian sesi #${sessionNo} untuk ${studentName} berhasil disimpan! (Siswa terakhir dalam halaqah ini)`);
+          setSuccessMsg(`✓ Data ${savedKind} sesi #${sessionNo} untuk ${studentName} berhasil disimpan! (Siswa terakhir dalam halaqah ini)`);
           setToast({
             type: 'success',
             message: '✓ Data berhasil disimpan.',
-            detail: `Penilaian sesi #${sessionNo} untuk ${studentName} tersimpan (Semua siswa dalam halaqah telah diinput).`
+            detail: hasSetoran
+              ? `Penilaian sesi #${sessionNo} untuk ${studentName} tersimpan (Semua siswa dalam halaqah telah diinput).`
+              : `Presensi sesi #${sessionNo} untuk ${studentName} tersimpan tanpa setoran.`
           });
         }
       } else if (nextAction === 'NEXT_SESSION') {
@@ -643,26 +672,36 @@ export const SessionAssessment: React.FC<SessionAssessmentProps> = ({
         if (currentConfigIdx >= 0 && currentConfigIdx < availableSessionConfigs.length - 1) {
           const nextConfig = availableSessionConfigs[currentConfigIdx + 1];
           setSelectedSessionConfigId(nextConfig.session_config_id);
-          setSuccessMsg(`✓ Data penilaian ${studentName} berhasil disimpan. Beralih ke: Sesi #${nextConfig.session_no}`);
+          setSuccessMsg(`✓ Data ${savedKind} ${studentName} berhasil disimpan. Beralih ke: Sesi #${nextConfig.session_no}`);
           setToast({
             type: 'success',
             message: '✓ Data berhasil disimpan.',
-            detail: `Penilaian sesi #${sessionNo} untuk ${studentName} tersimpan. Menampilkan formulir Sesi #${nextConfig.session_no}.`
+            detail: hasSetoran
+              ? `Penilaian sesi #${sessionNo} untuk ${studentName} tersimpan. Menampilkan formulir Sesi #${nextConfig.session_no}.`
+              : `Presensi sesi #${sessionNo} untuk ${studentName} tersimpan tanpa setoran. Menampilkan formulir Sesi #${nextConfig.session_no}.`
           });
         } else {
-          setSuccessMsg(`✓ Data penilaian sesi #${sessionNo} untuk ${studentName} berhasil disimpan! (Sesi terakhir dalam kegiatan)`);
+          setSuccessMsg(`✓ Data ${savedKind} sesi #${sessionNo} untuk ${studentName} berhasil disimpan! (Sesi terakhir dalam kegiatan)`);
           setToast({
             type: 'success',
             message: '✓ Data berhasil disimpan.',
-            detail: `Penilaian sesi #${sessionNo} untuk ${studentName} berhasil disimpan.`
+            detail: hasSetoran
+              ? `Penilaian sesi #${sessionNo} untuk ${studentName} berhasil disimpan.`
+              : `Presensi sesi #${sessionNo} untuk ${studentName} berhasil disimpan tanpa setoran.`
           });
         }
       } else {
-        setSuccessMsg(`✓ Penilaian sesi #${sessionNo} untuk ${studentName} berhasil disimpan!`);
+        setSuccessMsg(
+          hasSetoran
+            ? `✓ Penilaian sesi #${sessionNo} untuk ${studentName} berhasil disimpan!`
+            : `✓ Presensi sesi #${sessionNo} untuk ${studentName} berhasil disimpan tanpa setoran.`
+        );
         setToast({
           type: 'success',
           message: '✓ Data berhasil disimpan.',
-          detail: `Penilaian sesi #${sessionNo} untuk ${studentName} berhasil disimpan dan disinkronkan.`
+          detail: hasSetoran
+            ? `Penilaian sesi #${sessionNo} untuk ${studentName} berhasil disimpan dan disinkronkan.`
+            : `Presensi sesi #${sessionNo} untuk ${studentName} berhasil disimpan. Setoran dapat diisi kemudian.`
         });
       }
 
@@ -1112,6 +1151,16 @@ export const SessionAssessment: React.FC<SessionAssessmentProps> = ({
               </button>
             ))}
           </div>
+
+          {!isFinalEvaluationSession && attendance === 'PRESENT' && (
+            <div className="mt-2.5 p-3 bg-sky-50 border border-sky-200 rounded-lg text-[11px] text-sky-800 flex items-start gap-2">
+              <CheckCircle2 className="w-4 h-4 text-sky-600 shrink-0 mt-0.5" />
+              <span>
+                <strong>Kehadiran dapat disimpan tanpa setoran.</strong> Jika siswa belum sempat mendapat giliran,
+                cukup pilih <strong>Hadir</strong> lalu simpan. Detail setoran dapat diisi kemudian.
+              </span>
+            </div>
+          )}
         </div>
 
         {/* SPECIAL VIEW: FINAL EVALUATION SESSION */}
@@ -1217,7 +1266,7 @@ export const SessionAssessment: React.FC<SessionAssessmentProps> = ({
                     rows={2}
                     value={notes}
                     onChange={(e) => setNotes(e.target.value)}
-                    placeholder="Catatan kehadiran santri pada sesi evaluasi akhir..."
+                    placeholder="Catatan kehadiran siswa pada sesi evaluasi akhir..."
                     className="w-full px-3 py-2 bg-white border border-purple-200 rounded-lg text-xs text-slate-900 focus:outline-none focus:ring-2 focus:ring-purple-500"
                   ></textarea>
                 </div>
@@ -1234,7 +1283,7 @@ export const SessionAssessment: React.FC<SessionAssessmentProps> = ({
                       Siswa tidak mengikuti sesi evaluasi akhir ({attendance === 'SICK' ? 'Sakit' : attendance === 'PERMISSION' ? 'Izin' : 'Alpa'}).
                     </h4>
                     <p className="text-[11px] text-slate-500 mt-0.5">
-                      Data evaluasi akhir tidak dibuat secara otomatis. Simpan presensi untuk mencatat ketidakhadiran santri pada sesi ini.
+                      Data evaluasi akhir tidak dibuat secara otomatis. Simpan presensi untuk mencatat ketidakhadiran siswa pada sesi ini.
                     </p>
                   </div>
                 </div>

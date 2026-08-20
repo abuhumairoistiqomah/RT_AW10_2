@@ -736,18 +736,65 @@ export class ApiService {
     const teacherId=(payload.teacher_id||'').trim();if(isMockMode&&!teacherId)throw new Error('ID Guru (teacher_id) wajib diisi.');
     const attendanceStatus:AttendanceStatus=payload.attendance_status||payload.attendance||'UNASSESSED';
     let surah_start:number|undefined,ayah_start:number|undefined,surah_end:number|undefined,ayah_end:number|undefined,lines_added:number|undefined,assessment_mode:AssessmentMode|undefined,nuroniyyah_dars:string|undefined,iqra_level:number|undefined,iqra_page_start:number|undefined,iqra_page_end:number|undefined,iqra_pages_added:number|undefined;
+
     if(attendanceStatus==='PRESENT'){
-      const mode:AssessmentMode=payload.assessment_mode||(payload.nuroniyyah_dars?'NURONIYYAH':(payload.iqra_level||payload.iqraLevel?'IQRA':'ZIYADAH'));assessment_mode=mode;const rawLines=payload.lines_added??payload.totalLines;
-      if(mode==='NURONIYYAH'){
-        const dars=payload.nuroniyyah_dars||(payload.iqra_level?`Ad-Dars ${payload.iqra_level}`:'');if(!dars)throw new Error('Untuk status HADIR pada mode Nuroniyyah, data Ad-Dars wajib dipilih.');if(rawLines==null||isNaN(Number(rawLines)))throw new Error('Untuk status HADIR, jumlah baris (lines_added) wajib diisi.');nuroniyyah_dars=String(dars);lines_added=Number(rawLines);
-      }else if(mode==='IQRA'){
-        const l=payload.iqra_level??payload.iqraLevel,ps=payload.iqra_page_start??payload.iqraPageStart,pe=payload.iqra_page_end??payload.iqraPageEnd,pa=payload.iqra_pages_added??payload.iqraPagesAdded??payload.totalPages??rawLines;
-        if(l==null||l==='')throw new Error('Untuk mode Iqra, Jilid wajib dipilih.');if(ps==null||ps==='')throw new Error('Untuk mode Iqra, Halaman Awal wajib diisi.');if(pe==null||pe==='')throw new Error('Untuk mode Iqra, Halaman Akhir wajib diisi.');if(pa==null||pa==='')throw new Error('Untuk mode Iqra, Penambahan Halaman wajib diisi.');
-        iqra_level=Number(l);iqra_page_start=Number(ps);iqra_page_end=Number(pe);iqra_pages_added=Number(pa);if(!Number.isFinite(iqra_level)||iqra_level<1||iqra_level>6)throw new Error('Jilid Iqra harus antara 1 sampai 6.');if(!Number.isFinite(iqra_page_start)||iqra_page_start<1)throw new Error('Halaman Awal Iqra tidak valid.');if(!Number.isFinite(iqra_page_end)||iqra_page_end<1)throw new Error('Halaman Akhir Iqra tidak valid.');if(!Number.isFinite(iqra_pages_added)||iqra_pages_added<0)throw new Error('Penambahan Halaman Iqra tidak valid.');lines_added=undefined;nuroniyyah_dars=undefined;assessment_mode='IQRA';
-      }else{
-        assessment_mode='ZIYADAH';const ss=payload.surah_start??payload.start_surah,as=payload.ayah_start??payload.start_ayah,se=payload.surah_end??payload.end_surah,ae=payload.ayah_end??payload.end_ayah;if(ss==null||as==null||se==null||ae==null)throw new Error('Untuk status HADIR pada mode Hafalan Al-Qur\'an, data Surah dan Ayat (awal & akhir) wajib diisi.');if(rawLines==null||isNaN(Number(rawLines)))throw new Error('Untuk status HADIR, jumlah baris (lines_added) wajib diisi.');surah_start=Number(ss);ayah_start=Number(as);surah_end=Number(se);ayah_end=Number(ae);lines_added=Number(rawLines);
+      const explicitMode=String(payload.assessment_mode||'').trim().toUpperCase() as AssessmentMode|'';
+      const rawLines=payload.lines_added??payload.totalLines;
+      const ss=payload.surah_start??payload.start_surah;
+      const as=payload.ayah_start??payload.start_ayah;
+      const se=payload.surah_end??payload.end_surah;
+      const ae=payload.ayah_end??payload.end_ayah;
+      const dars=payload.nuroniyyah_dars;
+      const l=payload.iqra_level??payload.iqraLevel;
+      const ps=payload.iqra_page_start??payload.iqraPageStart;
+      const pe=payload.iqra_page_end??payload.iqraPageEnd;
+      const pa=payload.iqra_pages_added??payload.iqraPagesAdded??payload.totalPages;
+
+      // Attendance may be stored without setoran.
+      // Auto-suggested start fields do not count as a setoran by themselves.
+      const hasZiyadahInput=(rawLines!=null&&rawLines!=='')||(ae!=null&&ae!=='');
+      const hasNuroniyyahInput=rawLines!=null&&rawLines!=='';
+      const hasIqraInput=(pe!=null&&pe!=='')||(pa!=null&&pa!=='');
+
+      let hasSetoranInput=false;
+      if(explicitMode==='NURONIYYAH')hasSetoranInput=hasNuroniyyahInput;
+      else if(explicitMode==='IQRA')hasSetoranInput=hasIqraInput;
+      else if(explicitMode==='ZIYADAH')hasSetoranInput=hasZiyadahInput;
+      else hasSetoranInput=hasIqraInput||hasNuroniyyahInput||hasZiyadahInput;
+
+      if(hasSetoranInput){
+        const mode:AssessmentMode=explicitMode==='NURONIYYAH'||explicitMode==='IQRA'||explicitMode==='ZIYADAH'
+          ? explicitMode
+          : (dars?'NURONIYYAH':((l!=null&&l!=='')||(ps!=null&&ps!=='')||(pe!=null&&pe!==''))?'IQRA':'ZIYADAH');
+        assessment_mode=mode;
+
+        if(mode==='NURONIYYAH'){
+          if(!dars||!String(dars).trim())throw new Error('Untuk status HADIR pada mode Nuroniyyah, data Ad-Dars wajib dipilih.');
+          if(rawLines==null||rawLines===''||isNaN(Number(rawLines)))throw new Error('Untuk status HADIR, jumlah baris (lines_added) wajib diisi.');
+          nuroniyyah_dars=String(dars);lines_added=Number(rawLines);
+          if(!Number.isFinite(lines_added)||lines_added<0)throw new Error('Jumlah baris Nuroniyyah harus berupa angka 0 atau lebih.');
+        }else if(mode==='IQRA'){
+          if(l==null||l==='')throw new Error('Untuk mode Iqra, Jilid wajib dipilih.');
+          if(ps==null||ps==='')throw new Error('Untuk mode Iqra, Halaman Awal wajib diisi.');
+          if(pe==null||pe==='')throw new Error('Untuk mode Iqra, Halaman Akhir wajib diisi.');
+          if(pa==null||pa==='')throw new Error('Untuk mode Iqra, Penambahan Halaman wajib diisi.');
+          iqra_level=Number(l);iqra_page_start=Number(ps);iqra_page_end=Number(pe);iqra_pages_added=Number(pa);
+          if(!Number.isFinite(iqra_level)||iqra_level<1||iqra_level>6)throw new Error('Jilid Iqra harus antara 1 sampai 6.');
+          if(!Number.isFinite(iqra_page_start)||iqra_page_start<1)throw new Error('Halaman Awal Iqra tidak valid.');
+          if(!Number.isFinite(iqra_page_end)||iqra_page_end<1)throw new Error('Halaman Akhir Iqra tidak valid.');
+          if(!Number.isFinite(iqra_pages_added)||iqra_pages_added<0)throw new Error('Penambahan Halaman Iqra tidak valid.');
+          lines_added=undefined;nuroniyyah_dars=undefined;
+        }else{
+          if(ss==null||ss===''||as==null||as===''||se==null||se===''||ae==null||ae==='')throw new Error('Untuk status HADIR pada mode Hafalan Al-Qur\'an, data Surah dan Ayat (awal & akhir) wajib diisi.');
+          if(rawLines==null||rawLines===''||isNaN(Number(rawLines)))throw new Error('Untuk status HADIR, jumlah baris (lines_added) wajib diisi.');
+          surah_start=Number(ss);ayah_start=Number(as);surah_end=Number(se);ayah_end=Number(ae);lines_added=Number(rawLines);
+          if(!Number.isFinite(surah_start)||!Number.isFinite(ayah_start)||!Number.isFinite(surah_end)||!Number.isFinite(ayah_end)||!Number.isFinite(lines_added)||lines_added<0)throw new Error('Data Hafalan Al-Qur\'an mengandung angka yang tidak valid.');
+        }
       }
+      // No setoran input: assessment_mode and all progress fields stay undefined.
+      // Backend will save PRESENT + PENDING attendance only.
     }
+
     const asm={assessment_id:`ASM-${Date.now()}-${Math.random().toString(36).substring(2,6)}`,event_id,event_day_id:matching.event_day_id,session_config_id:matching.session_config_id,participant_id:participant.participant_id,student_id:participant.student_id,halaqah_id:participant.halaqah_id,session_no:matching.session_no,attendance_status:attendanceStatus,assessment_mode,nuroniyyah_dars,iqra_level,iqra_page_start,iqra_page_end,iqra_pages_added,surah_start,ayah_start,surah_end,ayah_end,lines_added,session_note:payload.notes||payload.session_note||'',teacher_id:teacherId,is_deleted:false,created_at:getCurrentIso(),updated_at:getCurrentIso()} as any as SessionAssessment;
     return this.saveSessionAssessment(asm,actorUserId||teacherId);
   }

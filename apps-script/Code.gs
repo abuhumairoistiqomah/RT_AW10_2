@@ -1659,6 +1659,11 @@ function summarizeAssessmentsByModeGS(
       return;
     }
 
+    // PRESENT without setoran is attendance-only, not zero progress.
+    if (!hasAssessmentContentGS(a)) {
+      return;
+    }
+
     var mode =
       normalizeAssessmentModeGS(a);
 
@@ -2126,7 +2131,7 @@ function handleHealth() {
       status: 'ok',
       spreadsheetConnected: Boolean(ss),
       backendVersion:
-        'RT-GS-3MODE-CANONICAL-2026-08-20-01'
+        'RT-GS-3MODE-CANONICAL-2026-08-20-02-ATTENDANCE-ONLY'
     });
   } catch (e) {
     return jsonError(
@@ -6083,296 +6088,307 @@ function handleSaveSessionAssessment(
     attendance;
 
   if (attendance === 'PRESENT') {
-    var requestedRawMode =
-      upperGS(
-        assessment.assessment_mode ||
-        defaultAssessmentModeForParticipantGS(
-          participant
-        ) ||
-        ASSESSMENT_MODES.ZIYADAH
-      );
-
-    if (
-      [
-        ASSESSMENT_MODES.ZIYADAH,
-        ASSESSMENT_MODES.NURONIYYAH,
-        ASSESSMENT_MODES.IQRA
-      ].indexOf(
-        requestedRawMode
-      ) === -1
-    ) {
-      return jsonError(
-        'VALIDATION_ERROR',
-        'Mode penilaian "' +
-          requestedRawMode +
-          '" tidak valid.'
-      );
-    }
-
-    if (
-      requestedRawMode ===
-      ASSESSMENT_MODES.NURONIYYAH
-    ) {
-      if (
-        !cleanStringGS(
-          assessment.nuroniyyah_dars
-        ) ||
-        !hasValueGS(
-          assessment.lines_added
-        )
-      ) {
-        return jsonError(
-          'VALIDATION_ERROR',
-          'Pada mode Nuroniyyah, Ad-Dars dan jumlah penambahan baris wajib diisi.'
-        );
-      }
-
-      var nuroniyyahLines =
-        Number(
-          assessment.lines_added
-        );
-
-      if (
-        !isFinite(
-          nuroniyyahLines
-        ) ||
-        isNaN(
-          nuroniyyahLines
-        ) ||
-        nuroniyyahLines < 0
-      ) {
-        return jsonError(
-          'VALIDATION_ERROR',
-          'Jumlah baris Nuroniyyah harus berupa angka 0 atau lebih.'
-        );
-      }
-
-      assessment.assessment_mode =
-        ASSESSMENT_MODES.NURONIYYAH;
-
-      assessment.nuroniyyah_dars =
-        cleanStringGS(
-          assessment.nuroniyyah_dars
-        );
-
-      assessment.lines_added =
-        nuroniyyahLines;
-
-      clearQuranProgressFieldsGS(
-        assessment
-      );
-
-      clearIqraFieldsGS(
-        assessment
-      );
-
-      assessment.assessment_status =
-        'COMPLETED';
-    } else if (
-      requestedRawMode ===
-      ASSESSMENT_MODES.IQRA
-    ) {
-      if (
-        !hasValueGS(
-          assessment.iqra_level
-        ) ||
-        !hasValueGS(
-          assessment.iqra_page_start
-        ) ||
-        !hasValueGS(
-          assessment.iqra_page_end
-        ) ||
-        !hasValueGS(
-          assessment.iqra_pages_added
-        )
-      ) {
-        return jsonError(
-          'VALIDATION_ERROR',
-          'Pada mode Iqra\', Jilid, Halaman Awal, Halaman Akhir, dan Penambahan Halaman wajib diisi.'
-        );
-      }
-
-      var iqraLevel =
-        Number(
-          assessment.iqra_level
-        );
-
-      var iqraPageStart =
-        Number(
-          assessment.iqra_page_start
-        );
-
-      var iqraPageEnd =
-        Number(
-          assessment.iqra_page_end
-        );
-
-      var iqraPagesAdded =
-        Number(
-          assessment.iqra_pages_added
-        );
-
-      if (
-        !isFinite(iqraLevel) ||
-        isNaN(iqraLevel) ||
-        iqraLevel < 1 ||
-        iqraLevel > 6
-      ) {
-        return jsonError(
-          'VALIDATION_ERROR',
-          'Jilid Iqra\' harus antara 1 sampai 6.'
-        );
-      }
-
-      if (
-        !isFinite(
-          iqraPageStart
-        ) ||
-        isNaN(
-          iqraPageStart
-        ) ||
-        iqraPageStart < 1
-      ) {
-        return jsonError(
-          'VALIDATION_ERROR',
-          'Halaman awal Iqra\' harus berupa angka positif.'
-        );
-      }
-
-      if (
-        !isFinite(
-          iqraPageEnd
-        ) ||
-        isNaN(
-          iqraPageEnd
-        ) ||
-        iqraPageEnd < 1
-      ) {
-        return jsonError(
-          'VALIDATION_ERROR',
-          'Halaman akhir Iqra\' harus berupa angka positif.'
-        );
-      }
-
-      if (
-        !isFinite(
-          iqraPagesAdded
-        ) ||
-        isNaN(
-          iqraPagesAdded
-        ) ||
-        iqraPagesAdded < 0
-      ) {
-        return jsonError(
-          'VALIDATION_ERROR',
-          'Penambahan halaman Iqra\' harus berupa angka 0 atau lebih.'
-        );
-      }
-
-      assessment.assessment_mode =
-        ASSESSMENT_MODES.IQRA;
-
-      assessment.iqra_level =
-        iqraLevel;
-
-      assessment.iqra_page_start =
-        iqraPageStart;
-
-      assessment.iqra_page_end =
-        iqraPageEnd;
-
-      assessment.iqra_pages_added =
-        iqraPagesAdded;
-
-      clearQuranProgressFieldsGS(
-        assessment
-      );
-
-      clearNuroniyyahProgressFieldsGS(
-        assessment
-      );
-
-      assessment.lines_added = '';
-
-      assessment.assessment_status =
-        'COMPLETED';
+    /**
+     * Attendance and setoran are independent.
+     * A student may be PRESENT even when there was no opportunity to submit
+     * Ziyadah / Nuroniyyah / Iqra in this session.
+     */
+    if (!hasAssessmentContentGS(assessment)) {
+      assessment.assessment_mode = '';
+      assessment.assessment_status = 'PENDING';
+      clearAllProgressFieldsGS(assessment);
     } else {
+      var requestedRawMode =
+        upperGS(
+          assessment.assessment_mode ||
+          defaultAssessmentModeForParticipantGS(
+            participant
+          ) ||
+          ASSESSMENT_MODES.ZIYADAH
+        );
+
       if (
-        !hasValueGS(
-          assessment.surah_start
-        ) ||
-        !hasValueGS(
-          assessment.ayah_start
-        ) ||
-        !hasValueGS(
-          assessment.surah_end
-        ) ||
-        !hasValueGS(
-          assessment.ayah_end
-        ) ||
-        !hasValueGS(
-          assessment.lines_added
-        )
+        [
+          ASSESSMENT_MODES.ZIYADAH,
+          ASSESSMENT_MODES.NURONIYYAH,
+          ASSESSMENT_MODES.IQRA
+        ].indexOf(
+          requestedRawMode
+        ) === -1
       ) {
         return jsonError(
           'VALIDATION_ERROR',
-          'Pada mode Hafalan Al-Qur\'an, surah/ayat awal & akhir serta jumlah baris wajib diisi.'
+          'Mode penilaian "' +
+            requestedRawMode +
+            '" tidak valid.'
         );
       }
 
-      var quranFields = [
-        'surah_start',
-        'ayah_start',
-        'surah_end',
-        'ayah_end',
-        'lines_added'
-      ];
-
-      for (
-        var i = 0;
-        i < quranFields.length;
-        i++
+      if (
+        requestedRawMode ===
+        ASSESSMENT_MODES.NURONIYYAH
       ) {
-        var numberValue =
+        if (
+          !cleanStringGS(
+            assessment.nuroniyyah_dars
+          ) ||
+          !hasValueGS(
+            assessment.lines_added
+          )
+        ) {
+          return jsonError(
+            'VALIDATION_ERROR',
+            'Pada mode Nuroniyyah, Ad-Dars dan jumlah penambahan baris wajib diisi.'
+          );
+        }
+
+        var nuroniyyahLines =
           Number(
-            assessment[
-              quranFields[i]
-            ]
+            assessment.lines_added
           );
 
         if (
           !isFinite(
-            numberValue
+            nuroniyyahLines
           ) ||
           isNaN(
-            numberValue
+            nuroniyyahLines
           ) ||
-          numberValue < 0
+          nuroniyyahLines < 0
         ) {
           return jsonError(
             'VALIDATION_ERROR',
-            'Data Hafalan Al-Qur\'an mengandung angka yang tidak valid.'
+            'Jumlah baris Nuroniyyah harus berupa angka 0 atau lebih.'
           );
         }
 
-        assessment[
-          quranFields[i]
-        ] = numberValue;
+        assessment.assessment_mode =
+          ASSESSMENT_MODES.NURONIYYAH;
+
+        assessment.nuroniyyah_dars =
+          cleanStringGS(
+            assessment.nuroniyyah_dars
+          );
+
+        assessment.lines_added =
+          nuroniyyahLines;
+
+        clearQuranProgressFieldsGS(
+          assessment
+        );
+
+        clearIqraFieldsGS(
+          assessment
+        );
+
+        assessment.assessment_status =
+          'COMPLETED';
+      } else if (
+        requestedRawMode ===
+        ASSESSMENT_MODES.IQRA
+      ) {
+        if (
+          !hasValueGS(
+            assessment.iqra_level
+          ) ||
+          !hasValueGS(
+            assessment.iqra_page_start
+          ) ||
+          !hasValueGS(
+            assessment.iqra_page_end
+          ) ||
+          !hasValueGS(
+            assessment.iqra_pages_added
+          )
+        ) {
+          return jsonError(
+            'VALIDATION_ERROR',
+            'Pada mode Iqra\', Jilid, Halaman Awal, Halaman Akhir, dan Penambahan Halaman wajib diisi.'
+          );
+        }
+
+        var iqraLevel =
+          Number(
+            assessment.iqra_level
+          );
+
+        var iqraPageStart =
+          Number(
+            assessment.iqra_page_start
+          );
+
+        var iqraPageEnd =
+          Number(
+            assessment.iqra_page_end
+          );
+
+        var iqraPagesAdded =
+          Number(
+            assessment.iqra_pages_added
+          );
+
+        if (
+          !isFinite(iqraLevel) ||
+          isNaN(iqraLevel) ||
+          iqraLevel < 1 ||
+          iqraLevel > 6
+        ) {
+          return jsonError(
+            'VALIDATION_ERROR',
+            'Jilid Iqra\' harus antara 1 sampai 6.'
+          );
+        }
+
+        if (
+          !isFinite(
+            iqraPageStart
+          ) ||
+          isNaN(
+            iqraPageStart
+          ) ||
+          iqraPageStart < 1
+        ) {
+          return jsonError(
+            'VALIDATION_ERROR',
+            'Halaman awal Iqra\' harus berupa angka positif.'
+          );
+        }
+
+        if (
+          !isFinite(
+            iqraPageEnd
+          ) ||
+          isNaN(
+            iqraPageEnd
+          ) ||
+          iqraPageEnd < 1
+        ) {
+          return jsonError(
+            'VALIDATION_ERROR',
+            'Halaman akhir Iqra\' harus berupa angka positif.'
+          );
+        }
+
+        if (
+          !isFinite(
+            iqraPagesAdded
+          ) ||
+          isNaN(
+            iqraPagesAdded
+          ) ||
+          iqraPagesAdded < 0
+        ) {
+          return jsonError(
+            'VALIDATION_ERROR',
+            'Penambahan halaman Iqra\' harus berupa angka 0 atau lebih.'
+          );
+        }
+
+        assessment.assessment_mode =
+          ASSESSMENT_MODES.IQRA;
+
+        assessment.iqra_level =
+          iqraLevel;
+
+        assessment.iqra_page_start =
+          iqraPageStart;
+
+        assessment.iqra_page_end =
+          iqraPageEnd;
+
+        assessment.iqra_pages_added =
+          iqraPagesAdded;
+
+        clearQuranProgressFieldsGS(
+          assessment
+        );
+
+        clearNuroniyyahProgressFieldsGS(
+          assessment
+        );
+
+        assessment.lines_added = '';
+
+        assessment.assessment_status =
+          'COMPLETED';
+      } else {
+        if (
+          !hasValueGS(
+            assessment.surah_start
+          ) ||
+          !hasValueGS(
+            assessment.ayah_start
+          ) ||
+          !hasValueGS(
+            assessment.surah_end
+          ) ||
+          !hasValueGS(
+            assessment.ayah_end
+          ) ||
+          !hasValueGS(
+            assessment.lines_added
+          )
+        ) {
+          return jsonError(
+            'VALIDATION_ERROR',
+            'Pada mode Hafalan Al-Qur\'an, surah/ayat awal & akhir serta jumlah baris wajib diisi.'
+          );
+        }
+
+        var quranFields = [
+          'surah_start',
+          'ayah_start',
+          'surah_end',
+          'ayah_end',
+          'lines_added'
+        ];
+
+        for (
+          var i = 0;
+          i < quranFields.length;
+          i++
+        ) {
+          var numberValue =
+            Number(
+              assessment[
+                quranFields[i]
+              ]
+            );
+
+          if (
+            !isFinite(
+              numberValue
+            ) ||
+            isNaN(
+              numberValue
+            ) ||
+            numberValue < 0
+          ) {
+            return jsonError(
+              'VALIDATION_ERROR',
+              'Data Hafalan Al-Qur\'an mengandung angka yang tidak valid.'
+            );
+          }
+
+          assessment[
+            quranFields[i]
+          ] = numberValue;
+        }
+
+        assessment.assessment_mode =
+          ASSESSMENT_MODES.ZIYADAH;
+
+        clearNuroniyyahProgressFieldsGS(
+          assessment
+        );
+
+        clearIqraFieldsGS(
+          assessment
+        );
+
+        assessment.assessment_status =
+          'COMPLETED';
       }
-
-      assessment.assessment_mode =
-        ASSESSMENT_MODES.ZIYADAH;
-
-      clearNuroniyyahProgressFieldsGS(
-        assessment
-      );
-
-      clearIqraFieldsGS(
-        assessment
-      );
-
-      assessment.assessment_status =
-        'COMPLETED';
     }
   } else if (
     attendance === 'UNASSESSED'
