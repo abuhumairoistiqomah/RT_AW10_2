@@ -254,19 +254,19 @@ export const StudentSessionHistoryModal: React.FC<StudentSessionHistoryModalProp
       case 'BBL':
         return (
           <span className="inline-flex items-center px-2 py-0.5 rounded-md text-[11px] font-bold bg-emerald-50 text-emerald-700 border border-emerald-200">
-            BBL (Bisa Baca Al-Qur'an)
+            BBL 
           </span>
         );
       case 'NON_BBL':
         return (
           <span className="inline-flex items-center px-2 py-0.5 rounded-md text-[11px] font-bold bg-amber-50 text-amber-800 border border-amber-200">
-            NON-BBL (Nuroniyyah)
+            NON-BBL (Nuroniyyah / Iqra)
           </span>
         );
       case 'BBLS':
         return (
           <span className="inline-flex items-center px-2 py-0.5 rounded-md text-[11px] font-bold bg-blue-50 text-blue-700 border border-blue-200">
-            BBLS (Bersyarat)
+            BBLS 
           </span>
         );
       case 'TAHSIN':
