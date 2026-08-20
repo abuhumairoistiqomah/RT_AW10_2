@@ -3,15 +3,29 @@ import { User, AttendanceStatus, EventDay, TeacherStudentSummary } from '../../t
 import { useTeacherWorkspace } from '../../context/TeacherWorkspaceContext';
 import { TeacherSyncBadge } from './TeacherSyncBadge';
 import { ApiService } from '../../services/api';
-import { formatSessionOptionLabel, sortSessionConfigs, isFinalEvaluationSession as checkIsFinalEvaluationSession } from '../../utils/sessionFormatter';
+import {
+  formatSessionOptionLabel,
+  sortSessionConfigs,
+  isFinalEvaluationSession as checkIsFinalEvaluationSession
+} from '../../utils/sessionFormatter';
 import { formatSkillBadgeText, formatSplitProgressDisplay } from '../../utils/targetUtils';
 import { hasAssessmentContent } from '../../utils/assessmentResolver';
 import { SessionSummaryCard } from '../common/SessionSummaryCard';
 import { StudentSessionHistoryModal } from './StudentSessionHistoryModal';
 import {
-  Users, BookOpen, CheckCircle2, ChevronRight,
-  Layers, Check, UserCheck, CheckSquare, Square,
-  Loader2, AlertCircle, Calendar, Clock, Eye
+  Users,
+  BookOpen,
+  CheckCircle2,
+  ChevronRight,
+  Layers,
+  Check,
+  UserCheck,
+  CheckSquare,
+  Square,
+  AlertCircle,
+  Calendar,
+  Clock,
+  Eye
 } from 'lucide-react';
 
 interface MyHalaqahProps {
@@ -20,7 +34,60 @@ interface MyHalaqahProps {
   onNavigateToEvaluation?: (studentId?: string, sessionConfigId?: string) => void;
 }
 
-export const MyHalaqah: React.FC<MyHalaqahProps> = ({ currentUser, onNavigateToAssessment, onNavigateToEvaluation }) => {
+/**
+ * TEMPORARY "TABRAK" TARGET DISPLAY
+ * ----------------------------------
+ * Target guru untuk sementara hanya perlu DIBACA, belum diproses.
+ * Karena bootstrap teacher workspace bisa menormalisasi beberapa target field
+ * menjadi angka, komponen ini membaca 12_EVENT_PARTICIPANTS sekali lagi melalui
+ * getEventParticipants(), lalu memakai teks mentah dari Spreadsheet.
+ *
+ * Priority:
+ * 1. target_text
+ * 2. target_note
+ * 3. target_surah_start + target_ayah_start + target_surah_end + target_ayah_end
+ * 4. targetText dari workspace sebagai fallback
+ *
+ * Tidak ada parsing Surah, tidak ada perhitungan, tidak ada aturan skill.
+ */
+function buildRawTeacherTargetText(participant: any, fallback = 'Belum ditentukan'): string {
+  if (!participant) return fallback || 'Belum ditentukan';
+
+  const clean = (value: any): string => {
+    if (value === undefined || value === null) return '';
+    return String(value).trim();
+  };
+
+  const targetText = clean(participant.target_text);
+  if (targetText) return targetText;
+
+  const targetNote = clean(participant.target_note);
+  if (targetNote) return targetNote;
+
+  const startSurah = clean(participant.target_surah_start);
+  const startAyah = clean(participant.target_ayah_start);
+  const endSurah = clean(participant.target_surah_end);
+  const endAyah = clean(participant.target_ayah_end);
+
+  const startText = [startSurah, startAyah].filter(Boolean).join(' : ');
+  const endText = [endSurah, endAyah].filter(Boolean).join(' : ');
+
+  if (startText && endText && startText !== endText) {
+    return `${startText} s/d ${endText}`;
+  }
+
+  if (startText || endText) {
+    return startText || endText;
+  }
+
+  return fallback || 'Belum ditentukan';
+}
+
+export const MyHalaqah: React.FC<MyHalaqahProps> = ({
+  currentUser,
+  onNavigateToAssessment,
+  onNavigateToEvaluation
+}) => {
   const {
     workspace,
     isLoading,
@@ -30,8 +97,7 @@ export const MyHalaqah: React.FC<MyHalaqahProps> = ({ currentUser, onNavigateToA
     selectedTeacherId,
     setSelectedTeacherId,
     availableTeachers,
-    applyBulkAttendanceOptimistic,
-    refreshWorkspace
+    applyBulkAttendanceOptimistic
   } = useTeacherWorkspace();
 
   const [selectedSessionId, setSelectedSessionId] = useState<string>('');
@@ -40,26 +106,52 @@ export const MyHalaqah: React.FC<MyHalaqahProps> = ({ currentUser, onNavigateToA
   const [bulkFeedback, setBulkFeedback] = useState<{ type: 'success' | 'error'; message: string } | null>(null);
   const [eventDays, setEventDays] = useState<EventDay[]>(workspace?.eventDays || []);
 
+  // Raw participant rows are deliberately kept separate from workspace summary.
+  const [rawParticipants, setRawParticipants] = useState<any[]>([]);
+
   const isAdminOrCoord = currentUser?.role === 'ADMIN' || currentUser?.role === 'COORDINATOR';
 
   useEffect(() => {
     if (workspace?.eventDays && workspace.eventDays.length > 0) {
       setEventDays(workspace.eventDays);
     } else if (workspace?.event?.event_id) {
-      ApiService.getEventDays(workspace.event.event_id).then(days => {
-        setEventDays(days);
-      }).catch(err => {
-        console.warn('Failed to load event days in MyHalaqah:', err);
-      });
+      ApiService.getEventDays(workspace.event.event_id)
+        .then(days => setEventDays(days))
+        .catch(err => console.warn('Failed to load event days in MyHalaqah:', err));
     }
   }, [workspace?.event?.event_id, workspace?.eventDays]);
+
+  // TABRAK TARGET: fetch raw participant data directly.
+  // Failure here never blocks teacher workspace; it simply falls back to workspace.targetText.
+  useEffect(() => {
+    const eventId = workspace?.event?.event_id;
+    if (!eventId) {
+      setRawParticipants([]);
+      return;
+    }
+
+    let cancelled = false;
+
+    ApiService.getEventParticipants(eventId)
+      .then(rows => {
+        if (!cancelled) setRawParticipants(rows || []);
+      })
+      .catch(err => {
+        if (!cancelled) {
+          console.warn('[Target Tabrak] Raw participant target fetch failed; using workspace fallback:', err);
+        }
+      });
+
+    return () => {
+      cancelled = true;
+    };
+  }, [workspace?.event?.event_id, workspace?.serverTimestamp]);
 
   const sessionConfigs = useMemo(() => {
     const raw = (workspace?.sessionConfigs || []).filter(sc => sc.active);
     return sortSessionConfigs(raw, eventDays);
   }, [workspace?.sessionConfigs, eventDays]);
 
-  // Set default selected session if none selected or not in list
   useEffect(() => {
     if (sessionConfigs.length > 0) {
       if (!selectedSessionId || !sessionConfigs.some(sc => sc.session_config_id === selectedSessionId)) {
@@ -70,11 +162,36 @@ export const MyHalaqah: React.FC<MyHalaqahProps> = ({ currentUser, onNavigateToA
     }
   }, [sessionConfigs, selectedSessionId]);
 
-  const students = workspace?.students || [];
+  const rawParticipantMap = useMemo(() => {
+    const map = new Map<string, any>();
+    rawParticipants.forEach(p => {
+      if (p?.participant_id) map.set(`PART:${String(p.participant_id)}`, p);
+      if (p?.student_id) map.set(`STU:${String(p.student_id)}`, p);
+    });
+    return map;
+  }, [rawParticipants]);
+
+  // Replace targetText ONLY. Everything else still comes from normal teacher workspace.
+  const students = useMemo<TeacherStudentSummary[]>(() => {
+    return (workspace?.students || []).map(st => {
+      const participant =
+        (st.participant_id ? rawParticipantMap.get(`PART:${String(st.participant_id)}`) : null) ||
+        rawParticipantMap.get(`STU:${String(st.student_id)}`);
+
+      return {
+        ...st,
+        targetText: buildRawTeacherTargetText(participant, st.targetText || 'Belum ditentukan')
+      };
+    });
+  }, [workspace?.students, rawParticipantMap]);
+
   const finalEvaluations = workspace?.finalEvaluations || [];
+
   const evaluatedStudentsCount = useMemo(() => {
     return students.filter(st =>
-      finalEvaluations.some(fe => fe.student_id === st.student_id || (st.participant_id && fe.participant_id === st.participant_id))
+      finalEvaluations.some(
+        fe => fe.student_id === st.student_id || (st.participant_id && fe.participant_id === st.participant_id)
+      )
     ).length;
   }, [students, finalEvaluations]);
 
@@ -86,18 +203,20 @@ export const MyHalaqah: React.FC<MyHalaqahProps> = ({ currentUser, onNavigateToA
     return checkIsFinalEvaluationSession(selectedSessionConfig, sessionConfigs);
   }, [selectedSessionConfig, sessionConfigs]);
 
-  // Assessments for current selected session
   const sessionAssessmentsMap = useMemo(() => {
-    const map = new Map<string, { attendance_status: AttendanceStatus; assessment_status?: string; hasProgress: boolean }>();
+    const map = new Map<
+      string,
+      { attendance_status: AttendanceStatus; assessment_status?: string; hasProgress: boolean }
+    >();
+
     if (!workspace?.assessments || !selectedSessionId) return map;
 
     workspace.assessments.forEach(a => {
       if (!a.is_deleted && a.session_config_id === selectedSessionId) {
-        const hasContent = hasAssessmentContent(a);
         map.set(a.student_id, {
           attendance_status: a.attendance_status,
           assessment_status: a.assessment_status,
-          hasProgress: hasContent
+          hasProgress: hasAssessmentContent(a)
         });
       }
     });
@@ -105,28 +224,24 @@ export const MyHalaqah: React.FC<MyHalaqahProps> = ({ currentUser, onNavigateToA
     return map;
   }, [workspace?.assessments, selectedSessionId]);
 
-  // Select all / Deselect all
   const isAllSelected = students.length > 0 && selectedStudentIds.length === students.length;
   const isSomeSelected = selectedStudentIds.length > 0 && selectedStudentIds.length < students.length;
 
   const handleToggleSelectAll = () => {
-    if (isAllSelected) {
-      setSelectedStudentIds([]);
-    } else {
-      setSelectedStudentIds(students.map(s => s.student_id));
-    }
+    if (isAllSelected) setSelectedStudentIds([]);
+    else setSelectedStudentIds(students.map(s => s.student_id));
   };
 
   const handleToggleStudent = (studentId: string) => {
     setSelectedStudentIds(prev =>
-      prev.includes(studentId)
-        ? prev.filter(id => id !== studentId)
-        : [...prev, studentId]
+      prev.includes(studentId) ? prev.filter(id => id !== studentId) : [...prev, studentId]
     );
   };
 
-  // Bulk Attendance Action Handler (Optimistic & Silent)
-  const handleBulkAttendance = async (status: 'PRESENT' | 'SICK' | 'PERMISSION' | 'ABSENT', targetStudentIds?: string[]) => {
+  const handleBulkAttendance = async (
+    status: 'PRESENT' | 'SICK' | 'PERMISSION' | 'ABSENT',
+    targetStudentIds?: string[]
+  ) => {
     const studentIdsToSubmit = targetStudentIds || selectedStudentIds;
 
     if (!selectedSessionId) {
@@ -156,7 +271,6 @@ export const MyHalaqah: React.FC<MyHalaqahProps> = ({ currentUser, onNavigateToA
         type: 'success',
         message: `Presensi [${statusLabels[status]}] untuk ${count} siswa berhasil diterapkan.`
       });
-      // Clear selection after applying bulk save
       setSelectedStudentIds([]);
     } else {
       setBulkFeedback({
@@ -168,11 +282,9 @@ export const MyHalaqah: React.FC<MyHalaqahProps> = ({ currentUser, onNavigateToA
 
   const handleAllPresentShortcut = () => {
     if (students.length === 0) return;
-    const allIds = students.map(s => s.student_id);
-    handleBulkAttendance('PRESENT', allIds);
+    handleBulkAttendance('PRESENT', students.map(s => s.student_id));
   };
 
-  // 1. Admin/Coordinator without a selected teacher
   if (isAdminOrCoord && !selectedTeacherId) {
     return (
       <div className="max-w-md mx-auto my-12 p-8 bg-white rounded border border-slate-200 shadow-sm text-center space-y-6 animate-in fade-in">
@@ -189,7 +301,7 @@ export const MyHalaqah: React.FC<MyHalaqahProps> = ({ currentUser, onNavigateToA
           <label className="text-xs font-bold text-slate-700">Pilih Guru Pengampu:</label>
           <select
             value={selectedTeacherId}
-            onChange={(e) => setSelectedTeacherId(e.target.value)}
+            onChange={e => setSelectedTeacherId(e.target.value)}
             className="w-full px-3 py-2 bg-white border border-slate-300 rounded text-sm font-medium text-slate-800 focus:ring-2 focus:ring-blue-500 focus:outline-none"
           >
             <option value="">-- Pilih Guru --</option>
@@ -204,12 +316,11 @@ export const MyHalaqah: React.FC<MyHalaqahProps> = ({ currentUser, onNavigateToA
     );
   }
 
-  // 2. Loading state: while fetching fresh data, always show loading indicator
   if ((isLoading || isRevalidating) && !workspace?.halaqah) {
     return (
       <div className="min-h-[60vh] flex items-center justify-center">
         <div className="text-center space-y-3">
-          <div className="w-10 h-10 border-4 border-blue-600 border-t-transparent rounded-full animate-spin mx-auto"></div>
+          <div className="w-10 h-10 border-4 border-blue-600 border-t-transparent rounded-full animate-spin mx-auto" />
           <p className="text-xs text-slate-500 font-medium">Memeriksa penugasan halaqah...</p>
         </div>
       </div>
@@ -219,7 +330,6 @@ export const MyHalaqah: React.FC<MyHalaqahProps> = ({ currentUser, onNavigateToA
   const halaqah = workspace?.halaqah;
   const availableHalaqahs = workspace?.availableHalaqahs || [];
 
-  // 3. No halaqah assigned - only show after loading completes and confirms no assignment
   if (!halaqah || availableHalaqahs.length === 0) {
     if (isAdminOrCoord) {
       return (
@@ -237,7 +347,7 @@ export const MyHalaqah: React.FC<MyHalaqahProps> = ({ currentUser, onNavigateToA
             <label className="text-xs font-bold text-slate-700">Ganti Pilihan Guru:</label>
             <select
               value={selectedTeacherId}
-              onChange={(e) => setSelectedTeacherId(e.target.value)}
+              onChange={e => setSelectedTeacherId(e.target.value)}
               className="w-full px-3 py-2 bg-white border border-slate-300 rounded text-sm font-medium text-slate-800 focus:ring-2 focus:ring-blue-500 focus:outline-none"
             >
               <option value="">-- Pilih Guru --</option>
@@ -267,17 +377,14 @@ export const MyHalaqah: React.FC<MyHalaqahProps> = ({ currentUser, onNavigateToA
 
   return (
     <div className="max-w-7xl mx-auto px-3 sm:px-6 lg:px-8 py-4 sm:py-8 space-y-4 sm:space-y-6 w-full max-w-full">
-      
-      {/* Top Sync & Selector Header */}
       <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3 sm:gap-4 w-full">
         <div className="flex flex-wrap items-center gap-2.5 sm:gap-4">
-          {/* Teacher Selector for Admin / Coordinator */}
           {isAdminOrCoord && availableTeachers.length > 0 && (
             <div className="flex items-center gap-2">
               <label className="text-xs font-bold text-slate-500">Guru:</label>
               <select
                 value={selectedTeacherId}
-                onChange={(e) => setSelectedTeacherId(e.target.value)}
+                onChange={e => setSelectedTeacherId(e.target.value)}
                 className="px-3 py-1.5 bg-white border border-slate-300 rounded text-xs font-bold text-slate-800 shadow-sm focus:ring-2 focus:ring-blue-500"
               >
                 {availableTeachers.map(t => (
@@ -289,13 +396,12 @@ export const MyHalaqah: React.FC<MyHalaqahProps> = ({ currentUser, onNavigateToA
             </div>
           )}
 
-          {/* Halaqah Selector */}
           {availableHalaqahs.length > 1 && (
             <div className="flex items-center gap-2">
               <label className="text-xs font-bold text-slate-500">Halaqah:</label>
               <select
                 value={activeHalaqahId || halaqah.halaqah_id}
-                onChange={(e) => setActiveHalaqahId(e.target.value)}
+                onChange={e => setActiveHalaqahId(e.target.value)}
                 className="px-3 py-1.5 bg-white border border-slate-300 rounded text-xs font-bold text-slate-800 shadow-sm focus:ring-2 focus:ring-blue-500"
               >
                 {availableHalaqahs.map(h => (
@@ -312,19 +418,22 @@ export const MyHalaqah: React.FC<MyHalaqahProps> = ({ currentUser, onNavigateToA
         </div>
       </div>
 
-      {/* Group Info Header */}
       <div className="bg-slate-900 text-white p-4 sm:p-6 md:p-8 rounded-xl sm:rounded-2xl border border-slate-800 shadow-sm flex flex-col xl:flex-row xl:items-center justify-between gap-4 sm:gap-6 border-l-4 border-l-blue-500 w-full min-w-0">
         <div className="space-y-1.5 sm:space-y-2 w-full min-w-0 max-w-full flex-1">
           <div className="inline-flex items-center space-x-1.5 sm:space-x-2 bg-slate-800 px-2.5 py-1 rounded text-xs text-blue-400 font-semibold border border-slate-700">
             <Layers className="w-3.5 h-3.5" />
             <span>Kelompok Binaan Guru</span>
           </div>
-          <h1 className="text-xl sm:text-2xl md:text-3xl font-bold tracking-tight text-white line-clamp-2 break-normal">{halaqah.group_name || halaqah.halaqah_name}</h1>
+          <h1 className="text-xl sm:text-2xl md:text-3xl font-bold tracking-tight text-white line-clamp-2 break-normal">
+            {halaqah.group_name || halaqah.halaqah_name}
+          </h1>
           <div className="flex flex-wrap items-center gap-x-3 gap-y-1 text-xs sm:text-sm text-slate-400 leading-relaxed">
             <span>Guru: <strong className="text-white">{halaqah.teacher_name}</strong></span>
             <span>&bull;</span>
             <span>Kapasitas: <strong className="text-white">{students.length}</strong> Siswa</span>
-            {((halaqah.target_ziyadah_lines != null && halaqah.target_ziyadah_lines > 0) || (halaqah.target_nuroniyyah_lines != null && halaqah.target_nuroniyyah_lines > 0) || (halaqah.target_iqra_pages != null && halaqah.target_iqra_pages > 0)) && (
+            {((halaqah.target_ziyadah_lines != null && halaqah.target_ziyadah_lines > 0) ||
+              (halaqah.target_nuroniyyah_lines != null && halaqah.target_nuroniyyah_lines > 0) ||
+              (halaqah.target_iqra_pages != null && halaqah.target_iqra_pages > 0)) && (
               <>
                 <span>&bull;</span>
                 <span className="inline-flex items-center gap-1.5 px-2 py-0.5 rounded bg-blue-950/80 border border-blue-700/60 text-blue-200 font-semibold text-xs">
@@ -332,7 +441,9 @@ export const MyHalaqah: React.FC<MyHalaqahProps> = ({ currentUser, onNavigateToA
                   <strong className="text-white">
                     {[
                       halaqah.target_ziyadah_lines ? `${halaqah.target_ziyadah_lines} Baris Ziyadah` : null,
-                      (halaqah.target_nuroniyyah_lines || halaqah.target_iqra_pages) ? `${halaqah.target_nuroniyyah_lines || halaqah.target_iqra_pages} Baris Nuroniyyah` : null
+                      (halaqah.target_nuroniyyah_lines || halaqah.target_iqra_pages)
+                        ? `${halaqah.target_nuroniyyah_lines || halaqah.target_iqra_pages} Baris Nuroniyyah`
+                        : null
                     ].filter(Boolean).join(' • ')}
                   </strong>
                 </span>
@@ -378,7 +489,6 @@ export const MyHalaqah: React.FC<MyHalaqahProps> = ({ currentUser, onNavigateToA
         </div>
       </div>
 
-      {/* Feedback Banner */}
       {bulkFeedback && (
         <div
           className={`p-3.5 sm:p-4 rounded-xl border text-xs font-semibold flex items-center justify-between animate-in fade-in ${
@@ -405,15 +515,9 @@ export const MyHalaqah: React.FC<MyHalaqahProps> = ({ currentUser, onNavigateToA
         </div>
       )}
 
-      {/* Bulk Attendance & Roster Card */}
       <div className="bg-white rounded-xl sm:rounded-2xl border border-slate-200 shadow-sm overflow-hidden space-y-4 p-3.5 sm:p-6 w-full max-w-full">
-        
-        {/* Bulk Attendance Controls Header (Sticky on Mobile) */}
         <div className="sticky top-0 z-20 bg-slate-50/95 backdrop-blur-md -mx-3.5 sm:mx-0 px-3.5 sm:px-4 py-3 sm:py-4 border-b sm:border border-slate-200 sm:rounded-xl shadow-xs space-y-3">
-          
           <div className="flex flex-col lg:flex-row lg:items-center justify-between gap-2.5 sm:gap-4">
-            
-            {/* Session Selector */}
             <div className="flex flex-col sm:flex-row sm:items-center gap-1.5 sm:gap-3">
               <div className="flex items-center space-x-1.5 text-xs font-bold text-slate-700 shrink-0">
                 <Calendar className="w-4 h-4 text-blue-600" />
@@ -422,7 +526,7 @@ export const MyHalaqah: React.FC<MyHalaqahProps> = ({ currentUser, onNavigateToA
               {sessionConfigs.length > 0 ? (
                 <select
                   value={selectedSessionId}
-                  onChange={(e) => {
+                  onChange={e => {
                     setSelectedSessionId(e.target.value);
                     setBulkFeedback(null);
                   }}
@@ -439,7 +543,6 @@ export const MyHalaqah: React.FC<MyHalaqahProps> = ({ currentUser, onNavigateToA
               )}
             </div>
 
-            {/* Selection Counter & Quick shortcut */}
             <div className="flex items-center justify-between sm:justify-end gap-2">
               <span className="text-xs font-bold text-slate-700 bg-white px-2.5 py-1 rounded-md border border-slate-200 shadow-2xs">
                 {selectedStudentIds.length} dari {students.length} siswa dipilih
@@ -456,7 +559,6 @@ export const MyHalaqah: React.FC<MyHalaqahProps> = ({ currentUser, onNavigateToA
             </div>
           </div>
 
-          {/* Compact Session Summary Context */}
           {selectedSessionConfig && (
             <div className="pt-2 border-t border-slate-200/70">
               <SessionSummaryCard
@@ -467,7 +569,6 @@ export const MyHalaqah: React.FC<MyHalaqahProps> = ({ currentUser, onNavigateToA
             </div>
           )}
 
-          {/* Bulk Action Buttons */}
           <div className="pt-2.5 border-t border-slate-200/80">
             <div className="text-[11px] font-bold uppercase tracking-wider text-slate-500 mb-1.5 sm:hidden">
               Tandai Presensi:
@@ -485,7 +586,6 @@ export const MyHalaqah: React.FC<MyHalaqahProps> = ({ currentUser, onNavigateToA
                 <Check className="w-3.5 h-3.5" />
                 <span>Hadir ({selectedStudentIds.length})</span>
               </button>
-
               <button
                 type="button"
                 disabled={selectedStudentIds.length === 0 || !selectedSessionId}
@@ -494,7 +594,6 @@ export const MyHalaqah: React.FC<MyHalaqahProps> = ({ currentUser, onNavigateToA
               >
                 <span>Sakit</span>
               </button>
-
               <button
                 type="button"
                 disabled={selectedStudentIds.length === 0 || !selectedSessionId}
@@ -503,7 +602,6 @@ export const MyHalaqah: React.FC<MyHalaqahProps> = ({ currentUser, onNavigateToA
               >
                 <span>Izin</span>
               </button>
-
               <button
                 type="button"
                 disabled={selectedStudentIds.length === 0 || !selectedSessionId}
@@ -516,12 +614,11 @@ export const MyHalaqah: React.FC<MyHalaqahProps> = ({ currentUser, onNavigateToA
           </div>
         </div>
 
-        {/* Header Roster Title */}
         <div className="flex items-center justify-between pb-2 pt-1 border-b border-slate-100">
           <div>
             <h3 className="font-bold text-xs sm:text-sm uppercase text-slate-800">Daftar Siswa & Presensi Sesi</h3>
             <p className="text-[11px] sm:text-xs text-slate-500">
-              Pilih checkbox siswa untuk presensi massal, atau klik "Input Sesi" untuk mengisi setoran hafalan.
+              Pilih checkbox siswa untuk presensi massal, atau klik &quot;Input Sesi&quot; untuk mengisi setoran hafalan.
             </p>
           </div>
           <span className="text-xs font-bold text-slate-600 bg-slate-100 px-2.5 py-1 rounded-md border border-slate-200 shrink-0">
@@ -529,12 +626,7 @@ export const MyHalaqah: React.FC<MyHalaqahProps> = ({ currentUser, onNavigateToA
           </span>
         </div>
 
-        {/* ============================================================ */}
-        {/* MOBILE CARDS VIEW (< 768px / md:hidden) */}
-        {/* ============================================================ */}
         <div className="block md:hidden space-y-3">
-          
-          {/* Mobile Select All Bar */}
           <div className="flex items-center justify-between py-1.5 px-2 bg-slate-50 rounded-lg border border-slate-200">
             <button
               type="button"
@@ -555,12 +647,13 @@ export const MyHalaqah: React.FC<MyHalaqahProps> = ({ currentUser, onNavigateToA
             </span>
           </div>
 
-          {/* Student Cards List */}
           <div className="space-y-3">
-            {students.map((st) => {
+            {students.map(st => {
               const isSelected = selectedStudentIds.includes(st.student_id);
               const sessionAsm = sessionAssessmentsMap.get(st.student_id);
-              const finalEval = finalEvaluations.find(fe => fe.student_id === st.student_id || (st.participant_id && fe.participant_id === st.participant_id));
+              const finalEval = finalEvaluations.find(
+                fe => fe.student_id === st.student_id || (st.participant_id && fe.participant_id === st.participant_id)
+              );
               const isEvaluated = Boolean(finalEval);
 
               return (
@@ -569,7 +662,7 @@ export const MyHalaqah: React.FC<MyHalaqahProps> = ({ currentUser, onNavigateToA
                   onClick={() => setSelectedStudentForHistory(st)}
                   role="button"
                   tabIndex={0}
-                  onKeyDown={(e) => {
+                  onKeyDown={e => {
                     if (e.key === 'Enter' || e.key === ' ') {
                       e.preventDefault();
                       setSelectedStudentForHistory(st);
@@ -583,11 +676,10 @@ export const MyHalaqah: React.FC<MyHalaqahProps> = ({ currentUser, onNavigateToA
                       : 'bg-white border-slate-200 hover:border-blue-300 hover:shadow-md'
                   }`}
                 >
-                  {/* Card Header: Checkbox + Student Name + Class & NIS */}
                   <div className="flex items-start gap-2.5">
                     <button
                       type="button"
-                      onClick={(e) => {
+                      onClick={e => {
                         e.stopPropagation();
                         handleToggleStudent(st.student_id);
                       }}
@@ -622,7 +714,6 @@ export const MyHalaqah: React.FC<MyHalaqahProps> = ({ currentUser, onNavigateToA
                     </div>
                   </div>
 
-                  {/* Attendance / Evaluation Status Badge */}
                   <div className="flex flex-wrap items-center gap-2 pt-1 border-t border-slate-100">
                     {isFinalEvaluationSession ? (
                       isEvaluated ? (
@@ -636,76 +727,59 @@ export const MyHalaqah: React.FC<MyHalaqahProps> = ({ currentUser, onNavigateToA
                           <span>Belum Dievaluasi</span>
                         </span>
                       )
-                    ) : (
-                      sessionAsm ? (
-                        sessionAsm.attendance_status === 'PRESENT' ? (
-                          sessionAsm.hasProgress || sessionAsm.assessment_status === 'COMPLETED' ? (
-                            <span className="bg-emerald-50 text-emerald-700 px-2.5 py-1 rounded-md text-xs font-bold border border-emerald-200 inline-flex items-center gap-1.5">
-                              <CheckCircle2 className="w-3.5 h-3.5 text-emerald-600 shrink-0" />
-                              <span>Hadir • Tuntas</span>
-                            </span>
-                          ) : (
-                            <span className="bg-sky-50 text-sky-700 px-2.5 py-1 rounded-md text-xs font-bold border border-sky-200 inline-flex items-center gap-1.5">
-                              <Clock className="w-3.5 h-3.5 text-sky-600 shrink-0" />
-                              <span>Hadir • Belum Dinilai</span>
-                            </span>
-                          )
-                        ) : sessionAsm.attendance_status === 'SICK' ? (
-                          <span className="bg-amber-50 text-amber-700 px-2.5 py-1 rounded-md text-xs font-bold border border-amber-200">
-                            Sakit
-                          </span>
-                        ) : sessionAsm.attendance_status === 'PERMISSION' ? (
-                          <span className="bg-blue-50 text-blue-700 px-2.5 py-1 rounded-md text-xs font-bold border border-blue-200">
-                            Izin
-                          </span>
-                        ) : sessionAsm.attendance_status === 'ABSENT' ? (
-                          <span className="bg-rose-50 text-rose-700 px-2.5 py-1 rounded-md text-xs font-bold border border-rose-200">
-                            Alpa
+                    ) : sessionAsm ? (
+                      sessionAsm.attendance_status === 'PRESENT' ? (
+                        sessionAsm.hasProgress || sessionAsm.assessment_status === 'COMPLETED' ? (
+                          <span className="bg-emerald-50 text-emerald-700 px-2.5 py-1 rounded-md text-xs font-bold border border-emerald-200 inline-flex items-center gap-1.5">
+                            <CheckCircle2 className="w-3.5 h-3.5 text-emerald-600 shrink-0" />
+                            <span>Hadir • Tuntas</span>
                           </span>
                         ) : (
-                          <span className="bg-slate-100 text-slate-500 px-2.5 py-1 rounded-md text-xs font-medium border border-slate-200">
-                            Belum Presensi
+                          <span className="bg-sky-50 text-sky-700 px-2.5 py-1 rounded-md text-xs font-bold border border-sky-200 inline-flex items-center gap-1.5">
+                            <Clock className="w-3.5 h-3.5 text-sky-600 shrink-0" />
+                            <span>Hadir • Belum Dinilai</span>
                           </span>
                         )
+                      ) : sessionAsm.attendance_status === 'SICK' ? (
+                        <span className="bg-amber-50 text-amber-700 px-2.5 py-1 rounded-md text-xs font-bold border border-amber-200">Sakit</span>
+                      ) : sessionAsm.attendance_status === 'PERMISSION' ? (
+                        <span className="bg-blue-50 text-blue-700 px-2.5 py-1 rounded-md text-xs font-bold border border-blue-200">Izin</span>
+                      ) : sessionAsm.attendance_status === 'ABSENT' ? (
+                        <span className="bg-rose-50 text-rose-700 px-2.5 py-1 rounded-md text-xs font-bold border border-rose-200">Alpa</span>
                       ) : (
-                        <span className="bg-slate-100 text-slate-500 px-2.5 py-1 rounded-md text-xs font-medium border border-slate-200">
-                          Belum Presensi
-                        </span>
+                        <span className="bg-slate-100 text-slate-500 px-2.5 py-1 rounded-md text-xs font-medium border border-slate-200">Belum Presensi</span>
                       )
+                    ) : (
+                      <span className="bg-slate-100 text-slate-500 px-2.5 py-1 rounded-md text-xs font-medium border border-slate-200">Belum Presensi</span>
                     )}
 
-                    {/* Completion status pill */}
                     {st.completionStatus === 'COMPLETE' ? (
                       <span className="bg-emerald-100 text-emerald-800 px-2 py-0.5 rounded text-[10px] font-bold border border-emerald-300 inline-flex items-center gap-1">
                         <CheckCircle2 className="w-3 h-3 text-emerald-600" />
                         <span>Target Tuntas</span>
                       </span>
                     ) : (
-                      <span className="bg-slate-100 text-slate-600 px-2 py-0.5 rounded text-[10px] font-medium">
-                        Belum Tuntas
-                      </span>
+                      <span className="bg-slate-100 text-slate-600 px-2 py-0.5 rounded text-[10px] font-medium">Belum Tuntas</span>
                     )}
                   </div>
 
-                  {/* Target & Current Progress Info Box */}
                   <div className="bg-slate-50/80 rounded-lg p-2.5 border border-slate-100 grid grid-cols-2 gap-2 text-xs">
                     <div>
-                      <p className="text-[10px] uppercase font-bold text-slate-400">Target Acara</p>
-                      <p className="font-semibold text-slate-700 mt-0.5">{st.targetText || 'Belum ditentukan'}</p>
+                      <p className="text-[10px] uppercase font-bold text-slate-400">Capaian Terakhir</p>
+                      <p className="font-semibold text-slate-700 mt-0.5 whitespace-pre-wrap break-words">
+                        {st.targetText || 'Belum ditentukan'}
+                      </p>
                     </div>
                     <div>
                       <p className="text-[10px] uppercase font-bold text-slate-400">Progress</p>
-                      <p className="font-bold text-blue-600 mt-0.5">
-                        {formatSplitProgressDisplay(st)}
-                      </p>
+                      <p className="font-bold text-blue-600 mt-0.5">{formatSplitProgressDisplay(st)}</p>
                     </div>
                   </div>
 
-                  {/* Action Button */}
                   {isFinalEvaluationSession ? (
                     <button
                       type="button"
-                      onClick={(e) => {
+                      onClick={e => {
                         e.stopPropagation();
                         if (onNavigateToEvaluation) {
                           onNavigateToEvaluation(st.student_id, selectedSessionConfig?.session_config_id);
@@ -726,7 +800,7 @@ export const MyHalaqah: React.FC<MyHalaqahProps> = ({ currentUser, onNavigateToA
                   ) : (
                     <button
                       type="button"
-                      onClick={(e) => {
+                      onClick={e => {
                         e.stopPropagation();
                         onNavigateToAssessment(st.student_id, selectedSessionConfig?.session_no);
                       }}
@@ -741,12 +815,8 @@ export const MyHalaqah: React.FC<MyHalaqahProps> = ({ currentUser, onNavigateToA
               );
             })}
           </div>
-
         </div>
 
-        {/* ============================================================ */}
-        {/* DESKTOP TABLE VIEW (>= 768px / hidden md:block) */}
-        {/* ============================================================ */}
         <div className="hidden md:block overflow-x-auto">
           <table className="w-full text-left text-xs">
             <thead className="bg-slate-50 text-slate-600 font-medium text-[10px] uppercase tracking-wider border-b border-slate-200">
@@ -772,17 +842,19 @@ export const MyHalaqah: React.FC<MyHalaqahProps> = ({ currentUser, onNavigateToA
                 <th className="py-3 px-4">Nama Siswa</th>
                 <th className="py-3 px-4">Kelas</th>
                 <th className="py-3 px-4">Status Presensi</th>
-                <th className="py-3 px-4">Target Acara</th>
+                <th className="py-3 px-4">Capaian Terakhir</th>
                 <th className="py-3 px-4">Total Penambahan</th>
                 <th className="py-3 px-4">Status Target</th>
                 <th className="py-3 px-4 text-right">Aksi Assessment</th>
               </tr>
             </thead>
             <tbody className="divide-y divide-slate-100">
-              {students.map((st) => {
+              {students.map(st => {
                 const isSelected = selectedStudentIds.includes(st.student_id);
                 const sessionAsm = sessionAssessmentsMap.get(st.student_id);
-                const finalEval = finalEvaluations.find(fe => fe.student_id === st.student_id || (st.participant_id && fe.participant_id === st.participant_id));
+                const finalEval = finalEvaluations.find(
+                  fe => fe.student_id === st.student_id || (st.participant_id && fe.participant_id === st.participant_id)
+                );
                 const isEvaluated = Boolean(finalEval);
 
                 return (
@@ -791,7 +863,7 @@ export const MyHalaqah: React.FC<MyHalaqahProps> = ({ currentUser, onNavigateToA
                     onClick={() => setSelectedStudentForHistory(st)}
                     role="button"
                     tabIndex={0}
-                    onKeyDown={(e) => {
+                    onKeyDown={e => {
                       if (e.key === 'Enter' || e.key === ' ') {
                         e.preventDefault();
                         setSelectedStudentForHistory(st);
@@ -803,12 +875,11 @@ export const MyHalaqah: React.FC<MyHalaqahProps> = ({ currentUser, onNavigateToA
                       isSelected ? 'bg-blue-50/50 hover:bg-blue-100/50' : 'hover:bg-blue-50/40'
                     }`}
                   >
-                    {/* Checkbox "PILIH" */}
-                    <td className="py-3 px-4 text-center" onClick={(e) => e.stopPropagation()}>
+                    <td className="py-3 px-4 text-center" onClick={e => e.stopPropagation()}>
                       <div className="flex items-center justify-center">
                         <button
                           type="button"
-                          onClick={(e) => {
+                          onClick={e => {
                             e.stopPropagation();
                             handleToggleStudent(st.student_id);
                           }}
@@ -823,13 +894,10 @@ export const MyHalaqah: React.FC<MyHalaqahProps> = ({ currentUser, onNavigateToA
                       </div>
                     </td>
 
-                    {/* Student Name & Skill */}
                     <td className="py-3 px-4">
                       <div className="flex items-center gap-2">
                         <div>
-                          <p className="font-bold text-slate-900 text-sm group-hover:text-blue-700 transition">
-                            {st.full_name}
-                          </p>
+                          <p className="font-bold text-slate-900 text-sm group-hover:text-blue-700 transition">{st.full_name}</p>
                           <p className="text-[11px] text-slate-500 font-medium">{formatSkillBadgeText(st.skill_status_start)}</p>
                         </div>
                         <span className="opacity-0 group-hover:opacity-100 text-blue-600 transition ml-auto shrink-0" title="Lihat riwayat sesi">
@@ -838,10 +906,8 @@ export const MyHalaqah: React.FC<MyHalaqahProps> = ({ currentUser, onNavigateToA
                       </div>
                     </td>
 
-                    {/* Class */}
                     <td className="py-3 px-4 font-medium text-slate-700">{st.grade_class}</td>
 
-                    {/* Session Attendance & Assessment / Evaluation Status */}
                     <td className="py-3 px-4">
                       {isFinalEvaluationSession ? (
                         isEvaluated ? (
@@ -855,48 +921,39 @@ export const MyHalaqah: React.FC<MyHalaqahProps> = ({ currentUser, onNavigateToA
                             <span>Belum Dievaluasi</span>
                           </span>
                         )
-                      ) : (
-                        sessionAsm ? (
-                          sessionAsm.attendance_status === 'PRESENT' ? (
-                            sessionAsm.hasProgress || sessionAsm.assessment_status === 'COMPLETED' ? (
-                              <span className="bg-emerald-50 text-emerald-700 px-2 py-0.5 rounded text-[11px] font-bold border border-emerald-200 inline-flex items-center gap-1">
-                                <CheckCircle2 className="w-3 h-3 text-emerald-600" />
-                                <span>Hadir • Tuntas</span>
-                              </span>
-                            ) : (
-                              <span className="bg-sky-50 text-sky-700 px-2 py-0.5 rounded text-[11px] font-bold border border-sky-200 inline-flex items-center gap-1">
-                                <Clock className="w-3 h-3 text-sky-600" />
-                                <span>Hadir • Belum Dinilai</span>
-                              </span>
-                            )
-                          ) : sessionAsm.attendance_status === 'SICK' ? (
-                            <span className="bg-amber-50 text-amber-700 px-2 py-0.5 rounded text-[11px] font-bold border border-amber-200">
-                              Sakit
-                            </span>
-                          ) : sessionAsm.attendance_status === 'PERMISSION' ? (
-                            <span className="bg-blue-50 text-blue-700 px-2 py-0.5 rounded text-[11px] font-bold border border-blue-200">
-                              Izin
-                            </span>
-                          ) : sessionAsm.attendance_status === 'ABSENT' ? (
-                            <span className="bg-rose-50 text-rose-700 px-2 py-0.5 rounded text-[11px] font-bold border border-rose-200">
-                              Alpa
+                      ) : sessionAsm ? (
+                        sessionAsm.attendance_status === 'PRESENT' ? (
+                          sessionAsm.hasProgress || sessionAsm.assessment_status === 'COMPLETED' ? (
+                            <span className="bg-emerald-50 text-emerald-700 px-2 py-0.5 rounded text-[11px] font-bold border border-emerald-200 inline-flex items-center gap-1">
+                              <CheckCircle2 className="w-3 h-3 text-emerald-600" />
+                              <span>Hadir • Tuntas</span>
                             </span>
                           ) : (
-                            <span className="text-slate-400 text-xs italic">Belum Presensi</span>
+                            <span className="bg-sky-50 text-sky-700 px-2 py-0.5 rounded text-[11px] font-bold border border-sky-200 inline-flex items-center gap-1">
+                              <Clock className="w-3 h-3 text-sky-600" />
+                              <span>Hadir • Belum Dinilai</span>
+                            </span>
                           )
+                        ) : sessionAsm.attendance_status === 'SICK' ? (
+                          <span className="bg-amber-50 text-amber-700 px-2 py-0.5 rounded text-[11px] font-bold border border-amber-200">Sakit</span>
+                        ) : sessionAsm.attendance_status === 'PERMISSION' ? (
+                          <span className="bg-blue-50 text-blue-700 px-2 py-0.5 rounded text-[11px] font-bold border border-blue-200">Izin</span>
+                        ) : sessionAsm.attendance_status === 'ABSENT' ? (
+                          <span className="bg-rose-50 text-rose-700 px-2 py-0.5 rounded text-[11px] font-bold border border-rose-200">Alpa</span>
                         ) : (
                           <span className="text-slate-400 text-xs italic">Belum Presensi</span>
                         )
+                      ) : (
+                        <span className="text-slate-400 text-xs italic">Belum Presensi</span>
                       )}
                     </td>
 
-                    {/* Target Event */}
-                    <td className="py-3 px-4 font-medium text-slate-700">{st.targetText || 'Belum ditentukan'}</td>
+                    <td className="py-3 px-4 font-medium text-slate-700 max-w-[260px] whitespace-normal break-words">
+                      {st.targetText || 'Belum ditentukan'}
+                    </td>
 
-                    {/* Total Lines Added */}
                     <td className="py-3 px-4 font-bold text-blue-600">{formatSplitProgressDisplay(st)}</td>
 
-                    {/* Target Completion Status */}
                     <td className="py-3 px-4">
                       {st.completionStatus === 'COMPLETE' ? (
                         <span className="bg-emerald-50 text-emerald-700 px-2.5 py-1 rounded text-[10px] font-bold border border-emerald-200 inline-flex items-center gap-1">
@@ -904,18 +961,15 @@ export const MyHalaqah: React.FC<MyHalaqahProps> = ({ currentUser, onNavigateToA
                           <span>Tuntas</span>
                         </span>
                       ) : (
-                        <span className="bg-amber-50 text-amber-700 px-2.5 py-1 rounded text-[10px] font-bold border border-amber-200">
-                          Belum Tuntas
-                        </span>
+                        <span className="bg-amber-50 text-amber-700 px-2.5 py-1 rounded text-[10px] font-bold border border-amber-200">Belum Tuntas</span>
                       )}
                     </td>
 
-                    {/* Assessment / Evaluation Action */}
-                    <td className="py-3 px-4 text-right" onClick={(e) => e.stopPropagation()}>
+                    <td className="py-3 px-4 text-right" onClick={e => e.stopPropagation()}>
                       {isFinalEvaluationSession ? (
                         <button
                           type="button"
-                          onClick={(e) => {
+                          onClick={e => {
                             e.stopPropagation();
                             if (onNavigateToEvaluation) {
                               onNavigateToEvaluation(st.student_id, selectedSessionConfig?.session_config_id);
@@ -935,7 +989,7 @@ export const MyHalaqah: React.FC<MyHalaqahProps> = ({ currentUser, onNavigateToA
                       ) : (
                         <button
                           type="button"
-                          onClick={(e) => {
+                          onClick={e => {
                             e.stopPropagation();
                             onNavigateToAssessment(st.student_id, selectedSessionConfig?.session_no);
                           }}
@@ -954,7 +1008,6 @@ export const MyHalaqah: React.FC<MyHalaqahProps> = ({ currentUser, onNavigateToA
         </div>
       </div>
 
-      {/* Student Session History Modal */}
       {selectedStudentForHistory && (
         <StudentSessionHistoryModal
           student={selectedStudentForHistory}
@@ -968,7 +1021,6 @@ export const MyHalaqah: React.FC<MyHalaqahProps> = ({ currentUser, onNavigateToA
           onNavigateToEvaluation={onNavigateToEvaluation}
         />
       )}
-
     </div>
   );
 };
