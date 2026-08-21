@@ -62,6 +62,12 @@ interface TeacherWorkspaceContextType {
     payload: any
   ) => Promise<{ success: boolean; error?: string }>;
 
+  deleteFinalEvaluationOptimistic: (params: {
+    finalEvaluationId?: string;
+    participantId?: string;
+    studentId?: string;
+  }) => Promise<{ success: boolean; error?: string }>;
+
   applyBulkAttendanceOptimistic: (
     sessionConfigId: string,
     studentIds: string[],
@@ -92,6 +98,14 @@ function getPendingCacheKey(teacherId: string): string {
 
 function isFinalEvaluationWrite(item: PendingAssessmentWrite): boolean {
   return item?.payload?.action === 'saveFinalEvaluation';
+}
+
+function isDeleteFinalEvaluationWrite(item: PendingAssessmentWrite): boolean {
+  return item?.payload?.action === 'deleteFinalEvaluation';
+}
+
+function isAnyFinalEvaluationWrite(item: PendingAssessmentWrite): boolean {
+  return isFinalEvaluationWrite(item) || isDeleteFinalEvaluationWrite(item);
 }
 
 function isBulkAttendanceWrite(item: PendingAssessmentWrite): boolean {
@@ -381,7 +395,7 @@ export const TeacherWorkspaceProvider: React.FC<{
           totalIqraPagesAdded: iqraPages,
           completionStatus: evaluation
             ? evaluation.completion_status
-            : student.completionStatus || 'NOT_EVALUATED'
+            : 'NOT_EVALUATED'
         };
       });
     },
@@ -441,12 +455,37 @@ export const TeacherWorkspaceProvider: React.FC<{
       const merged = [...(serverEvaluations || [])];
 
       queue.forEach(item => {
-        if (!isFinalEvaluationWrite(item)) return;
+        if (!isAnyFinalEvaluationWrite(item)) return;
 
         const payload = item.payload || {};
         const participantId =
-          payload.participant_id || item.participant_id || '';
-        const studentId = payload.student_id || item.student_id || '';
+          payload.participant_id ||
+          payload.participantId ||
+          item.participant_id ||
+          '';
+        const studentId =
+          payload.student_id ||
+          payload.studentId ||
+          item.student_id ||
+          '';
+
+        if (isDeleteFinalEvaluationWrite(item)) {
+          for (let index = merged.length - 1; index >= 0; index--) {
+            const evaluation = merged[index];
+            const sameParticipant =
+              Boolean(participantId) &&
+              evaluation.participant_id === participantId;
+            const sameStudent =
+              Boolean(studentId) &&
+              evaluation.student_id === studentId;
+
+            if (sameParticipant || sameStudent) {
+              merged.splice(index, 1);
+            }
+          }
+          return;
+        }
+
         const timestamp = new Date(
           item.localTimestamp || Date.now()
         ).toISOString();
@@ -523,7 +562,7 @@ export const TeacherWorkspaceProvider: React.FC<{
       ]);
 
       queue.forEach(item => {
-        if (isFinalEvaluationWrite(item)) return;
+        if (isAnyFinalEvaluationWrite(item)) return;
 
         const payload = item.payload || {};
 
@@ -854,7 +893,32 @@ export const TeacherWorkspaceProvider: React.FC<{
         }
 
         try {
-          if (isFinalEvaluationWrite(item)) {
+          if (isDeleteFinalEvaluationWrite(item)) {
+            await ApiService.deleteFinalEvaluation(
+              {
+                finalEvaluationId:
+                  item.payload.finalEvaluationId ||
+                  item.payload.final_evaluation_id ||
+                  '',
+                participantId:
+                  item.payload.participantId ||
+                  item.payload.participant_id ||
+                  item.participant_id ||
+                  '',
+                studentId:
+                  item.payload.studentId ||
+                  item.payload.student_id ||
+                  item.student_id ||
+                  '',
+                eventId:
+                  item.payload.eventId ||
+                  item.payload.event_id ||
+                  item.event_id ||
+                  ''
+              },
+              currentUser?.user_id
+            );
+          } else if (isFinalEvaluationWrite(item)) {
             const {
               action: _action,
               final_evaluation_id: _localEvaluationId,
@@ -1570,7 +1634,7 @@ export const TeacherWorkspaceProvider: React.FC<{
       };
 
       const nextQueue = loadPendingWrites(cacheKey).filter(old => {
-        if (!isFinalEvaluationWrite(old)) return true;
+        if (!isAnyFinalEvaluationWrite(old)) return true;
 
         const sameParticipant =
           Boolean(participantId) && old.participant_id === participantId;
@@ -1657,6 +1721,179 @@ export const TeacherWorkspaceProvider: React.FC<{
         });
 
       // Successful teacher action = safely stored locally.
+      return { success: true };
+    },
+    [
+      currentUser,
+      workspace,
+      isTeacher,
+      selectedTeacherId,
+      recomputeStudentProgress,
+      setStatusFromQueue
+    ]
+  );
+
+
+  const deleteFinalEvaluationOptimistic = useCallback(
+    async (params: {
+      finalEvaluationId?: string;
+      participantId?: string;
+      studentId?: string;
+    }): Promise<{ success: boolean; error?: string }> => {
+      if (!currentUser || !workspace) {
+        return { success: false, error: 'Sesi guru belum siap.' };
+      }
+
+      const participantId = params.participantId || '';
+      const studentId = params.studentId || '';
+
+      const existing = workspace.finalEvaluations.find(
+        evaluation =>
+          (params.finalEvaluationId &&
+            evaluation.final_evaluation_id === params.finalEvaluationId) ||
+          (participantId && evaluation.participant_id === participantId) ||
+          (studentId && evaluation.student_id === studentId)
+      );
+
+      if (!existing) {
+        return {
+          success: false,
+          error: 'Evaluasi akhir aktif siswa tidak ditemukan.'
+        };
+      }
+
+      const resolvedParticipantId =
+        participantId || existing.participant_id || '';
+      const resolvedStudentId = studentId || existing.student_id || '';
+      const eventId = workspace.event?.event_id || existing.event_id || '';
+
+      const cacheKey = isTeacher
+        ? currentUser.teacher_id || ''
+        : selectedTeacherId || '__ADMIN_ALL__';
+
+      const remainingEvaluations = workspace.finalEvaluations.filter(
+        evaluation => {
+          const sameParticipant =
+            Boolean(resolvedParticipantId) &&
+            evaluation.participant_id === resolvedParticipantId;
+          const sameStudent =
+            Boolean(resolvedStudentId) &&
+            evaluation.student_id === resolvedStudentId;
+
+          return !(sameParticipant || sameStudent);
+        }
+      );
+
+      const updatedWorkspace: TeacherWorkspaceBootstrap = {
+        ...workspace,
+        finalEvaluations: remainingEvaluations,
+        students: recomputeStudentProgress(
+          workspace.students,
+          workspace.assessments,
+          remainingEvaluations
+        )
+      };
+
+      setWorkspace(updatedWorkspace);
+      saveWorkspaceToCache(cacheKey, updatedWorkspace);
+
+      const queueId = `final-delete-${Date.now()}-${Math.random()
+        .toString(36)
+        .slice(2, 7)}`;
+
+      const deleteItem: PendingAssessmentWrite = {
+        id: queueId,
+        event_id: eventId,
+        participant_id: resolvedParticipantId,
+        session_config_id: FINAL_EVAL_SENTINEL,
+        student_id: resolvedStudentId,
+        payload: {
+          action: 'deleteFinalEvaluation',
+          finalEvaluationId: existing.final_evaluation_id || '',
+          participantId: resolvedParticipantId,
+          studentId: resolvedStudentId,
+          eventId
+        },
+        localTimestamp: Date.now(),
+        status: 'SYNCING',
+        retryCount: 0
+      };
+
+      const nextQueue = loadPendingWrites(cacheKey).filter(old => {
+        if (!isAnyFinalEvaluationWrite(old)) return true;
+
+        const oldParticipantId =
+          old.payload?.participantId ||
+          old.payload?.participant_id ||
+          old.participant_id ||
+          '';
+        const oldStudentId =
+          old.payload?.studentId ||
+          old.payload?.student_id ||
+          old.student_id ||
+          '';
+
+        const sameParticipant =
+          Boolean(resolvedParticipantId) &&
+          oldParticipantId === resolvedParticipantId;
+        const sameStudent =
+          Boolean(resolvedStudentId) &&
+          oldStudentId === resolvedStudentId;
+
+        return !(sameParticipant || sameStudent);
+      });
+
+      nextQueue.push(deleteItem);
+      setPendingWrites(nextQueue);
+      savePendingWrites(cacheKey, nextQueue);
+      setStatusFromQueue(nextQueue, false);
+
+      ApiService.deleteFinalEvaluation(
+        {
+          finalEvaluationId: existing.final_evaluation_id || '',
+          participantId: resolvedParticipantId,
+          studentId: resolvedStudentId,
+          eventId
+        },
+        currentUser.user_id
+      )
+        .then(() => {
+          const queue = loadPendingWrites(cacheKey).filter(
+            pending => pending.id !== queueId
+          );
+
+          setPendingWrites(queue);
+          savePendingWrites(cacheKey, queue);
+          setStatusFromQueue(queue, false);
+
+          if (queue.length === 0) {
+            setLastSyncedAt(new Date());
+          }
+        })
+        .catch(error => {
+          console.warn(
+            'Optimistic Final Evaluation delete failed to sync:',
+            error?.message || error
+          );
+
+          const queue = loadPendingWrites(cacheKey).map(pending =>
+            pending.id === queueId
+              ? {
+                  ...pending,
+                  status: 'FAILED' as const,
+                  error:
+                    error?.message ||
+                    'Gagal menyinkronkan penghapusan evaluasi akhir',
+                  retryCount: (pending.retryCount || 0) + 1
+                }
+              : pending
+          );
+
+          setPendingWrites(queue);
+          savePendingWrites(cacheKey, queue);
+          setStatusFromQueue(queue, false);
+        });
+
       return { success: true };
     },
     [
@@ -1759,6 +1996,7 @@ export const TeacherWorkspaceProvider: React.FC<{
         saveAssessmentOptimistic,
         deleteAssessmentOptimistic,
         saveFinalEvaluationOptimistic,
+        deleteFinalEvaluationOptimistic,
         applyBulkAttendanceOptimistic,
         retryPendingWrites
       }}

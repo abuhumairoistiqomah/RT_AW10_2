@@ -16,7 +16,8 @@ import {
   UserCheck,
   RefreshCw,
   ArrowRight,
-  Loader2
+  Loader2,
+  Trash2
 } from 'lucide-react';
 import { SurahAutocomplete } from '../common/SurahAutocomplete';
 
@@ -58,6 +59,7 @@ export const FinalEvaluation: React.FC<FinalEvaluationProps> = ({
     isLoading,
     isRevalidating,
     saveFinalEvaluationOptimistic,
+    deleteFinalEvaluationOptimistic,
     activeHalaqahId,
     setActiveHalaqahId,
     selectedTeacherId,
@@ -69,7 +71,13 @@ export const FinalEvaluation: React.FC<FinalEvaluationProps> = ({
     currentUser?.role === 'ADMIN' ||
     currentUser?.role === 'COORDINATOR';
 
+  const canDeleteFinalEvaluation =
+    currentUser?.role === 'ADMIN' ||
+    currentUser?.role === 'TEACHER';
+
   const [submitting, setSubmitting] = useState(false);
+  const [deleting, setDeleting] = useState(false);
+  const [showDeleteConfirm, setShowDeleteConfirm] = useState(false);
   const [successMsg, setSuccessMsg] = useState('');
   const [errorMsg, setErrorMsg] = useState('');
   const [toast, setToast] = useState<{
@@ -411,38 +419,47 @@ export const FinalEvaluation: React.FC<FinalEvaluationProps> = ({
     // a temporary server response is empty/stale.
   }, [selectedStudentId, evaluations, selectedStudent]);
 
+  const hasCompleteQuranRange = (): boolean => {
+    return Boolean(
+      evalSurahStart != null &&
+      evalAyahStart !== '' &&
+      evalSurahEnd != null &&
+      evalAyahEnd !== ''
+    );
+  };
+
   const validateForm = (): string | null => {
     if (!selectedStudentId) {
       return 'Pilih siswa terlebih dahulu.';
     }
 
-    if (evalSurahStart) {
-      if (!evalAyahStart || Number(evalAyahStart) < 1) {
-        return 'Ayat awal evaluasi harus angka positif.';
+    // Capaian Al-Qur'an sepenuhnya OPSIONAL untuk semua status skill.
+    // Jika keempat field lengkap, validasi nilainya. Jika kosong atau hanya
+    // sebagian terisi, evaluasi tetap boleh disimpan dan range tidak dikirim.
+    if (hasCompleteQuranRange()) {
+      const startAyah = Number(evalAyahStart);
+      const endAyah = Number(evalAyahEnd);
+
+      if (startAyah < 1 || endAyah < 1) {
+        return 'Ayat evaluasi harus berupa angka positif.';
       }
 
-      const result = validateAyah(
-        evalSurahStart,
-        Number(evalAyahStart)
+      const startResult = validateAyah(
+        Number(evalSurahStart),
+        startAyah
       );
 
-      if (!result.valid) {
-        return `Ayat awal evaluasi tidak valid: ${result.message}`;
-      }
-    }
-
-    if (evalSurahEnd) {
-      if (!evalAyahEnd || Number(evalAyahEnd) < 1) {
-        return 'Ayat akhir evaluasi harus angka positif.';
+      if (!startResult.valid) {
+        return `Ayat awal evaluasi tidak valid: ${startResult.message}`;
       }
 
-      const result = validateAyah(
-        evalSurahEnd,
-        Number(evalAyahEnd)
+      const endResult = validateAyah(
+        Number(evalSurahEnd),
+        endAyah
       );
 
-      if (!result.valid) {
-        return `Ayat akhir evaluasi tidak valid: ${result.message}`;
+      if (!endResult.valid) {
+        return `Ayat akhir evaluasi tidak valid: ${endResult.message}`;
       }
     }
 
@@ -471,36 +488,41 @@ export const FinalEvaluation: React.FC<FinalEvaluationProps> = ({
     return null;
   };
 
-  const buildPayload = () => ({
-    student_id: selectedStudentId,
-    participant_id: selectedStudent?.participant_id,
-    evaluation_surah_start:
-      evalSurahStart != null
+  const buildPayload = () => {
+    const includeQuranRange = hasCompleteQuranRange();
+
+    return {
+      student_id: selectedStudentId,
+      participant_id: selectedStudent?.participant_id,
+
+      // Partial/default Quran range is intentionally discarded. This prevents
+      // NON-BBL / Nuroniyyah / Iqra evaluations from being rejected merely
+      // because one auto-filled Quran field happens to exist.
+      evaluation_surah_start: includeQuranRange
         ? Number(evalSurahStart)
         : undefined,
-    evaluation_ayah_start:
-      evalAyahStart !== ''
+      evaluation_ayah_start: includeQuranRange
         ? Number(evalAyahStart)
         : undefined,
-    evaluation_surah_end:
-      evalSurahEnd != null
+      evaluation_surah_end: includeQuranRange
         ? Number(evalSurahEnd)
         : undefined,
-    evaluation_ayah_end:
-      evalAyahEnd !== ''
+      evaluation_ayah_end: includeQuranRange
         ? Number(evalAyahEnd)
         : undefined,
-    final_score:
-      finalScore !== ''
-        ? Number(finalScore)
-        : undefined,
-    completion_status: completionStatus,
-    skill_status_end: skillStatusEnd,
-    affective_rating: affectiveGrade || undefined,
-    affective_note: affectiveNote,
-    evaluator_notes: finalNote,
-    evaluator_teacher_id: currentUser?.teacher_id || ''
-  });
+
+      final_score:
+        finalScore !== ''
+          ? Number(finalScore)
+          : undefined,
+      completion_status: completionStatus,
+      skill_status_end: skillStatusEnd,
+      affective_rating: affectiveGrade || undefined,
+      affective_note: affectiveNote,
+      evaluator_notes: finalNote,
+      evaluator_teacher_id: currentUser?.teacher_id || ''
+    };
+  };
 
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
@@ -675,6 +697,73 @@ export const FinalEvaluation: React.FC<FinalEvaluationProps> = ({
       });
     } finally {
       setSubmitting(false);
+    }
+  };
+
+
+  const handleDeleteFinalEvaluation = async () => {
+    if (!selectedStudent || !existingEvaluationId) {
+      setShowDeleteConfirm(false);
+      return;
+    }
+
+    setDeleting(true);
+    setErrorMsg('');
+    setSuccessMsg('');
+
+    try {
+      const result = await deleteFinalEvaluationOptimistic({
+        finalEvaluationId: existingEvaluationId,
+        participantId: selectedStudent.participant_id,
+        studentId: selectedStudent.student_id
+      });
+
+      if (result?.success === false) {
+        throw new Error(
+          result.error || 'Gagal menghapus evaluasi akhir.'
+        );
+      }
+
+      const studentName = selectedStudent.full_name || 'siswa';
+
+      // Context already removed the evaluation locally. Explicitly reset the
+      // current form because the anti-reset hydration intentionally refuses to
+      // blank a same-student form merely due to background data changes.
+      hydrateDefaultsForStudent(selectedStudent);
+      hydratedStudentIdRef.current = selectedStudentId;
+      markClean();
+      setShowDeleteConfirm(false);
+
+      setSuccessMsg(
+        `✓ Evaluasi akhir ${studentName} dibatalkan. Status kembali menjadi Belum Dievaluasi.`
+      );
+
+      setToast({
+        type: 'success',
+        message: '✓ Evaluasi akhir dihapus.',
+        detail:
+          `Evaluasi ${studentName} dibatalkan. Presensi dan penilaian per sesi tetap aman. Sinkronisasi berjalan di latar belakang.`
+      });
+
+      setTimeout(() => {
+        formTopRef.current?.scrollIntoView({
+          behavior: 'smooth',
+          block: 'start'
+        });
+      }, 60);
+    } catch (err: any) {
+      const message =
+        err?.message || 'Terjadi kesalahan saat menghapus evaluasi akhir.';
+
+      setErrorMsg('Gagal menghapus evaluasi akhir: ' + message);
+      setToast({
+        type: 'error',
+        message: 'Gagal menghapus evaluasi akhir.',
+        detail: message
+      });
+      setShowDeleteConfirm(false);
+    } finally {
+      setDeleting(false);
     }
   };
 
@@ -1059,9 +1148,14 @@ export const FinalEvaluation: React.FC<FinalEvaluationProps> = ({
         </div>
 
         <div className="space-y-3 pt-2">
-          <label className="block text-xs font-bold uppercase tracking-wider text-slate-600">
-            Capaian Akhir Evaluasi (Surah & Ayat)
-          </label>
+          <div>
+            <label className="block text-xs font-bold uppercase tracking-wider text-slate-600">
+              Capaian Akhir Evaluasi (Surah & Ayat)
+            </label>
+            <p className="mt-1 text-[11px] text-slate-500">
+              Opsional. Boleh dikosongkan apabila siswa belum memiliki capaian/setoran Al-Qur'an pada evaluasi ini.
+            </p>
+          </div>
 
           <div className="grid grid-cols-1 md:grid-cols-2 gap-4 p-4 bg-slate-50 border border-slate-200 rounded-lg">
             <div className="space-y-3">
@@ -1294,7 +1388,7 @@ export const FinalEvaluation: React.FC<FinalEvaluationProps> = ({
         <div className="flex flex-col sm:flex-row items-center gap-3 pt-2">
           <button
             type="submit"
-            disabled={submitting}
+            disabled={submitting || deleting}
             className="w-full sm:flex-1 py-3.5 bg-purple-600 hover:bg-purple-700 active:bg-purple-800 text-white font-bold text-sm rounded-xl shadow-sm transition flex items-center justify-center space-x-2 disabled:opacity-50 min-h-[44px]"
           >
             {submitting ? (
@@ -1311,7 +1405,7 @@ export const FinalEvaluation: React.FC<FinalEvaluationProps> = ({
 
           <button
             type="button"
-            disabled={submitting}
+            disabled={submitting || deleting}
             onClick={handleSaveAndNext}
             className="w-full sm:flex-1 py-3.5 bg-slate-900 hover:bg-slate-800 active:bg-slate-950 text-white font-bold text-sm rounded-xl shadow-sm transition flex items-center justify-center space-x-2 disabled:opacity-50 min-h-[44px]"
           >
@@ -1329,8 +1423,89 @@ export const FinalEvaluation: React.FC<FinalEvaluationProps> = ({
               <ArrowRight className="w-4 h-4 text-slate-400" />
             )}
           </button>
+
+          {canDeleteFinalEvaluation && existingEvaluationId && (
+            <button
+              type="button"
+              disabled={submitting || deleting}
+              onClick={() => setShowDeleteConfirm(true)}
+              className="w-full sm:w-auto px-4 py-3.5 bg-white hover:bg-rose-50 active:bg-rose-100 text-rose-700 font-bold text-sm rounded-xl border border-rose-300 shadow-sm transition flex items-center justify-center space-x-2 disabled:opacity-50 min-h-[44px]"
+            >
+              {deleting ? (
+                <Loader2 className="w-4 h-4 animate-spin" />
+              ) : (
+                <Trash2 className="w-4 h-4" />
+              )}
+              <span>
+                {deleting ? 'Menghapus...' : 'Hapus Evaluasi'}
+              </span>
+            </button>
+          )}
         </div>
       </form>
+
+      {showDeleteConfirm && selectedStudent && existingEvaluationId && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-slate-950/45 backdrop-blur-[1px]">
+          <div className="w-full max-w-md bg-white rounded-2xl shadow-2xl border border-slate-200 overflow-hidden animate-in fade-in zoom-in-95">
+            <div className="p-5 sm:p-6 space-y-4">
+              <div className="flex items-start gap-3">
+                <div className="w-10 h-10 rounded-full bg-rose-50 text-rose-600 flex items-center justify-center shrink-0 border border-rose-100">
+                  <Trash2 className="w-5 h-5" />
+                </div>
+
+                <div className="space-y-1 min-w-0">
+                  <h3 className="text-base font-bold text-slate-900">
+                    Hapus Evaluasi Akhir?
+                  </h3>
+                  <p className="text-xs leading-relaxed text-slate-600">
+                    Evaluasi akhir untuk{' '}
+                    <strong className="text-slate-900">
+                      {selectedStudent.full_name}
+                    </strong>{' '}
+                    akan dibatalkan dan statusnya kembali menjadi{' '}
+                    <strong>Belum Dievaluasi</strong>.
+                  </p>
+                </div>
+              </div>
+
+              <div className="p-3 bg-amber-50 border border-amber-200 rounded-lg text-[11px] leading-relaxed text-amber-900">
+                Presensi dan seluruh penilaian per sesi tidak akan dihapus.
+                Riwayat penghapusan tetap tercatat di Audit Log.
+                {formDirty && (
+                  <span className="block mt-1 font-semibold text-rose-700">
+                    Perubahan formulir yang belum disimpan juga akan dibuang.
+                  </span>
+                )}
+              </div>
+
+              <div className="flex flex-col-reverse sm:flex-row sm:justify-end gap-2 pt-1">
+                <button
+                  type="button"
+                  disabled={deleting}
+                  onClick={() => setShowDeleteConfirm(false)}
+                  className="px-4 py-2.5 rounded-lg border border-slate-300 bg-white hover:bg-slate-50 text-slate-700 text-xs font-bold transition disabled:opacity-50"
+                >
+                  Batal
+                </button>
+
+                <button
+                  type="button"
+                  disabled={deleting}
+                  onClick={handleDeleteFinalEvaluation}
+                  className="px-4 py-2.5 rounded-lg bg-rose-600 hover:bg-rose-700 text-white text-xs font-bold transition shadow-sm disabled:opacity-50 inline-flex items-center justify-center gap-2"
+                >
+                  {deleting ? (
+                    <Loader2 className="w-4 h-4 animate-spin" />
+                  ) : (
+                    <Trash2 className="w-4 h-4" />
+                  )}
+                  <span>{deleting ? 'Menghapus...' : 'Ya, Hapus Evaluasi'}</span>
+                </button>
+              </div>
+            </div>
+          </div>
+        </div>
+      )}
     </div>
   );
 };

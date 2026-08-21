@@ -1304,7 +1304,7 @@ function handleHealth() {
     return jsonResponse({
       status: 'ok',
       spreadsheetConnected: Boolean(ss),
-      backendVersion: 'RT-GS-3MODE-CANONICAL-2026-08-22-FLEX-FINAL-QURAN'
+      backendVersion: 'RT-GS-3MODE-CANONICAL-2026-08-22-FINAL-EVAL-SOFT-DELETE'
     });
   } catch (e) {
     return jsonError('SERVER_ERROR', 'Gagal terhubung ke Google Spreadsheet: ' + e.message);
@@ -1413,6 +1413,7 @@ function handlePostAndGetRouter(action, payload, authToken) {
     case 'bulkSaveSessionAttendance': return handleBulkSaveSessionAttendance(payload, authToken);
     case 'deleteSessionAssessment': return handleDeleteSessionAssessment(payload, authToken);
     case 'saveFinalEvaluation': return handleSaveFinalEvaluation(payload, authToken);
+    case 'deleteFinalEvaluation': return handleDeleteFinalEvaluation(payload, authToken);
 
     default:
       return jsonError('VALIDATION_ERROR', 'Aksi API "' + action + '" tidak dikenal.');
@@ -2268,7 +2269,7 @@ function buildTeacherWorkspaceDataGS(session, payload) {
   });
 
   var finalEvaluations = readSheetObjects('14_FINAL_EVALUATIONS').filter(function(e) {
-    return cleanStringGS(e.event_id) === eventId && (
+    return !isDeletedRecordGS(e) && cleanStringGS(e.event_id) === eventId && (
       Boolean(studentIdSet[cleanStringGS(e.student_id)]) || Boolean(participantIdSet[cleanStringGS(e.participant_id)])
     );
   });
@@ -2396,7 +2397,9 @@ function handleGetSessionAssessments(payload, authToken) {
 function handleGetFinalEvaluations(payload, authToken) {
   var session = requireRole(authToken, [ROLES.TEACHER, ROLES.ADMIN, ROLES.COORDINATOR]);
   var eventId = resolveRequestedEventId(payload.eventId);
-  var evaluations = readSheetObjects('14_FINAL_EVALUATIONS');
+  var evaluations = readSheetObjects('14_FINAL_EVALUATIONS').filter(function(e) {
+    return !isDeletedRecordGS(e);
+  });
 
   if (eventId) evaluations = evaluations.filter(function(e) { return cleanStringGS(e.event_id) === eventId; });
 
@@ -2968,6 +2971,10 @@ function handleSaveFinalEvaluation(payload, authToken) {
     if (!evaluation.created_at) evaluation.created_at = saveNow;
   }
 
+  // Saving after a prior delete restores the same canonical row.
+  evaluation.is_deleted = false;
+  evaluation.deleted_at = '';
+  evaluation.deleted_by = '';
   evaluation.updated_at = saveNow;
 
   var status = upsertObject(
@@ -2989,6 +2996,212 @@ function handleSaveFinalEvaluation(payload, authToken) {
   );
 
   return jsonResponse(evaluation);
+}
+
+
+/**
+ * Soft-delete a Final Evaluation.
+ *
+ * Domain rule:
+ * - ACTIVE evaluation exists -> mark is_deleted = TRUE.
+ * - Already deleted / no active evaluation -> idempotent success when a canonical
+ *   deleted row exists; otherwise NOT_FOUND.
+ * - Teacher may delete only students in their assigned halaqah.
+ * - Admin may delete any participant evaluation.
+ * - Session assessments / attendance are never touched.
+ */
+function handleDeleteFinalEvaluation(payload, authToken) {
+  var actor = requireRole(authToken, [ROLES.TEACHER, ROLES.ADMIN]);
+
+  var participantId = cleanStringGS(
+    payload.participantId ||
+    payload.participant_id ||
+    (payload.finalEvaluation && payload.finalEvaluation.participant_id)
+  );
+
+  var studentId = cleanStringGS(
+    payload.studentId ||
+    payload.student_id ||
+    (payload.finalEvaluation && payload.finalEvaluation.student_id)
+  );
+
+  var requestedEvaluationId = cleanStringGS(
+    payload.finalEvaluationId ||
+    payload.final_evaluation_id ||
+    (payload.finalEvaluation && payload.finalEvaluation.final_evaluation_id)
+  );
+
+  if (!participantId && !studentId && !requestedEvaluationId) {
+    return jsonError(
+      'VALIDATION_ERROR',
+      'participantId / studentId / finalEvaluationId wajib tersedia untuk menghapus evaluasi akhir.'
+    );
+  }
+
+  var participant = null;
+  var participants = readSheetObjects('12_EVENT_PARTICIPANTS');
+
+  if (participantId) {
+    participant = participants.find(function(p) {
+      return cleanStringGS(p.participant_id) === participantId;
+    });
+  }
+
+  if (!participant && studentId) {
+    var resolvedEventId = resolveRequestedEventId(payload.eventId || payload.event_id);
+    participant = participants.find(function(p) {
+      return (
+        cleanStringGS(p.student_id) === studentId &&
+        (!resolvedEventId || cleanStringGS(p.event_id) === resolvedEventId)
+      );
+    });
+  }
+
+  if (!participant && !requestedEvaluationId) {
+    return jsonError('NOT_FOUND', 'Data peserta tidak ditemukan.');
+  }
+
+  if (participant && actor.role === ROLES.TEACHER) {
+    var allowed = getTeacherAuthorizedHalaqahIds(
+      actor.teacher_id,
+      participant.event_id
+    );
+
+    if (allowed.indexOf(cleanStringGS(participant.halaqah_id)) === -1) {
+      return jsonError(
+        'FORBIDDEN',
+        'Anda tidak berwenang menghapus evaluasi akhir siswa ini.'
+      );
+    }
+  }
+
+  var evaluations = readSheetObjects('14_FINAL_EVALUATIONS');
+  var evaluation = null;
+
+  // Exact persisted ID wins when available.
+  if (requestedEvaluationId && requestedEvaluationId.indexOf('FE-LOCAL-') !== 0) {
+    evaluation = evaluations.find(function(e) {
+      return cleanStringGS(e.final_evaluation_id) === requestedEvaluationId;
+    });
+  }
+
+  // Never let a spoofed/mismatched persisted ID escape the participant scope.
+  if (evaluation && participant) {
+    var idMatchesParticipant =
+      cleanStringGS(evaluation.event_id) === cleanStringGS(participant.event_id) &&
+      cleanStringGS(evaluation.participant_id) === cleanStringGS(participant.participant_id);
+
+    if (!idMatchesParticipant) {
+      evaluation = null;
+    }
+  }
+
+  // Canonical fallback: event + participant.
+  if (!evaluation && participant) {
+    evaluation = evaluations.find(function(e) {
+      return (
+        cleanStringGS(e.event_id) === cleanStringGS(participant.event_id) &&
+        cleanStringGS(e.participant_id) === cleanStringGS(participant.participant_id)
+      );
+    });
+  }
+
+  if (!evaluation) {
+    // Idempotent delete: if the participant is valid but no Final Evaluation row
+    // exists on the server, the requested end-state (NOT_EVALUATED) is already true.
+    if (participant) {
+      return jsonResponse({
+        success: true,
+        alreadyDeleted: true,
+        notFoundOnServer: true,
+        participantId: participant.participant_id,
+        studentId: participant.student_id
+      });
+    }
+
+    return jsonError('NOT_FOUND', 'Evaluasi akhir siswa tidak ditemukan.');
+  }
+
+  // If request came only by persisted ID, resolve participant now for authorization.
+  if (!participant) {
+    participant = participants.find(function(p) {
+      return (
+        cleanStringGS(p.participant_id) === cleanStringGS(evaluation.participant_id) ||
+        (
+          cleanStringGS(p.student_id) === cleanStringGS(evaluation.student_id) &&
+          cleanStringGS(p.event_id) === cleanStringGS(evaluation.event_id)
+        )
+      );
+    });
+
+    if (actor.role === ROLES.TEACHER) {
+      if (!participant) {
+        return jsonError('FORBIDDEN', 'Peserta evaluasi tidak dapat diverifikasi.');
+      }
+
+      var teacherAllowed = getTeacherAuthorizedHalaqahIds(
+        actor.teacher_id,
+        participant.event_id
+      );
+
+      if (teacherAllowed.indexOf(cleanStringGS(participant.halaqah_id)) === -1) {
+        return jsonError(
+          'FORBIDDEN',
+          'Anda tidak berwenang menghapus evaluasi akhir siswa ini.'
+        );
+      }
+    }
+  }
+
+  // Idempotent retry: already deleted means the desired final state is achieved.
+  if (isDeletedRecordGS(evaluation)) {
+    return jsonResponse({
+      success: true,
+      alreadyDeleted: true,
+      finalEvaluationId: evaluation.final_evaluation_id,
+      participantId: evaluation.participant_id,
+      studentId: evaluation.student_id
+    });
+  }
+
+  var deletedAt = nowIsoGS();
+  var updated = {
+    is_deleted: true,
+    deleted_at: deletedAt,
+    deleted_by: actor.user_id,
+    updated_at: deletedAt
+  };
+
+  var ok = updateObject(
+    '14_FINAL_EVALUATIONS',
+    'final_evaluation_id',
+    evaluation.final_evaluation_id,
+    updated
+  );
+
+  if (!ok) {
+    return jsonError('SERVER_ERROR', 'Gagal membatalkan evaluasi akhir siswa.');
+  }
+
+  addAuditLog(
+    'SOFT_DELETE_FINAL_EVALUATION',
+    'FINAL_EVALUATION',
+    evaluation.final_evaluation_id,
+    evaluation,
+    Object.assign({}, evaluation, updated),
+    'Evaluasi akhir dibatalkan. Penilaian sesi dan presensi tetap dipertahankan.',
+    actor.user_id,
+    evaluation.event_id
+  );
+
+  return jsonResponse({
+    success: true,
+    deleted: true,
+    finalEvaluationId: evaluation.final_evaluation_id,
+    participantId: evaluation.participant_id,
+    studentId: evaluation.student_id,
+    deletedAt: deletedAt
+  });
 }
 
 // ====================================================
@@ -3155,7 +3368,7 @@ function handleGetCompletenessReport(eventId, authToken) {
   assessments = resolveCanonicalAssessmentsGS(assessments);
 
   var evaluations = readSheetObjects('14_FINAL_EVALUATIONS').filter(function(e) {
-    return cleanStringGS(e.event_id) === resolvedEventId;
+    return !isDeletedRecordGS(e) && cleanStringGS(e.event_id) === resolvedEventId;
   });
   var sessionConfigs = readSheetObjects('09_SESSION_CONFIG').filter(function(sc) {
     return cleanStringGS(sc.event_id) === resolvedEventId && isActiveRecordGS(sc);
@@ -3577,7 +3790,7 @@ function handleGetExecutiveAnalytics(params, authToken) {
     assessments = resolveCanonicalAssessmentsGS(assessments);
 
     var evaluations = readSheetObjects('14_FINAL_EVALUATIONS').filter(function(e) {
-      return cleanStringGS(e.event_id) === eventId;
+      return !isDeletedRecordGS(e) && cleanStringGS(e.event_id) === eventId;
     });
 
     var assessmentsByStudent = {};
@@ -3804,7 +4017,7 @@ function handlePublicStudentProgress(payload) {
   assessments = resolveCanonicalAssessmentsGS(assessments);
 
   var evaluation = readSheetObjects('14_FINAL_EVALUATIONS').find(function(e) {
-    return cleanStringGS(e.event_id) === eventId && (
+    return !isDeletedRecordGS(e) && cleanStringGS(e.event_id) === eventId && (
       cleanStringGS(e.student_id) === cleanStringGS(student.student_id) ||
       cleanStringGS(e.participant_id) === cleanStringGS(participant.participant_id)
     );
@@ -4014,7 +4227,18 @@ function backendSelfCheckGS() {
       'teacher_id', 'is_deleted', 'created_at', 'updated_at',
       'deleted_at', 'deleted_by'
     ],
-    '14_FINAL_EVALUATIONS': ['final_evaluation_id', 'event_id', 'participant_id', 'student_id', 'completion_status', 'skill_status_end', 'evaluator_teacher_id'],
+    '14_FINAL_EVALUATIONS': [
+      'final_evaluation_id',
+      'event_id',
+      'participant_id',
+      'student_id',
+      'completion_status',
+      'skill_status_end',
+      'evaluator_teacher_id',
+      'is_deleted',
+      'deleted_at',
+      'deleted_by'
+    ],
     '15_AUDIT_LOG': ['log_id', 'timestamp', 'user_id', 'action', 'entity_type', 'entity_id'],
     '16_SESSIONS': ['session_token', 'user_id', 'role', 'teacher_id', 'created_at', 'last_seen_at', 'revoked', 'revoked_at']
   };

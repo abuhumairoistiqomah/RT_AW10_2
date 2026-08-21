@@ -180,6 +180,7 @@ function getRequestTimeoutMs(action: string): number {
     case 'saveSessionAssessment':
     case 'bulkSaveSessionAttendance':
     case 'saveFinalEvaluation':
+    case 'deleteFinalEvaluation':
     case 'saveStudent':
     case 'saveTeacher':
     case 'saveUser':
@@ -430,7 +431,7 @@ function saveData<T>(key: string, data: T): void {
 }
 
 
-type PendingWriteAction = 'saveSessionAssessment' | 'bulkSaveSessionAttendance' | 'saveFinalEvaluation';
+type PendingWriteAction = 'saveSessionAssessment' | 'bulkSaveSessionAttendance' | 'saveFinalEvaluation' | 'deleteFinalEvaluation';
 export interface PendingWriteItem {
   id: string;
   action: PendingWriteAction;
@@ -2259,7 +2260,8 @@ export class ApiService {
     if (!isMockMode) {
       return apiPost<FinalEvaluation[]>('getFinalEvaluations', { eventId });
     }
-    const evals = loadData<FinalEvaluation[]>(STORAGE_KEYS.FINAL_EVALUATIONS, INITIAL_FINAL_EVALUATIONS);
+    const evals = loadData<FinalEvaluation[]>(STORAGE_KEYS.FINAL_EVALUATIONS, INITIAL_FINAL_EVALUATIONS)
+      .filter(e => !(e as any).is_deleted);
     if (eventId) {
       return evals.filter(e => e.event_id === eventId);
     }
@@ -2278,7 +2280,8 @@ export class ApiService {
         ...old,
         ...fe,
         final_evaluation_id: old.final_evaluation_id,
-        updated_at: getCurrentIso()
+        updated_at: getCurrentIso(),
+        ...({ is_deleted: false, deleted_at: '', deleted_by: '' } as any)
       };
       evals[idx] = updatedItem;
       saveData(STORAGE_KEYS.FINAL_EVALUATIONS, evals);
@@ -2290,6 +2293,102 @@ export class ApiService {
       await this.addAuditLog('SAVE_FINAL_EVALUATION', 'FINAL_EVALUATION', fe.final_evaluation_id, undefined, JSON.stringify(fe), undefined, actorUserId || fe.evaluator_teacher_id, fe.event_id);
       return fe;
     }
+  }
+
+
+  /**
+   * Soft-delete Final Evaluation.
+   * Production is a single POST; Code.gs resolves authorization and canonical row.
+   * Mock mode keeps the row but marks it deleted so a later save can restore it.
+   */
+  static async deleteFinalEvaluation(params: {
+    finalEvaluationId?: string;
+    participantId?: string;
+    studentId?: string;
+    eventId?: string;
+  }, actorUserId?: string): Promise<{
+    success: boolean;
+    deleted?: boolean;
+    alreadyDeleted?: boolean;
+    finalEvaluationId?: string;
+    participantId?: string;
+    studentId?: string;
+    deletedAt?: string;
+  }> {
+    const payload = {
+      finalEvaluationId: params.finalEvaluationId || '',
+      participantId: params.participantId || '',
+      studentId: params.studentId || '',
+      eventId: params.eventId || ''
+    };
+
+    if (!payload.finalEvaluationId && !payload.participantId && !payload.studentId) {
+      throw new Error('Evaluasi akhir yang akan dihapus tidak dapat diidentifikasi.');
+    }
+
+    if (!isMockMode) {
+      return apiPost('deleteFinalEvaluation', payload);
+    }
+
+    const evals = loadData<any[]>(STORAGE_KEYS.FINAL_EVALUATIONS, INITIAL_FINAL_EVALUATIONS as any);
+    const idx = evals.findIndex(e =>
+      (payload.finalEvaluationId && e.final_evaluation_id === payload.finalEvaluationId) ||
+      (
+        payload.participantId &&
+        e.participant_id === payload.participantId &&
+        (!payload.eventId || e.event_id === payload.eventId)
+      ) ||
+      (
+        payload.studentId &&
+        e.student_id === payload.studentId &&
+        (!payload.eventId || e.event_id === payload.eventId)
+      )
+    );
+
+    if (idx < 0) {
+      throw new Error('Evaluasi akhir siswa tidak ditemukan.');
+    }
+
+    if (evals[idx].is_deleted) {
+      return {
+        success: true,
+        alreadyDeleted: true,
+        finalEvaluationId: evals[idx].final_evaluation_id,
+        participantId: evals[idx].participant_id,
+        studentId: evals[idx].student_id
+      };
+    }
+
+    const old = { ...evals[idx] };
+    const deletedAt = getCurrentIso();
+    evals[idx] = {
+      ...evals[idx],
+      is_deleted: true,
+      deleted_at: deletedAt,
+      deleted_by: actorUserId || getStoredUser()?.user_id || 'SYSTEM',
+      updated_at: deletedAt
+    };
+    saveData(STORAGE_KEYS.FINAL_EVALUATIONS, evals);
+
+    await this.addAuditLog(
+      'SOFT_DELETE_FINAL_EVALUATION',
+      'FINAL_EVALUATION',
+      evals[idx].final_evaluation_id,
+      JSON.stringify(old),
+      JSON.stringify(evals[idx]),
+      'Evaluasi akhir dibatalkan; penilaian sesi dan presensi tidak dihapus.',
+      actorUserId,
+      evals[idx].event_id
+    );
+
+    return {
+      success: true,
+      deleted: true,
+      finalEvaluationId: evals[idx].final_evaluation_id,
+      participantId: evals[idx].participant_id,
+      studentId: evals[idx].student_id,
+      deletedAt
+    };
   }
 
   // Audit Log
@@ -2699,15 +2798,9 @@ export class ApiService {
     const aStart = payload.evaluation_ayah_start ?? payload.start_ayah;
     const sEnd = payload.evaluation_surah_end ?? payload.end_surah;
     const aEnd = payload.evaluation_ayah_end ?? payload.end_ayah;
-    const skill = String(payload.skill_status_end).toUpperCase();
-
-    if (
-      (skill === 'BBL' || skill === 'BBLS') &&
-      (sStart == null || aStart == null || sEnd == null || aEnd == null)
-    ) {
-      throw new Error('Jangkauan Surah dan Ayat evaluasi akhir wajib diisi.');
-    }
-
+    // Quran range is optional for every skill status. The FinalEvaluation form
+    // only sends it when all four fields are complete; Code.gs also accepts
+    // empty/partial input without blocking the evaluation.
     const teacherId = (payload.evaluator_teacher_id || payload.teacher_id || '').trim();
 
     if (!isMockMode) {
