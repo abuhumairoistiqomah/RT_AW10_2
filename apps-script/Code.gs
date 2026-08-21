@@ -1304,7 +1304,7 @@ function handleHealth() {
     return jsonResponse({
       status: 'ok',
       spreadsheetConnected: Boolean(ss),
-      backendVersion: 'RT-GS-3MODE-CANONICAL-2026-08-22-FINAL-EVAL-SOFT-DELETE'
+      backendVersion: 'RT-GS-3MODE-CANONICAL-2026-08-22-FINAL-EVAL-AUTO-PRESENT'
     });
   } catch (e) {
     return jsonError('SERVER_ERROR', 'Gagal terhubung ke Google Spreadsheet: ' + e.message);
@@ -2827,6 +2827,178 @@ function handleDeleteSessionAssessment(payload, authToken) {
 // 18. FINAL EVALUATION
 // ====================================================
 
+/**
+ * TRACE ON: Final Evaluation -> automatic attendance for FINAL SESSION.
+ *
+ * Domain rules:
+ * - Final session = highest ACTIVE session_no for the participant's session group.
+ * - No assessment / UNASSESSED -> mark PRESENT attendance-only.
+ * - PRESENT -> keep as-is. Never erase existing setoran/content.
+ * - SICK / PERMISSION / ABSENT -> keep as-is. Never override explicit attendance.
+ * - Auto attendance is an attendance shell only:
+ *     attendance_status = PRESENT
+ *     assessment_status = PENDING
+ *     assessment_mode = ''
+ *     no Quran/Nuroniyyah/Iqra progress fields
+ * - Saving Final Evaluation must not fail merely because auto-attendance cannot run.
+ */
+function ensureFinalSessionPresentFromEvaluationGS(participant, evaluatorTeacherId, actorUserId) {
+  try {
+    if (!participant) {
+      return { changed: false, reason: 'PARTICIPANT_NOT_FOUND' };
+    }
+
+    var eventId = cleanStringGS(participant.event_id);
+    var participantId = cleanStringGS(participant.participant_id);
+    var studentId = cleanStringGS(participant.student_id);
+    var halaqahId = cleanStringGS(participant.halaqah_id);
+
+    if (!eventId || !participantId) {
+      return { changed: false, reason: 'PARTICIPANT_KEY_INCOMPLETE' };
+    }
+
+    var sessionGroupId = cleanStringGS(participant.session_group_id);
+
+    if (!sessionGroupId && halaqahId) {
+      var halaqah = readSheetObjects('10_HALAQAH').find(function(h) {
+        return (
+          cleanStringGS(h.event_id) === eventId &&
+          cleanStringGS(h.halaqah_id) === halaqahId
+        );
+      });
+
+      if (halaqah) {
+        sessionGroupId = cleanStringGS(halaqah.session_group_id);
+      }
+    }
+
+    if (!sessionGroupId) {
+      return { changed: false, reason: 'SESSION_GROUP_NOT_FOUND' };
+    }
+
+    var sessionConfigs = readSheetObjects('09_SESSION_CONFIG')
+      .filter(function(sc) {
+        return (
+          cleanStringGS(sc.event_id) === eventId &&
+          cleanStringGS(sc.session_group_id) === sessionGroupId &&
+          isActiveRecordGS(sc)
+        );
+      })
+      .sort(function(a, b) {
+        return (Number(b.session_no) || 0) - (Number(a.session_no) || 0);
+      });
+
+    if (!sessionConfigs.length) {
+      return { changed: false, reason: 'FINAL_SESSION_NOT_FOUND' };
+    }
+
+    var finalSession = sessionConfigs[0];
+    var sessionConfigId = cleanStringGS(finalSession.session_config_id);
+
+    if (!sessionConfigId) {
+      return { changed: false, reason: 'FINAL_SESSION_ID_MISSING' };
+    }
+
+    var existing = getCanonicalAssessmentForKeyGS(
+      eventId,
+      participantId,
+      sessionConfigId
+    );
+
+    if (existing) {
+      var existingAttendance = upperGS(existing.attendance_status || 'UNASSESSED');
+
+      // Never override an explicit/manual attendance decision.
+      if (
+        existingAttendance === 'PRESENT' ||
+        existingAttendance === 'SICK' ||
+        existingAttendance === 'PERMISSION' ||
+        existingAttendance === 'ABSENT'
+      ) {
+        return {
+          changed: false,
+          reason: 'EXISTING_ATTENDANCE_PRESERVED',
+          attendance_status: existingAttendance,
+          assessment_id: existing.assessment_id || ''
+        };
+      }
+    }
+
+    var now = nowIsoGS();
+    var assessment = existing
+      ? Object.assign({}, existing)
+      : {
+          assessment_id: makeIdGS('ASM_', 16),
+          event_id: eventId,
+          participant_id: participantId,
+          student_id: studentId,
+          halaqah_id: halaqahId,
+          session_config_id: sessionConfigId,
+          created_at: now
+        };
+
+    assessment.event_id = eventId;
+    assessment.event_day_id = finalSession.event_day_id || '';
+    assessment.session_config_id = sessionConfigId;
+    assessment.participant_id = participantId;
+    assessment.student_id = studentId;
+    assessment.halaqah_id = halaqahId;
+    assessment.session_no = finalSession.session_no;
+    assessment.attendance_status = 'PRESENT';
+    assessment.assessment_status = 'PENDING';
+    assessment.assessment_mode = '';
+    assessment.teacher_id = cleanStringGS(evaluatorTeacherId);
+    assessment.is_deleted = false;
+    assessment.deleted_at = '';
+    assessment.deleted_by = '';
+    assessment.updated_at = now;
+
+    // Critical: auto-present means attendance only, never fake a setoran.
+    clearAllProgressFieldsGS(assessment);
+    assessment.assessment_mode = '';
+    assessment.assessment_status = 'PENDING';
+
+    var saveStatus = upsertObject(
+      '13_SESSION_ASSESSMENTS',
+      ['event_id', 'participant_id', 'session_config_id'],
+      assessment,
+      'assessment_id'
+    );
+
+    addAuditLog(
+      'AUTO_PRESENT_FROM_FINAL_EVALUATION',
+      'SESSION_ASSESSMENT',
+      assessment.assessment_id,
+      existing || null,
+      assessment,
+      'Presensi final session otomatis karena Evaluasi Akhir disimpan. Tidak membuat setoran.',
+      actorUserId || 'SYSTEM',
+      eventId
+    );
+
+    return {
+      changed: true,
+      status: saveStatus,
+      assessment_id: assessment.assessment_id,
+      session_config_id: sessionConfigId,
+      session_no: finalSession.session_no,
+      attendance_status: 'PRESENT'
+    };
+  } catch (error) {
+    // Final Evaluation itself must remain safe even if attendance automation fails.
+    Logger.log(
+      'AUTO_PRESENT_FROM_FINAL_EVALUATION failed: ' +
+      (error && error.message ? error.message : String(error))
+    );
+
+    return {
+      changed: false,
+      reason: 'AUTO_PRESENT_ERROR',
+      error: error && error.message ? error.message : String(error)
+    };
+  }
+}
+
 function handleSaveFinalEvaluation(payload, authToken) {
   var actor = requireRole(authToken, [ROLES.TEACHER, ROLES.ADMIN]);
   var evaluation = Object.assign({}, payload.finalEvaluation || {});
@@ -2994,6 +3166,17 @@ function handleSaveFinalEvaluation(payload, authToken) {
     actor.user_id,
     evaluation.event_id
   );
+
+  // TRACE ON: saving Final Evaluation implies presence at the FINAL SESSION,
+  // but only when attendance is still empty/UNASSESSED. Explicit absence is sacred.
+  var autoAttendanceResult = ensureFinalSessionPresentFromEvaluationGS(
+    participant,
+    evaluation.evaluator_teacher_id,
+    actor.user_id
+  );
+
+  // Helpful for debugging; ignored safely by older frontends.
+  evaluation.auto_attendance = autoAttendanceResult;
 
   return jsonResponse(evaluation);
 }
