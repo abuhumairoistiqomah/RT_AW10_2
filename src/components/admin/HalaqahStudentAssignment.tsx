@@ -136,15 +136,21 @@ export const HalaqahStudentAssignment: React.FC = () => {
   const registeredCount = activeMasterStudents.filter(s => participantMap.has(s.student_id)).length;
   const unregisteredCount = totalMasterCount - registeredCount;
 
+  // Search helper: aman jika ada field null / undefined / kosong dari Spreadsheet
+  const normalizeSearchText = (value: unknown): string =>
+    String(value ?? '').trim().toLowerCase();
+
+  const normalizedSearch = normalizeSearchText(search);
+
   // Filtered Students List from Master Students
   const filteredStudents = activeMasterStudents.filter(s => {
     const p = participantMap.get(s.student_id);
     const isRegistered = Boolean(p);
 
     const matchesSearch =
-      search.trim() === '' ||
-      s.full_name.toLowerCase().includes(search.toLowerCase()) ||
-      s.nis.toLowerCase().includes(search.toLowerCase());
+      normalizedSearch === '' ||
+      normalizeSearchText(s.full_name).includes(normalizedSearch) ||
+      normalizeSearchText(s.nis).includes(normalizedSearch);
 
     const matchesClass = classFilter === 'ALL' || s.class_name === classFilter;
     const matchesGender = genderFilter === 'ALL' || s.gender === genderFilter;

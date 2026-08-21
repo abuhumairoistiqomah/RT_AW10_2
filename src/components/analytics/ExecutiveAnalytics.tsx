@@ -533,23 +533,77 @@ export const ExecutiveAnalytics: React.FC = () => {
 
           {/* Section 5: Distribution Buckets */}
           <div className="bg-white p-6 rounded-2xl border border-slate-200 shadow-sm space-y-4">
-            <h3 className="text-sm font-bold text-slate-900 flex items-center space-x-2">
-              <PieChart className="w-4 h-4 text-emerald-600" />
-              <span>Distribusi Kelompok Capaian Baris (Hanya Data Valid)</span>
-            </h3>
+  <div>
+    <h3 className="text-sm font-bold text-slate-900 flex items-center space-x-2">
+      <PieChart className="w-4 h-4 text-emerald-600" />
+      <span>Distribusi Kelompok Capaian Baris</span>
+    </h3>
 
-            <div className="grid grid-cols-1 sm:grid-cols-2 md:grid-cols-4 gap-3">
-              {data.distributionBuckets.map((b: any) => (
-                <div key={b.range} className="p-3.5 bg-slate-50 rounded-xl border border-slate-200">
-                  <span className="text-xs font-bold text-slate-800 block">{b.range}</span>
-                  <div className="flex items-baseline space-x-2 mt-1">
-                    <span className="text-xl font-black text-emerald-900">{b.count}</span>
-                    <span className="text-xs text-slate-500 font-semibold">Siswa ({b.percentage}%)</span>
-                  </div>
-                </div>
-              ))}
-            </div>
+    <p className="text-xs text-slate-500 mt-1">
+      Seluruh peserta masuk tepat satu kategori. Capaian 0 baris dibedakan
+      antara belum presensi, sakit/izin/alpa, hadir tanpa aktivitas,
+      dan hadir dengan aktivitas lain seperti Nuroniyyah, Iqra, atau catatan guru
+      (misalnya murojaah per juz).
+    </p>
+  </div>
+
+  <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 xl:grid-cols-5 gap-3">
+    {(data.distributionBuckets || []).map((b: any) => {
+      const isZeroStatus = String(b.range || '').startsWith('0 Baris');
+      const isOtherActivity = b.code === 'ZERO_PRESENT_OTHER_ACTIVITY';
+
+      return (
+        <div
+          key={b.code || b.range}
+          className={`p-3.5 rounded-xl border ${
+            isOtherActivity
+              ? 'bg-sky-50/70 border-sky-200'
+              : isZeroStatus
+              ? 'bg-amber-50/60 border-amber-200'
+              : 'bg-emerald-50/40 border-emerald-200'
+          }`}
+        >
+          <span
+            className={`text-xs font-bold block ${
+              isOtherActivity
+                ? 'text-sky-900'
+                : isZeroStatus
+                ? 'text-amber-900'
+                : 'text-emerald-950'
+            }`}
+          >
+            {b.range}
+          </span>
+
+          <div className="flex items-baseline space-x-2 mt-1">
+            <span
+              className={`text-xl font-black ${
+                isOtherActivity
+                  ? 'text-sky-800'
+                  : isZeroStatus
+                  ? 'text-amber-800'
+                  : 'text-emerald-900'
+              }`}
+            >
+              {b.count}
+            </span>
+
+            <span className="text-xs text-slate-500 font-semibold">
+              Siswa ({b.percentage}%)
+            </span>
           </div>
+        </div>
+      );
+    })}
+  </div>
+
+  <div className="text-[11px] text-slate-500 bg-slate-50 border border-slate-200 rounded-xl px-3 py-2">
+    Catatan: kategori “Hadir (Nuroniyyah / Iqra / Ada Catatan)” mencakup siswa
+    dengan total Ziyadah 0 tetapi memiliki aktivitas non-Ziyadah atau catatan guru,
+    termasuk murojaah. Statistik mean, median, CV, box plot, dan outlier tetap
+    menggunakan data Ziyadah valid saja.
+  </div>
+</div>
         </div>
       ) : analyticsMode === 'ANNUAL' ? (
         /* ANNUAL COMPARISON MODE */

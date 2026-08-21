@@ -8329,40 +8329,175 @@ function calculateStatsGS(values) {
   };
 }
 
+// PATCH V2 Code.gs
+// Distribusi Ziyadah utama:
+// - 0 Baris — Belum Presensi
+// - 0 Baris — Sakit / Izin / Alpa
+// - 0 Baris — Hadir Tanpa Catatan/Aktivitas
+// - 0 Baris — Hadir (Nuroniyyah / Iqra / Ada Catatan)
+// - 1–5 Baris
+// - 6–14 Baris
+// - 15–21 Baris
+// - 22–40 Baris
+// - > 40 Baris
+//
+// Replace seluruh function getDistributionBucketsGS(...) lama dengan ini.
+// Lalu untuk distribusi utama Ziyadah panggil:
+// getDistributionBucketsGS(ziyadahTotals, participants, assessmentsByStudent)
+//
+// Nuroniyyah/Iqra analytics lain tetap boleh memanggil:
+// getDistributionBucketsGS(values)
+
 function getDistributionBucketsGS(
-  values
+  values,
+  participants,
+  assessmentsByStudent
 ) {
+  if (
+    Array.isArray(participants) &&
+    assessmentsByStudent &&
+    typeof assessmentsByStudent === 'object'
+  ) {
+    var detailedBuckets = [
+      { code: 'ZERO_NOT_ATTENDED', range: '0 Baris — Belum Presensi', count: 0 },
+      { code: 'ZERO_ABSENCE', range: '0 Baris — Sakit / Izin / Alpa', count: 0 },
+      { code: 'ZERO_PRESENT_EMPTY', range: '0 Baris — Hadir Tanpa Catatan/Aktivitas', count: 0 },
+      { code: 'ZERO_PRESENT_OTHER_ACTIVITY', range: '0 Baris — Hadir (Nuroniyyah / Iqra / Ada Catatan)', count: 0 },
+      { code: 'RANGE_1_5', range: '1–5 Baris', count: 0 },
+      { code: 'RANGE_6_14', range: '6–14 Baris', count: 0 },
+      { code: 'RANGE_15_21', range: '15–21 Baris', count: 0 },
+      { code: 'RANGE_22_40', range: '22–40 Baris', count: 0 },
+      { code: 'RANGE_OVER_40', range: '> 40 Baris', count: 0 }
+    ];
+
+    var bucketMap = {};
+    detailedBuckets.forEach(function(bucket) {
+      bucketMap[bucket.code] = bucket;
+    });
+
+    participants.forEach(function(p) {
+      var sid = cleanStringGS(p.student_id);
+      var studentAssessments = assessmentsByStudent[sid] || [];
+
+      var summary = summarizeAssessmentsByModeGS(studentAssessments);
+      var totalZiyadah = Number(summary.ziyadahLines);
+
+      if (!isFinite(totalZiyadah) || isNaN(totalZiyadah) || totalZiyadah < 0) {
+        totalZiyadah = 0;
+      }
+
+      // Jika ada capaian Ziyadah positif, langsung masuk bucket capaian.
+      if (totalZiyadah > 0) {
+        if (totalZiyadah <= 5) bucketMap.RANGE_1_5.count++;
+        else if (totalZiyadah <= 14) bucketMap.RANGE_6_14.count++;
+        else if (totalZiyadah <= 21) bucketMap.RANGE_15_21.count++;
+        else if (totalZiyadah <= 40) bucketMap.RANGE_22_40.count++;
+        else bucketMap.RANGE_OVER_40.count++;
+        return;
+      }
+
+      var hasPresent = false;
+      var hasAbsence = false;
+
+      // Aktivitas sah walau Ziyadah = 0:
+      // - Nuroniyyah
+      // - Iqra
+      // - Catatan guru, termasuk murojaah per juz
+      var hasOtherPresentActivity = false;
+
+      studentAssessments.forEach(function(a) {
+        var attendance = upperGS(a.attendance_status);
+
+        if (attendance === 'PRESENT') {
+          hasPresent = true;
+
+          var mode = upperGS(a.assessment_mode);
+
+          if (
+            mode === ASSESSMENT_MODES.NURONIYYAH ||
+            mode === ASSESSMENT_MODES.IQRA ||
+            cleanStringGS(a.session_note)
+          ) {
+            hasOtherPresentActivity = true;
+          }
+
+          // Legacy safety:
+          // jika assessment_mode kosong tetapi field Nuroniyyah/Iqra terisi,
+          // tetap dianggap aktivitas non-Ziyadah.
+          if (
+            hasValueGS(a.nuroniyyah_dars) ||
+            hasValueGS(a.iqra_level) ||
+            hasValueGS(a.iqra_page_start) ||
+            hasValueGS(a.iqra_page_end) ||
+            hasValueGS(a.iqra_pages_added)
+          ) {
+            hasOtherPresentActivity = true;
+          }
+
+          return;
+        }
+
+        if (
+          attendance === 'SICK' ||
+          attendance === 'PERMISSION' ||
+          attendance === 'ABSENT'
+        ) {
+          hasAbsence = true;
+        }
+      });
+
+      if (hasPresent) {
+        if (hasOtherPresentActivity) {
+          bucketMap.ZERO_PRESENT_OTHER_ACTIVITY.count++;
+        } else {
+          bucketMap.ZERO_PRESENT_EMPTY.count++;
+        }
+        return;
+      }
+
+      if (hasAbsence) {
+        bucketMap.ZERO_ABSENCE.count++;
+        return;
+      }
+
+      bucketMap.ZERO_NOT_ATTENDED.count++;
+    });
+
+    var detailedDenominator = participants.length;
+
+    return detailedBuckets.map(function(bucket) {
+      return {
+        code: bucket.code,
+        range: bucket.range,
+        count: bucket.count,
+        percentage:
+          detailedDenominator > 0
+            ? Number(((bucket.count / detailedDenominator) * 100).toFixed(1))
+            : 0
+      };
+    });
+  }
+
+  // Legacy distribution untuk Nuroniyyah/Iqra atau caller lama.
   var sanitized =
-    (values || []).filter(
-      function(v) {
-        return (
-          typeof v === 'number' &&
-          isFinite(v) &&
-          !isNaN(v) &&
-          v >= 0
-        );
-      }
-    );
+    (values || []).filter(function(v) {
+      return (
+        typeof v === 'number' &&
+        isFinite(v) &&
+        !isNaN(v) &&
+        v >= 0
+      );
+    });
 
-  var denominator =
-    sanitized.length || 1;
+  var denominator = sanitized.length || 1;
+  var buckets = [0, 0, 0, 0];
 
-  var buckets =
-    [0, 0, 0, 0];
-
-  sanitized.forEach(
-    function(v) {
-      if (v <= 10) {
-        buckets[0]++;
-      } else if (v <= 20) {
-        buckets[1]++;
-      } else if (v <= 30) {
-        buckets[2]++;
-      } else {
-        buckets[3]++;
-      }
-    }
-  );
+  sanitized.forEach(function(v) {
+    if (v <= 10) buckets[0]++;
+    else if (v <= 20) buckets[1]++;
+    else if (v <= 30) buckets[2]++;
+    else buckets[3]++;
+  });
 
   var labels = [
     '0–10 Baris',
@@ -8371,25 +8506,13 @@ function getDistributionBucketsGS(
     '> 30 Baris'
   ];
 
-  return labels.map(
-    function(label, idx) {
-      return {
-        range: label,
-        count:
-          buckets[idx],
-        percentage:
-          Number(
-            (
-              (
-                buckets[idx] /
-                denominator
-              ) *
-              100
-            ).toFixed(1)
-          )
-      };
-    }
-  );
+  return labels.map(function(label, idx) {
+    return {
+      range: label,
+      count: buckets[idx],
+      percentage: Number(((buckets[idx] / denominator) * 100).toFixed(1))
+    };
+  });
 }
 
 function calculateSkillTransitionsGS(
@@ -9035,9 +9158,11 @@ function handleGetExecutiveAnalytics(
       stats:
         ziyadahStats,
       distributionBuckets:
-        getDistributionBucketsGS(
-          ziyadahTotals
-        ),
+  getDistributionBucketsGS(
+    ziyadahTotals,
+    participants,
+    assessmentsByStudent
+  ),
 
       ziyadahProgressCount:
         ziyadahTotals.length,
@@ -9047,9 +9172,11 @@ function handleGetExecutiveAnalytics(
       ziyadahStats:
         ziyadahStats,
       ziyadahDistributionBuckets:
-        getDistributionBucketsGS(
-          ziyadahTotals
-        ),
+  getDistributionBucketsGS(
+    ziyadahTotals,
+    participants,
+    assessmentsByStudent
+  ),
 
       nuroniyyahProgressCount:
         nuroniyyahTotals.length,

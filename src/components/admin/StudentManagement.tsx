@@ -78,14 +78,20 @@ export const StudentManagement: React.FC = () => {
     return getUniqueClassesSorted(students);
   }, [students]);
 
+  // Search helper: aman jika field Spreadsheet null / undefined / kosong.
+  const normalizeSearchText = (value: unknown): string =>
+    String(value ?? '').trim().toLowerCase();
+
   // Filter logic
+  const normalizedSearch = normalizeSearchText(search);
+
   const filteredStudents = students.filter(s => {
     const matchesSearch =
-      search.trim() === '' ||
-      s.full_name.toLowerCase().includes(search.toLowerCase()) ||
-      s.nis.toLowerCase().includes(search.toLowerCase()) ||
-      s.access_code.toLowerCase().includes(search.toLowerCase()) ||
-      s.student_id.toLowerCase().includes(search.toLowerCase());
+      normalizedSearch === '' ||
+      normalizeSearchText(s.full_name).includes(normalizedSearch) ||
+      normalizeSearchText(s.nis).includes(normalizedSearch) ||
+      normalizeSearchText(s.access_code).includes(normalizedSearch) ||
+      normalizeSearchText(s.student_id).includes(normalizedSearch);
 
     const matchesClass = classFilter === 'ALL' || s.class_name === classFilter;
     const matchesGender = genderFilter === 'ALL' || s.gender === genderFilter;
@@ -656,6 +662,7 @@ export const StudentManagement: React.FC = () => {
           </div>
         </div>
       )}
+
       {/* Regenerate Access Code Confirmation Modal */}
       {studentToRegenerate && (
         <div className="fixed inset-0 z-50 bg-slate-900/60 backdrop-blur-sm flex items-center justify-center p-4">

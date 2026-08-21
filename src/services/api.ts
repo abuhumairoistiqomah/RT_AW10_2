@@ -21,7 +21,7 @@ import { generateRandomAccessCode } from '../utils/accessCode';
 import { formatParticipantTarget, getEffectiveTargets } from '../utils/targetUtils';
 
 const DEFAULT_API_URL =
-  'https://script.google.com/macros/s/AKfycbxtv8UjLBbu44AEC9fMLJLDfJpNnB6eg_VExDu2iWgKb4kqNGIwSN1TIQWfa9TU5Xu1WA/exec';
+  'https://script.google.com/macros/s/AKfycbz-KXpzp1fknAHcxRHFLbzo4bLQUH61gR8NA5Orjxs_kGE2MhafyuvGZzw4LmCP43CG0A/exec';
 
 export function resolveApiUrl(): string {
   if (typeof window !== 'undefined') {
@@ -90,95 +90,390 @@ function notifyAuthExpired(): void {
   if (typeof window !== 'undefined') window.dispatchEvent(new CustomEvent('rt_auth_expired', { detail: { message: 'Sesi login telah berakhir. Silakan masuk kembali.' } }));
 }
 
-export const REQUEST_TIMEOUT_MS = 8000;
+/**
+ * RUMAH TAHFIDZ LMS
+ * NETWORK RESILIENCE PATCH
+ *
+ * Tujuan:
+ * - Normal request: 20 detik
+ * - Login: 45 detik
+ * - Auth validate/logout: 25 detik
+ * - Heavy read: 45 detik
+ * - Direct write: 30 detik
+ * - Health/warm-up: 20 detik
+ * - Pre-warm Google Apps Script setelah frontend load
+ *
+ * Cara pakai:
+ * 1. Di src/services/api.ts, replace bagian network lama mulai dari:
+ *      export const REQUEST_TIMEOUT_MS = 8000;
+ *    sampai tepat sebelum:
+ *      function loadData<T>(...)
+ *    dengan SECTION A di bawah.
+ *
+ * 2. Di dalam class ApiService, tambahkan SECTION B sebelum testConnection().
+ *
+ * 3. Di ApiService.testConnection(), ganti timeout hardcoded 8000 menjadi:
+ *      HEALTH_TIMEOUT_MS
+ *
+ * 4. Replace block paling bawah:
+ *      if (typeof window !== 'undefined') { ... }
+ *    dengan SECTION C.
+ *
+ * Tidak perlu edit Code.gs.
+ * Setelah itu build + redeploy Vercel.
+ */
+
+// ====================================================
+// SECTION A
+// REPLACE NETWORK LAYER LAMA
+// ====================================================
+
+export const REQUEST_TIMEOUT_MS = 20000;
+export const LOGIN_TIMEOUT_MS = 45000;
+export const AUTH_TIMEOUT_MS = 25000;
+export const HEAVY_READ_TIMEOUT_MS = 45000;
+export const WRITE_TIMEOUT_MS = 30000;
+export const HEALTH_TIMEOUT_MS = 20000;
+
 export const CIRCUIT_BREAKER_MAX_FAILURES = 3;
 export const CIRCUIT_BREAKER_COOLDOWN_MS = 30000;
+
+function getRequestTimeoutMs(action: string): number {
+  switch (action) {
+    case 'login':
+      return LOGIN_TIMEOUT_MS;
+
+    case 'validateSession':
+    case 'logout':
+      return AUTH_TIMEOUT_MS;
+
+    case 'getExecutiveAnalytics':
+    case 'getAdminOverview':
+    case 'getCompletenessReport':
+    case 'getTeacherWorkspaceBootstrap':
+    case 'getMyHalaqahData':
+    case 'getStudentPlacementBootstrap':
+    case 'getSessionAssessments':
+    case 'getFinalEvaluations':
+    case 'getEventParticipants':
+      return HEAVY_READ_TIMEOUT_MS;
+
+    case 'saveSessionAssessment':
+    case 'bulkSaveSessionAttendance':
+    case 'saveFinalEvaluation':
+    case 'saveStudent':
+    case 'saveTeacher':
+    case 'saveUser':
+    case 'saveEvent':
+    case 'saveEventDay':
+    case 'saveSessionGroup':
+    case 'saveSessionConfig':
+    case 'saveHalaqah':
+    case 'saveHalaqahTeacher':
+    case 'deleteHalaqahTeacher':
+    case 'bulkRegisterAndAssignStudentsToHalaqah':
+    case 'bulkAssignStudentsToHalaqah':
+    case 'updateParticipantTarget':
+    case 'resetUserPassword':
+    case 'regenerateAccessCode':
+    case 'updateAppConfig':
+    case 'deleteSessionAssessment':
+      return WRITE_TIMEOUT_MS;
+
+    default:
+      return REQUEST_TIMEOUT_MS;
+  }
+}
 
 export class NetworkError extends Error {
   isNetworkError = true;
   isTimeout: boolean;
   status?: number;
-  constructor(message: string, isTimeout = false, status?: number) {
-    super(message); this.name = 'NetworkError'; this.isTimeout = isTimeout; this.status = status;
+
+  constructor(
+    message: string,
+    isTimeout = false,
+    status?: number
+  ) {
+    super(message);
+    this.name = 'NetworkError';
+    this.isTimeout = isTimeout;
+    this.status = status;
   }
 }
 
-interface CircuitBreakerState { failureCount: number; lastFailureTime: number; status: 'ONLINE' | 'OFFLINE' | 'DEGRADED'; }
-const circuitBreaker: CircuitBreakerState = { failureCount: 0, lastFailureTime: 0, status: 'ONLINE' };
+interface CircuitBreakerState {
+  failureCount: number;
+  lastFailureTime: number;
+  status: 'ONLINE' | 'OFFLINE' | 'DEGRADED';
+}
+
+const circuitBreaker: CircuitBreakerState = {
+  failureCount: 0,
+  lastFailureTime: 0,
+  status: 'ONLINE'
+};
 
 export function getCircuitBreakerState() {
-  const isCooldownActive = circuitBreaker.status === 'OFFLINE' && Date.now() - circuitBreaker.lastFailureTime < CIRCUIT_BREAKER_COOLDOWN_MS;
-  const remainingCooldownSeconds = isCooldownActive ? Math.ceil((CIRCUIT_BREAKER_COOLDOWN_MS - (Date.now() - circuitBreaker.lastFailureTime)) / 1000) : 0;
+  const isCooldownActive =
+    circuitBreaker.status === 'OFFLINE' &&
+    Date.now() - circuitBreaker.lastFailureTime <
+      CIRCUIT_BREAKER_COOLDOWN_MS;
+
+  const remainingCooldownSeconds =
+    isCooldownActive
+      ? Math.ceil(
+          (
+            CIRCUIT_BREAKER_COOLDOWN_MS -
+            (Date.now() - circuitBreaker.lastFailureTime)
+          ) / 1000
+        )
+      : 0;
+
   return {
-    status: isCooldownActive ? ('OFFLINE' as const) : (circuitBreaker.failureCount > 0 ? ('DEGRADED' as const) : ('ONLINE' as const)),
+    status: isCooldownActive
+      ? ('OFFLINE' as const)
+      : circuitBreaker.failureCount > 0
+      ? ('DEGRADED' as const)
+      : ('ONLINE' as const),
     failureCount: circuitBreaker.failureCount,
     isOffline: isCooldownActive,
     remainingCooldownSeconds
   };
 }
+
 export function recordCircuitSuccess(): void {
-  if (circuitBreaker.failureCount > 0 || circuitBreaker.status !== 'ONLINE') {
-    circuitBreaker.failureCount = 0; circuitBreaker.status = 'ONLINE';
-    if (typeof window !== 'undefined') window.dispatchEvent(new CustomEvent('rt_backend_status_change', { detail: { status: 'ONLINE', failureCount: 0 } }));
+  if (
+    circuitBreaker.failureCount > 0 ||
+    circuitBreaker.status !== 'ONLINE'
+  ) {
+    circuitBreaker.failureCount = 0;
+    circuitBreaker.status = 'ONLINE';
+
+    if (typeof window !== 'undefined') {
+      window.dispatchEvent(
+        new CustomEvent('rt_backend_status_change', {
+          detail: {
+            status: 'ONLINE',
+            failureCount: 0
+          }
+        })
+      );
+    }
   }
 }
+
 export function recordCircuitFailure(error?: any): void {
-  circuitBreaker.failureCount++; circuitBreaker.lastFailureTime = Date.now();
-  circuitBreaker.status = circuitBreaker.failureCount >= CIRCUIT_BREAKER_MAX_FAILURES ? 'OFFLINE' : 'DEGRADED';
-  if (typeof window !== 'undefined') window.dispatchEvent(new CustomEvent('rt_backend_status_change', { detail: { status: circuitBreaker.status, failureCount: circuitBreaker.failureCount, error: error?.message || 'Network transport failure' } }));
-}
-export function resetCircuitBreaker(): void {
-  circuitBreaker.failureCount = 0; circuitBreaker.lastFailureTime = 0; circuitBreaker.status = 'ONLINE';
-  if (typeof window !== 'undefined') window.dispatchEvent(new CustomEvent('rt_backend_status_change', { detail: { status: 'ONLINE', failureCount: 0 } }));
+  circuitBreaker.failureCount++;
+  circuitBreaker.lastFailureTime = Date.now();
+
+  circuitBreaker.status =
+    circuitBreaker.failureCount >=
+    CIRCUIT_BREAKER_MAX_FAILURES
+      ? 'OFFLINE'
+      : 'DEGRADED';
+
+  if (typeof window !== 'undefined') {
+    window.dispatchEvent(
+      new CustomEvent('rt_backend_status_change', {
+        detail: {
+          status: circuitBreaker.status,
+          failureCount: circuitBreaker.failureCount,
+          error:
+            error?.message ||
+            'Network transport failure'
+        }
+      })
+    );
+  }
 }
 
-async function fetchWithTimeout(url: string, options: RequestInit, timeoutMs = REQUEST_TIMEOUT_MS): Promise<Response> {
+export function resetCircuitBreaker(): void {
+  circuitBreaker.failureCount = 0;
+  circuitBreaker.lastFailureTime = 0;
+  circuitBreaker.status = 'ONLINE';
+
+  if (typeof window !== 'undefined') {
+    window.dispatchEvent(
+      new CustomEvent('rt_backend_status_change', {
+        detail: {
+          status: 'ONLINE',
+          failureCount: 0
+        }
+      })
+    );
+  }
+}
+
+async function fetchWithTimeout(
+  url: string,
+  options: RequestInit,
+  timeoutMs = REQUEST_TIMEOUT_MS
+): Promise<Response> {
   const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), timeoutMs);
-  try { return await fetch(url, { ...options, signal: controller.signal }); }
-  catch (err: any) {
-    if (err.name === 'AbortError' || controller.signal.aborted) throw new NetworkError('Batas waktu koneksi habis (8 detik). Server backend Google Apps Script lambat atau tidak merespons.', true);
-    throw new NetworkError(`Koneksi jaringan terputus atau server tidak dapat dihubungi: ${err.message || 'Network request failed'}`);
-  } finally { clearTimeout(timer); }
+
+  const timer = setTimeout(
+    () => controller.abort(),
+    timeoutMs
+  );
+
+  try {
+    return await fetch(url, {
+      ...options,
+      signal: controller.signal
+    });
+  } catch (err: any) {
+    if (
+      err?.name === 'AbortError' ||
+      controller.signal.aborted
+    ) {
+      const seconds = Math.round(
+        timeoutMs / 1000
+      );
+
+      throw new NetworkError(
+        `Batas waktu koneksi habis (${seconds} detik). ` +
+          'Google Apps Script sedang lambat atau mengalami cold start. ' +
+          'Silakan coba kembali.',
+        true
+      );
+    }
+
+    throw new NetworkError(
+      `Koneksi jaringan terputus atau server tidak dapat dihubungi: ${
+        err?.message || 'Network request failed'
+      }`
+    );
+  } finally {
+    clearTimeout(timer);
+  }
 }
 
 let isRevalidatingAuth = false;
 
-async function apiPost<T>(action: string, payload: any = {}, customUrl?: string, retryCount = 0): Promise<T> {
-  const targetUrl = (customUrl || resolveApiUrl()).trim();
-  if (!targetUrl || targetUrl.includes('YOUR_DEPLOYMENT_ID')) throw new Error('Konfigurasi URL Google Apps Script belum diatur. Silakan atur URL di pengaturan database.');
-  const token = getAuthToken();
-  let res: Response;
-  try {
-    res = await fetchWithTimeout(targetUrl, {
-      method: 'POST', headers: { 'Content-Type': 'text/plain;charset=utf-8' },
-      body: JSON.stringify({ action, payload, authToken: token })
-    });
-  } catch (err: any) { recordCircuitFailure(err); throw err; }
-  if (!res.ok) {
-    const httpErr = new NetworkError(`HTTP Error ${res.status}: Gagal terhubung ke backend server.`, false, res.status);
-    recordCircuitFailure(httpErr); throw httpErr;
+async function apiPost<T>(
+  action: string,
+  payload: any = {},
+  customUrl?: string,
+  retryCount = 0
+): Promise<T> {
+  const targetUrl = (
+    customUrl || resolveApiUrl()
+  ).trim();
+
+  if (
+    !targetUrl ||
+    targetUrl.includes('YOUR_DEPLOYMENT_ID')
+  ) {
+    throw new Error(
+      'Konfigurasi URL Google Apps Script belum diatur. ' +
+        'Silakan atur URL di pengaturan database.'
+    );
   }
+
+  const token = getAuthToken();
+
+  let res: Response;
+
+  try {
+    const timeoutMs =
+      getRequestTimeoutMs(action);
+
+    res = await fetchWithTimeout(
+      targetUrl,
+      {
+        method: 'POST',
+        headers: {
+          'Content-Type':
+            'text/plain;charset=utf-8'
+        },
+        body: JSON.stringify({
+          action,
+          payload,
+          authToken: token
+        })
+      },
+      timeoutMs
+    );
+  } catch (err: any) {
+    recordCircuitFailure(err);
+    throw err;
+  }
+
+  if (!res.ok) {
+    const httpErr = new NetworkError(
+      `HTTP Error ${res.status}: Gagal terhubung ke backend server.`,
+      false,
+      res.status
+    );
+
+    recordCircuitFailure(httpErr);
+    throw httpErr;
+  }
+
   let json: any;
-  try { json = await res.json(); }
-  catch { const e = new NetworkError('Format respons server tidak valid (bukan JSON).'); recordCircuitFailure(e); throw e; }
+
+  try {
+    json = await res.json();
+  } catch {
+    const e = new NetworkError(
+      'Format respons server tidak valid (bukan JSON).'
+    );
+
+    recordCircuitFailure(e);
+    throw e;
+  }
+
   if (!json.success) {
-    const isAuthErr = json.error?.code === 'AUTH_REQUIRED' || json.error?.message?.includes('AUTH_REQUIRED') || json.error?.message?.includes('Sesi login telah berakhir');
-    if (isAuthErr && action !== 'validateSession' && action !== 'login' && retryCount === 0 && token) {
+    const isAuthErr =
+      json.error?.code === 'AUTH_REQUIRED' ||
+      json.error?.message?.includes('AUTH_REQUIRED') ||
+      json.error?.message?.includes(
+        'Sesi login telah berakhir'
+      );
+
+    if (
+      isAuthErr &&
+      action !== 'validateSession' &&
+      action !== 'login' &&
+      retryCount === 0 &&
+      token
+    ) {
       if (!isRevalidatingAuth) {
         isRevalidatingAuth = true;
+
         try {
-          const valRes = await ApiService.validateSession();
+          const valRes =
+            await ApiService.validateSession();
+
           isRevalidatingAuth = false;
-          if (valRes?.valid) return await apiPost<T>(action, payload, customUrl, retryCount + 1);
-        } catch { isRevalidatingAuth = false; }
+
+          if (valRes?.valid) {
+            return await apiPost<T>(
+              action,
+              payload,
+              customUrl,
+              retryCount + 1
+            );
+          }
+        } catch {
+          isRevalidatingAuth = false;
+        }
       }
+
       notifyAuthExpired();
     }
+
     recordCircuitSuccess();
-    throw new Error(json.error?.message || 'Gagal menyimpan data ke Google Apps Script backend.');
+
+    throw new Error(
+      json.error?.message ||
+        'Gagal menyimpan data ke Google Apps Script backend.'
+    );
   }
+
   recordCircuitSuccess();
+
   return json.data as T;
 }
 
@@ -299,10 +594,11 @@ function overlayPendingWritesOnAssessments(serverAssessments: SessionAssessment[
   return result;
 }
 
-function applyPendingOverlayToWorkspace<T extends any>(workspace: T): T {
-  if (!workspace) return workspace;
-  const merged = overlayPendingWritesOnAssessments(workspace.assessments || workspace.sessions || [], { eventId: workspace.event?.event_id, halaqahId: workspace.halaqah?.halaqah_id, sessionConfigs: workspace.sessionConfigs || [], students: workspace.students || [] });
-  const students = (workspace.students || []).map((student: any) => {
+function applyPendingOverlayToWorkspace<T extends Record<string, any>>(workspace: T): T {
+  if (!workspace || typeof workspace !== 'object') return workspace;
+  const ws = workspace as any;
+  const merged = overlayPendingWritesOnAssessments(ws.assessments || ws.sessions || [], { eventId: ws.event?.event_id, halaqahId: ws.halaqah?.halaqah_id, sessionConfigs: ws.sessionConfigs || [], students: ws.students || [] });
+  const students = (ws.students || []).map((student: any) => {
     const asms = merged.filter(a => a.student_id === student.student_id && !a.is_deleted && a.attendance_status === 'PRESENT');
     let zi = 0, nur = 0, iqra = 0;
     asms.forEach(a => {
@@ -316,17 +612,60 @@ function applyPendingOverlayToWorkspace<T extends any>(workspace: T): T {
     });
     return { ...student, totalLinesAdded: zi, totalZiyadahLinesAdded: zi, totalNuroniyyahLinesAdded: nur, totalIqraPagesAdded: iqra };
   });
-  return { ...workspace, assessments: merged, ...(workspace.sessions ? { sessions: merged } : {}), students };
+  return { ...workspace, assessments: merged, ...(ws.sessions ? { sessions: merged } : {}), students } as T;
 }
 
 export class ApiService {
+  // ====================================================
+// SECTION B
+// TAMBAHKAN DI DALAM `export class ApiService {`
+// LETAKKAN SEBELUM `static async testConnection(...)`
+// ====================================================
+
+static async warmBackend(): Promise<void> {
+  if (isMockMode) return;
+
+  const baseUrl = resolveApiUrl().trim();
+
+  if (
+    !baseUrl ||
+    baseUrl.includes('YOUR_DEPLOYMENT_ID')
+  ) {
+    return;
+  }
+
+  try {
+    const url =
+      `${baseUrl}${
+        baseUrl.includes('?') ? '&' : '?'
+      }action=health`;
+
+    await fetchWithTimeout(
+      url,
+      {
+        method: 'GET',
+        headers: {
+          Accept: 'application/json'
+        }
+      },
+      HEALTH_TIMEOUT_MS
+    );
+  } catch (error) {
+    // Warm-up sengaja silent.
+    // Gagal warmup tidak otomatis dianggap logout.
+    console.debug(
+      '[Backend Warmup] GAS belum siap, request nyata akan mencoba lagi.',
+      error
+    );
+  }
+}
   static async testConnection(customUrl?: string): Promise<{ connected: boolean; message: string; data?: any }> {
     const urlToTest = (customUrl || resolveApiUrl()).trim();
     const validation = validateApiUrl(urlToTest);
     if (!validation.valid) return { connected: false, message: validation.error || 'URL tidak valid' };
     try {
       const url = `${urlToTest}${urlToTest.includes('?') ? '&' : '?'}action=health`;
-      const res = await fetchWithTimeout(url, { method: 'GET', headers: { Accept: 'application/json' } }, 8000);
+      const res = await fetchWithTimeout(url, { method: 'GET', headers: { Accept: 'application/json' } }, HEALTH_TIMEOUT_MS);
       if (!res.ok) { recordCircuitFailure(); return { connected: false, message: `HTTP Error ${res.status} saat menghubungi Web App.` }; }
       const json = await res.json();
       if (json?.success && json?.data?.spreadsheetConnected === true) { recordCircuitSuccess(); return { connected: true, message: 'Database Google Sheets Terhubung', data: json.data }; }
@@ -856,7 +1195,23 @@ export class ApiService {
 }
 
 if (typeof window !== 'undefined') {
+  // Bangunkan GAS 0.5 detik setelah frontend mulai hidup.
+  // Ini non-blocking; user tidak perlu menunggu prewarm selesai.
+  window.setTimeout(() => {
+    void ApiService.warmBackend();
+  }, 500);
+
   window.addEventListener('online', () => {
-    void ApiService.flushPendingWrites().catch(error => console.warn('[Pending Sync] Auto-sync setelah online gagal:', error));
+    // Saat internet kembali, bangunkan backend lalu
+    // jalankan pending sync seperti sebelumnya.
+    void ApiService.warmBackend();
+
+    void ApiService.flushPendingWrites().catch(
+      error =>
+        console.warn(
+          '[Pending Sync] Auto-sync setelah online gagal:',
+          error
+        )
+    );
   });
 }
