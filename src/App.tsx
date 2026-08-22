@@ -5,6 +5,7 @@ import { StudentProgressLookup } from './components/public/StudentProgressLookup
 import { MyHalaqah } from './components/teacher/MyHalaqah';
 import { SessionAssessment } from './components/teacher/SessionAssessment';
 import { FinalEvaluation } from './components/teacher/FinalEvaluation';
+import { RekapNilaiRT } from './components/teacher/RekapNilaiRT';
 import { AdminDashboard } from './components/admin/AdminDashboard';
 import { EventManagement } from './components/admin/EventManagement';
 import { StudentManagement } from './components/admin/StudentManagement';
@@ -22,7 +23,7 @@ import {
   BarChart3, Search, Users, Calendar, BookOpen, UserCheck,
   TrendingUp, Settings, Layers, Menu, X, Shield,
   Activity, CheckCircle2, ShieldAlert, Database, Wifi, LogOut,
-  Loader2, LogIn
+  Loader2, LogIn, ClipboardList
 } from 'lucide-react';
 
 export default function App() {
@@ -259,7 +260,7 @@ export default function App() {
 
   const canAccessTab = (tab: string) => {
     if (isAdminRole) return true;
-    if (isTeacherRole) return ['student-progress', 'my-halaqah', 'session-assessment', 'final-evaluation'].includes(tab);
+    if (isTeacherRole) return ['student-progress', 'my-halaqah', 'session-assessment', 'final-evaluation', 'grade-recap'].includes(tab);
     return tab === 'student-progress';
   };
 
@@ -269,6 +270,7 @@ export default function App() {
       case 'my-halaqah': return 'Portal Guru / Halaqah Saya';
       case 'session-assessment': return 'Portal Guru / Input Penilaian Sesi';
       case 'final-evaluation': return 'Portal Guru / Evaluasi Akhir Event';
+      case 'grade-recap': return 'Portal Guru / Rekap Nilai Rumah Tahfidz';
       case 'admin-dashboard': return 'Command Center / Operational Dashboard';
       case 'event-mgmt': return 'Manajemen Event / Konfigurasi Acara & Sesi';
       case 'student-mgmt': return 'Manajemen Master Data / Data Siswa & Target';
@@ -402,6 +404,18 @@ export default function App() {
                 >
                   <UserCheck className="w-4 h-4" />
                   <span>Evaluasi Akhir</span>
+                </button>
+
+                <button
+                  onClick={() => { setActiveTab('grade-recap'); setSidebarOpen(false); }}
+                  className={`w-full flex items-center gap-3 px-3 py-2.5 rounded text-xs font-medium transition-colors ${
+                    activeTab === 'grade-recap'
+                      ? 'bg-blue-600 text-white font-semibold'
+                      : 'text-slate-400 hover:text-white hover:bg-slate-800/80'
+                  }`}
+                >
+                  <ClipboardList className="w-4 h-4" />
+                  <span>Rekap Nilai RT</span>
                 </button>
               </div>
             </div>
@@ -745,6 +759,10 @@ export default function App() {
                   currentUser={currentUser}
                   initialStudentId={evaluationNavState.studentId}
                 />
+              )}
+
+              {activeTab === 'grade-recap' && (
+                <RekapNilaiRT />
               )}
 
               {activeTab === 'admin-dashboard' && (

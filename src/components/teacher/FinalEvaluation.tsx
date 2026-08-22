@@ -20,6 +20,11 @@ import {
   Trash2
 } from 'lucide-react';
 import { SurahAutocomplete } from '../common/SurahAutocomplete';
+import { hasAssessmentContent } from '../../utils/assessmentResolver';
+import {
+  calculateQuranProgressDelta,
+  warmQuranLineCalculator
+} from '../../utils/quranLineCalculator';
 
 interface FinalEvaluationProps {
   currentUser: User | null;
@@ -132,6 +137,15 @@ export const FinalEvaluation: React.FC<FinalEvaluationProps> = ({
   const [affectiveNote, setAffectiveNote] = useState('');
   const [finalNote, setFinalNote] = useState('');
 
+  // Projection no Mahou: detect Ziyadah history and calculate only the
+  // additional physical lines that appear at the final session.
+  const deltaCalcRequestRef = useRef(0);
+  const [finalDeltaState, setFinalDeltaState] = useState<
+    'IDLE' | 'LOADING' | 'READY' | 'NO_CHANGE' | 'EXISTING' | 'ERROR'
+  >('IDLE');
+  const [finalDeltaDetail, setFinalDeltaDetail] = useState('');
+  const [autoFinalZiyadah, setAutoFinalZiyadah] = useState<any | null>(null);
+
   const [existingEvaluationId, setExistingEvaluationId] =
     useState<string | null>(null);
 
@@ -191,6 +205,34 @@ export const FinalEvaluation: React.FC<FinalEvaluationProps> = ({
     [workspace?.sessionConfigs]
   );
 
+  const finalSessionConfig = useMemo(() => {
+    const groupId = halaqah?.session_group_id;
+
+    const active = sessionConfigs.filter(sc => {
+      const activeValue = String(sc?.active ?? true).toLowerCase();
+      const sameGroup =
+        !groupId ||
+        !sc?.session_group_id ||
+        sc.session_group_id === groupId;
+
+      return activeValue !== 'false' && sameGroup;
+    });
+
+    return (
+      active
+        .slice()
+        .sort(
+          (a, b) =>
+            Number(b?.session_no || 0) -
+            Number(a?.session_no || 0)
+        )[0] || null
+    );
+  }, [sessionConfigs, halaqah?.session_group_id]);
+
+  useEffect(() => {
+    void warmQuranLineCalculator();
+  }, []);
+
   useEffect(() => {
     if (
       initialStudentId &&
@@ -236,7 +278,12 @@ export const FinalEvaluation: React.FC<FinalEvaluationProps> = ({
         totalZiyadahLines: 0,
         hasZiyadahAssessment: false,
         coverageText: '0 / 0 Sesi',
-        latestSetoran: null as any
+        latestSetoran: null as any,
+        firstRealZiyadah: null as any,
+        latestRealZiyadah: null as any,
+        lastPreFinalZiyadah: null as any,
+        finalSessionRealZiyadah: null as any,
+        finalSessionAssessment: null as any
       };
     }
 
@@ -248,10 +295,6 @@ export const FinalEvaluation: React.FC<FinalEvaluationProps> = ({
       a => a.attendance_status === 'PRESENT'
     );
 
-    // IMPORTANT: target completion is based ONLY on ZIYADAH.
-    // Nuroniyyah lines and Iqra pages must never be mixed into this total.
-    // A small legacy fallback treats Quran-range records with an empty mode as
-    // Ziyadah, but never records carrying Nuroniyyah/Iqra fields.
     const ziyadahAsms = presentAsms.filter(a => {
       const mode = String(a.assessment_mode || '').toUpperCase();
 
@@ -264,12 +307,11 @@ export const FinalEvaluation: React.FC<FinalEvaluationProps> = ({
         a.iqra_page_end != null ||
         a.iqra_pages_added != null
       );
-
       const hasNuroniyyah = Boolean(a.nuroniyyah_dars);
       const hasQuranRange = Boolean(
-        a.surah_start != null ||
-        a.ayah_start != null ||
-        a.surah_end != null ||
+        a.surah_start != null &&
+        a.ayah_start != null &&
+        a.surah_end != null &&
         a.ayah_end != null
       );
 
@@ -281,18 +323,55 @@ export const FinalEvaluation: React.FC<FinalEvaluationProps> = ({
       0
     );
 
-    const latest =
-      ziyadahAsms
-        .slice()
-        .sort(
-          (a, b) =>
-            Number(b.session_no || 0) -
-            Number(a.session_no || 0)
+    // "Real Ziyadah" excludes muroja'ah records intentionally entered as
+    // 0 baris. These records still remain valid session history, but they do
+    // not define the memorization origin/limit for Final Evaluation.
+    const realZiyadahAsms = ziyadahAsms
+      .filter(
+        a =>
+          Number(a.lines_added || 0) > 0 &&
+          a.surah_start != null &&
+          a.ayah_start != null &&
+          a.surah_end != null &&
+          a.ayah_end != null
+      )
+      .slice()
+      .sort(
+        (a, b) =>
+          Number(a.session_no || 0) -
+          Number(b.session_no || 0)
+      );
+
+    const firstRealZiyadah = realZiyadahAsms[0] || null;
+    const latestRealZiyadah =
+      realZiyadahAsms[realZiyadahAsms.length - 1] || null;
+
+    const finalSessionNo = Number(finalSessionConfig?.session_no || 0);
+
+    const preFinalReal = finalSessionNo
+      ? realZiyadahAsms.filter(
+          a => Number(a.session_no || 0) < finalSessionNo
         )
-        .find(a => a.surah_end && a.ayah_end) || null;
+      : realZiyadahAsms;
+
+    const lastPreFinalZiyadah =
+      preFinalReal[preFinalReal.length - 1] || null;
+
+    const finalSessionRealZiyadah = finalSessionNo
+      ? realZiyadahAsms.find(
+          a => Number(a.session_no || 0) === finalSessionNo
+        ) || null
+      : null;
+
+    const finalSessionAssessment = finalSessionNo
+      ? studentAsms.find(
+          a =>
+            a.session_config_id === finalSessionConfig?.session_config_id ||
+            Number(a.session_no || 0) === finalSessionNo
+        ) || null
+      : null;
 
     const groupId = halaqah?.session_group_id;
-
     const applicableConfigs = groupId
       ? sessionConfigs.filter(
           sc =>
@@ -302,15 +381,24 @@ export const FinalEvaluation: React.FC<FinalEvaluationProps> = ({
       : sessionConfigs;
 
     return {
-      // Kept as an alias for the existing card/UI label. It now correctly
-      // represents Ziyadah lines only.
       totalLines: totalZiyadahLines,
       totalZiyadahLines,
-      hasZiyadahAssessment: ziyadahAsms.length > 0,
+      hasZiyadahAssessment: realZiyadahAsms.length > 0,
       coverageText: `${studentAsms.length} dari ${applicableConfigs.length} Sesi Evaluasi`,
-      latestSetoran: latest
+      latestSetoran: latestRealZiyadah,
+      firstRealZiyadah,
+      latestRealZiyadah,
+      lastPreFinalZiyadah,
+      finalSessionRealZiyadah,
+      finalSessionAssessment
     };
-  }, [assessments, selectedStudentId, halaqah, sessionConfigs]);
+  }, [
+    assessments,
+    selectedStudentId,
+    halaqah,
+    sessionConfigs,
+    finalSessionConfig
+  ]);
 
   const effectiveZiyadahTarget = useMemo(() => {
     const positiveNumber = (value: any): number | null => {
@@ -358,6 +446,10 @@ export const FinalEvaluation: React.FC<FinalEvaluationProps> = ({
     completionAutoAppliedRef.current = false;
     scoreAutoAppliedRef.current = false;
     setCompletionSource(null);
+    deltaCalcRequestRef.current += 1;
+    setAutoFinalZiyadah(null);
+    setFinalDeltaState('IDLE');
+    setFinalDeltaDetail('');
 
     setExistingEvaluationId(
       existing.final_evaluation_id || null
@@ -418,49 +510,56 @@ export const FinalEvaluation: React.FC<FinalEvaluationProps> = ({
     );
   };
 
-  const hydrateDefaultsForStudent = (student: any) => {
-    // New record: allow automatic target completion until the teacher manually
-    // touches Tuntas/Belum Tuntas.
+  const hydrateDefaultsForStudent = (_student: any) => {
     completionManualOverrideRef.current = false;
     completionAutoAppliedRef.current = false;
     scoreAutoAppliedRef.current = false;
+    deltaCalcRequestRef.current += 1;
     setCompletionSource(null);
+    setAutoFinalZiyadah(null);
+    setFinalDeltaState('IDLE');
+    setFinalDeltaDetail('');
 
     setExistingEvaluationId(null);
 
-    setEvalSurahStart(
-      student?.target_surah_start ??
-        student?.baseline_surah ??
-        undefined
-    );
+    const first = studentMetrics.firstRealZiyadah;
+    const latest = studentMetrics.latestRealZiyadah;
 
-    setEvalAyahStart(
-      student?.target_ayah_start != null
-        ? String(student.target_ayah_start)
-        : student?.baseline_ayah != null
-          ? String(student.baseline_ayah)
-          : ''
-    );
+    if (first) {
+      // The beginning of Final Evaluation is not teacher input anymore.
+      // It is the first REAL Ziyadah detected in this RT event.
+      setEvalSurahStart(Number(first.surah_start));
+      setEvalAyahStart(String(first.ayah_start));
 
-    setEvalSurahEnd(
-      student?.target_surah_end ??
-        student?.target_surah_start ??
-        student?.baseline_surah ??
-        undefined
-    );
-
-    setEvalAyahEnd(
-      student?.target_ayah_end != null
-        ? String(student.target_ayah_end)
-        : ''
-    );
+      // Start the final-limit field from the latest known Ziyadah so the
+      // teacher only needs to move it when there is new memorization.
+      setEvalSurahEnd(
+        latest?.surah_end != null
+          ? Number(latest.surah_end)
+          : Number(first.surah_end)
+      );
+      setEvalAyahEnd(
+        latest?.ayah_end != null
+          ? String(latest.ayah_end)
+          : String(first.ayah_end || '')
+      );
+    } else {
+      setEvalSurahStart(undefined);
+      setEvalAyahStart('');
+      setEvalSurahEnd(undefined);
+      setEvalAyahEnd('');
+    }
 
     setFinalScore('');
     setCompletionStatus(undefined);
     setSkillStatusEnd(undefined);
     setAffectiveGrade(undefined);
     setAffectiveNote('');
-    setFinalNote('');
+    setFinalNote(
+      first
+        ? ''
+        : 'Karena tidak ada catatan Ziyadah, siswa ini mengikuti Rumah Tahfidz dalam kondisi belajar membaca lancar atau fokus mengulang hafalan.'
+    );
   };
 
   // CRITICAL ANTI-RESET EFFECT
@@ -508,6 +607,23 @@ export const FinalEvaluation: React.FC<FinalEvaluationProps> = ({
     return Boolean(findExistingEvaluation(selectedStudentId));
   }, [selectedStudentId, evaluations, students]);
 
+  const projectedZiyadahLines =
+    studentMetrics.totalZiyadahLines +
+    Number(autoFinalZiyadah?.lines_added || 0);
+
+  const quranStartSurahForDisplay =
+    evalSurahStart ??
+    studentMetrics.firstRealZiyadah?.surah_start ??
+    undefined;
+  const quranStartAyahForDisplay =
+    evalAyahStart ||
+    (studentMetrics.firstRealZiyadah?.ayah_start != null
+      ? String(studentMetrics.firstRealZiyadah.ayah_start)
+      : '');
+  const hasDisplayableQuranStart = Boolean(
+    quranStartSurahForDisplay && quranStartAyahForDisplay
+  );
+
   // Used by both automatic completion and automatic score guidance.
   // This remains a NEW-evaluation automation, matching the existing rule:
   // saved Final Evaluation records are not silently rewritten when reopened.
@@ -526,7 +642,7 @@ export const FinalEvaluation: React.FC<FinalEvaluationProps> = ({
       eligibleSkill &&
       effectiveZiyadahTarget !== null &&
       studentMetrics.hasZiyadahAssessment &&
-      studentMetrics.totalZiyadahLines >= effectiveZiyadahTarget
+      projectedZiyadahLines >= effectiveZiyadahTarget
     );
   }, [
     selectedStudentId,
@@ -536,7 +652,8 @@ export const FinalEvaluation: React.FC<FinalEvaluationProps> = ({
     skillStatusEnd,
     effectiveZiyadahTarget,
     studentMetrics.hasZiyadahAssessment,
-    studentMetrics.totalZiyadahLines
+    studentMetrics.totalZiyadahLines,
+    autoFinalZiyadah?.lines_added
   ]);
 
   // AUTO TARGET COMPLETION — NEW EVALUATIONS ONLY.
@@ -581,7 +698,7 @@ export const FinalEvaluation: React.FC<FinalEvaluationProps> = ({
     }
 
     const autoStatus: CompletionStatus =
-      studentMetrics.totalZiyadahLines >= effectiveZiyadahTarget
+      projectedZiyadahLines >= effectiveZiyadahTarget
         ? 'COMPLETE'
         : 'INCOMPLETE';
 
@@ -618,7 +735,187 @@ export const FinalEvaluation: React.FC<FinalEvaluationProps> = ({
     effectiveZiyadahTarget,
     studentMetrics.hasZiyadahAssessment,
     studentMetrics.totalZiyadahLines,
+    autoFinalZiyadah?.lines_added,
     completionStatus
+  ]);
+
+  useEffect(() => {
+    const requestId = ++deltaCalcRequestRef.current;
+
+    setAutoFinalZiyadah(null);
+
+    // Existing saved Final Evaluation is never silently rewritten.
+    if (hasExistingEvaluation || existingEvaluationId) {
+      setFinalDeltaState('IDLE');
+      setFinalDeltaDetail('');
+      return;
+    }
+
+    const first = studentMetrics.firstRealZiyadah;
+    const previous = studentMetrics.lastPreFinalZiyadah;
+
+    if (!first) {
+      setFinalDeltaState('IDLE');
+      setFinalDeltaDetail('Tidak ada riwayat Ziyadah nyata untuk dihitung.');
+      return;
+    }
+
+    const existingFinalSession = studentMetrics.finalSessionAssessment;
+    const finalAttendance = String(
+      existingFinalSession?.attendance_status || 'UNASSESSED'
+    ).toUpperCase();
+
+    if (
+      finalAttendance === 'SICK' ||
+      finalAttendance === 'PERMISSION' ||
+      finalAttendance === 'ABSENT'
+    ) {
+      setFinalDeltaState('EXISTING');
+      setFinalDeltaDetail(
+        `Presensi sesi akhir sudah tercatat ${finalAttendance}. Sistem tidak akan membuat Ziyadah otomatis.`
+      );
+      return;
+    }
+
+    // Any substantive final-session assessment is sacred. Do not overwrite
+    // manual Ziyadah, Nuroniyyah, or Iqra content from Final Evaluation.
+    if (
+      existingFinalSession &&
+      hasAssessmentContent(existingFinalSession)
+    ) {
+      const mode = String(
+        existingFinalSession.assessment_mode || 'ZIYADAH'
+      ).toUpperCase();
+      const addition =
+        mode === 'IQRA'
+          ? `${Number(existingFinalSession.iqra_pages_added || 0)} halaman Iqra`
+          : `${Number(existingFinalSession.lines_added || 0)} baris`;
+
+      setFinalDeltaState('EXISTING');
+      setFinalDeltaDetail(
+        `Sesi akhir sudah memiliki penilaian ${mode} (${addition}). Sistem tidak membuat atau menimpa data sesi tersebut.`
+      );
+      return;
+    }
+
+    if (!previous) {
+      setFinalDeltaState('NO_CHANGE');
+      setFinalDeltaDetail(
+        'Belum ada batas Ziyadah sebelum sesi akhir yang dapat dibandingkan.'
+      );
+      return;
+    }
+
+    if (
+      evalSurahEnd == null ||
+      evalAyahEnd === '' ||
+      !Number.isInteger(Number(evalAyahEnd)) ||
+      Number(evalAyahEnd) < 1
+    ) {
+      setFinalDeltaState('IDLE');
+      setFinalDeltaDetail(
+        'Isi batas hafalan akhir untuk mendeteksi tambahan Ziyadah sesi akhir.'
+      );
+      return;
+    }
+
+    const endValidation = validateAyah(
+      Number(evalSurahEnd),
+      Number(evalAyahEnd)
+    );
+
+    if (!endValidation.valid) {
+      setFinalDeltaState('ERROR');
+      setFinalDeltaDetail(endValidation.message || 'Ayat akhir tidak valid.');
+      return;
+    }
+
+    setFinalDeltaState('LOADING');
+    setFinalDeltaDetail('Menghitung tambahan baris sesi akhir…');
+
+    void calculateQuranProgressDelta({
+      origin: {
+        surah: Number(first.surah_start),
+        ayah: Number(first.ayah_start)
+      },
+      previousLimit: {
+        surah: Number(previous.surah_end),
+        ayah: Number(previous.ayah_end)
+      },
+      newLimit: {
+        surah: Number(evalSurahEnd),
+        ayah: Number(evalAyahEnd)
+      }
+    })
+      .then(result => {
+        if (requestId !== deltaCalcRequestRef.current) return;
+
+        if (!result.isExtension) {
+          setFinalDeltaState('ERROR');
+          setFinalDeltaDetail(
+            'Batas hafalan akhir tidak melanjutkan riwayat Ziyadah sebelumnya. Sistem tidak menambahkan baris otomatis.'
+          );
+          return;
+        }
+
+        if (
+          result.totalLines <= 0 ||
+          !result.firstNewVerse ||
+          !finalSessionConfig
+        ) {
+          setFinalDeltaState('NO_CHANGE');
+          setFinalDeltaDetail(
+            'Tidak terdeteksi tambahan baris baru pada sesi akhir.'
+          );
+          return;
+        }
+
+        const directionLabel =
+          result.direction === 'BACKWARD_SURAH'
+            ? 'arah surah mundur'
+            : result.direction === 'FORWARD'
+              ? 'arah surah maju'
+              : 'surah yang sama';
+
+        const autoPayload = {
+          enabled: true,
+          session_config_id: finalSessionConfig.session_config_id,
+          event_day_id: finalSessionConfig.event_day_id || '',
+          session_no: Number(finalSessionConfig.session_no),
+          surah_start: result.firstNewVerse.surah,
+          ayah_start: result.firstNewVerse.ayah,
+          surah_end: Number(evalSurahEnd),
+          ayah_end: Number(evalAyahEnd),
+          lines_added: result.totalLines,
+          direction: result.direction
+        };
+
+        setAutoFinalZiyadah(autoPayload);
+        setFinalDeltaState('READY');
+        setFinalDeltaDetail(
+          `+${result.totalLines} baris otomatis • ${result.verseCount} ayat baru • ${directionLabel}. Akan dicatat sebagai Ziyadah pada sesi akhir saat Evaluasi Akhir disimpan.`
+        );
+      })
+      .catch(error => {
+        if (requestId !== deltaCalcRequestRef.current) return;
+
+        setFinalDeltaState('ERROR');
+        setFinalDeltaDetail(
+          error?.message ||
+            'Tambahan baris sesi akhir belum dapat dihitung otomatis.'
+        );
+      });
+  }, [
+    selectedStudentId,
+    hasExistingEvaluation,
+    existingEvaluationId,
+    studentMetrics.firstRealZiyadah,
+    studentMetrics.lastPreFinalZiyadah,
+    studentMetrics.finalSessionRealZiyadah,
+    studentMetrics.finalSessionAssessment,
+    evalSurahEnd,
+    evalAyahEnd,
+    finalSessionConfig
   ]);
 
   const hasCompleteQuranRange = (): boolean => {
@@ -726,7 +1023,11 @@ export const FinalEvaluation: React.FC<FinalEvaluationProps> = ({
       affective_rating: affectiveGrade || undefined,
       affective_note: affectiveNote,
       evaluator_notes: finalNote,
-      evaluator_teacher_id: currentUser?.teacher_id || ''
+      evaluator_teacher_id: currentUser?.teacher_id || '',
+
+      // Backend stores this in 13_SESSION_ASSESSMENTS, not in
+      // 14_FINAL_EVALUATIONS. No new spreadsheet header is required.
+      auto_final_ziyadah: autoFinalZiyadah || undefined
     };
   };
 
@@ -1281,8 +1582,12 @@ export const FinalEvaluation: React.FC<FinalEvaluationProps> = ({
                   Total Baris Ditambah
                 </span>
                 <span className="font-bold text-blue-900">
-                  {studentMetrics.totalLines > 0
-                    ? `${studentMetrics.totalLines} Baris`
+                  {projectedZiyadahLines > 0
+                    ? `${projectedZiyadahLines} Baris${
+                        autoFinalZiyadah?.lines_added
+                          ? ` (termasuk +${autoFinalZiyadah.lines_added} proyeksi sesi akhir)`
+                          : ''
+                      }`
                     : 'Belum tersedia'}
                 </span>
               </div>
@@ -1356,68 +1661,90 @@ export const FinalEvaluation: React.FC<FinalEvaluationProps> = ({
         <div className="space-y-3 pt-2">
           <div>
             <label className="block text-xs font-bold uppercase tracking-wider text-slate-600">
-              Capaian Akhir Evaluasi (Surah & Ayat)
+              Capaian Ziyadah Rumah Tahfidz
             </label>
             <p className="mt-1 text-[11px] text-slate-500">
-              Opsional. Boleh dikosongkan apabila siswa belum memiliki capaian/setoran Al-Qur'an pada evaluasi ini.
+              Titik awal diambil otomatis dari catatan Ziyadah nyata pertama pada Rumah Tahfidz ini. Guru cukup memastikan batas hafalan akhirnya.
             </p>
           </div>
 
-          <div className="grid grid-cols-1 md:grid-cols-2 gap-4 p-4 bg-slate-50 border border-slate-200 rounded-lg">
-            <div className="space-y-3">
-              <SurahAutocomplete
-                label="Surah Awal Evaluasi"
-                value={evalSurahStart}
-                onChange={val => {
-                  setEvalSurahStart(val || undefined);
-                  markDirty();
-                }}
-              />
-              <div>
-                <label className="block text-[11px] font-semibold text-slate-600 mb-1">
-                  Ayat Awal Evaluasi
-                </label>
-                <input
-                  type="number"
-                  min={1}
-                  value={evalAyahStart}
-                  onChange={e => {
-                    setEvalAyahStart(e.target.value);
-                    markDirty();
-                  }}
-                  placeholder="mis: 1"
-                  className="w-full px-3 py-2 bg-white border border-slate-300 rounded text-xs font-semibold text-slate-900 focus:outline-none focus:ring-2 focus:ring-blue-500"
-                />
+          {hasDisplayableQuranStart ? (
+            <div className="grid grid-cols-1 md:grid-cols-2 gap-4 p-4 bg-slate-50 border border-slate-200 rounded-lg">
+              <div className="rounded-lg border border-emerald-200 bg-emerald-50/70 p-3">
+                <span className="block text-[10px] font-bold uppercase tracking-wider text-emerald-700 mb-1">
+                  {studentMetrics.firstRealZiyadah
+                    ? 'Awal Ziyadah RT • Terdeteksi Otomatis'
+                    : 'Awal Capaian Evaluasi • Data Tersimpan'}
+                </span>
+                <div className="text-sm font-bold text-emerald-950">
+                  {getSurahNameFormatted(Number(quranStartSurahForDisplay))} • Ayat {quranStartAyahForDisplay}
+                </div>
+                <p className="mt-1 text-[10px] leading-snug text-emerald-700">
+                  {studentMetrics.firstRealZiyadah
+                    ? 'Ini adalah Surah dan Ayat pertama yang terdeteksi sebagai Ziyadah dengan penambahan baris > 0 pada Rumah Tahfidz ini. Field ini tidak perlu diisi guru.'
+                    : 'Rentang ini berasal dari Evaluasi Akhir yang sudah tersimpan.'}
+                </p>
               </div>
-            </div>
 
-            <div className="space-y-3">
-              <SurahAutocomplete
-                label="Surah Akhir Evaluasi"
-                value={evalSurahEnd}
-                onChange={val => {
-                  setEvalSurahEnd(val || undefined);
-                  markDirty();
-                }}
-              />
-              <div>
-                <label className="block text-[11px] font-semibold text-slate-600 mb-1">
-                  Ayat Akhir Evaluasi
-                </label>
-                <input
-                  type="number"
-                  min={1}
-                  value={evalAyahEnd}
-                  onChange={e => {
-                    setEvalAyahEnd(e.target.value);
+              <div className="space-y-3">
+                <SurahAutocomplete
+                  label="Batas Hafalan Akhir"
+                  value={evalSurahEnd}
+                  onChange={val => {
+                    setEvalSurahEnd(val || undefined);
                     markDirty();
                   }}
-                  placeholder="mis: 30"
-                  className="w-full px-3 py-2 bg-white border border-slate-300 rounded text-xs font-semibold text-slate-900 focus:outline-none focus:ring-2 focus:ring-blue-500"
                 />
+                <div>
+                  <label className="block text-[11px] font-semibold text-slate-600 mb-1">
+                    Ayat pada Batas Hafalan Akhir
+                  </label>
+                  <input
+                    type="number"
+                    min={1}
+                    value={evalAyahEnd}
+                    onChange={e => {
+                      setEvalAyahEnd(e.target.value);
+                      markDirty();
+                    }}
+                    placeholder="mis: 3"
+                    className="w-full px-3 py-2 bg-white border border-slate-300 rounded text-xs font-semibold text-slate-900 focus:outline-none focus:ring-2 focus:ring-blue-500"
+                  />
+                </div>
+              </div>
+
+              <div
+                className={`md:col-span-2 rounded-lg border px-3 py-2 text-[10px] sm:text-[11px] leading-relaxed ${
+                  finalDeltaState === 'READY'
+                    ? 'bg-blue-50 border-blue-200 text-blue-800'
+                    : finalDeltaState === 'ERROR'
+                      ? 'bg-rose-50 border-rose-200 text-rose-700'
+                      : finalDeltaState === 'EXISTING'
+                        ? 'bg-emerald-50 border-emerald-200 text-emerald-700'
+                        : 'bg-slate-50 border-slate-200 text-slate-600'
+                }`}
+              >
+                <span className="font-bold">
+                  {finalDeltaState === 'LOADING'
+                    ? 'Menghitung sesi akhir: '
+                    : finalDeltaState === 'READY'
+                      ? 'Tambahan Ziyadah sesi akhir: '
+                      : finalDeltaState === 'EXISTING'
+                        ? 'Sesi akhir sudah tercatat: '
+                        : 'Deteksi sesi akhir: '}
+                </span>
+                {finalDeltaState === 'LOADING'
+                  ? 'mohon tunggu…'
+                  : finalDeltaDetail ||
+                    'Ubah batas hafalan akhir apabila ada tambahan setoran pada sesi evaluasi.'}
               </div>
             </div>
-          </div>
+          ) : (
+            <div className="rounded-lg border border-amber-200 bg-amber-50 px-4 py-3 text-[11px] leading-relaxed text-amber-800">
+              <span className="font-bold">Tidak ada catatan Ziyadah nyata.</span>{' '}
+              Rentang Al-Qur&apos;an tidak dipaksakan pada Evaluasi Akhir. Catatan evaluasi otomatis diberi keterangan bahwa siswa kemungkinan sedang belajar membaca lancar atau fokus mengulang hafalan.
+            </div>
+          )}
         </div>
 
         <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
@@ -1479,10 +1806,10 @@ export const FinalEvaluation: React.FC<FinalEvaluationProps> = ({
                       ? 'Pilihan guru:'
                       : 'Tuntas otomatis:'}
                   </span>{' '}
-                  Ziyadah {studentMetrics.totalZiyadahLines} / {effectiveZiyadahTarget} Baris.{' '}
+                  Ziyadah {projectedZiyadahLines} / {effectiveZiyadahTarget} Baris.{autoFinalZiyadah?.lines_added ? ` Termasuk +${autoFinalZiyadah.lines_added} baris otomatis sesi akhir.` : ''}{' '}
                   {completionSource === 'MANUAL'
                     ? 'Pilihan manual tidak akan ditimpa otomatis selama formulir ini sedang diedit.'
-                    : studentMetrics.totalZiyadahLines >= effectiveZiyadahTarget
+                    : projectedZiyadahLines >= effectiveZiyadahTarget
                       ? 'Capaian sudah memenuhi target kegiatan. Guru tetap dapat mengubah pilihan.'
                       : 'Capaian belum memenuhi target kegiatan. Guru tetap dapat mengubah pilihan.'}
                 </div>

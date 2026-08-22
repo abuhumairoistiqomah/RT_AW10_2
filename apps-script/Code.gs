@@ -1304,7 +1304,7 @@ function handleHealth() {
     return jsonResponse({
       status: 'ok',
       spreadsheetConnected: Boolean(ss),
-      backendVersion: 'RT-GS-3MODE-CANONICAL-2026-08-22-FINAL-EVAL-AUTO-PRESENT'
+      backendVersion: 'RT-GS-3MODE-CANONICAL-2026-08-22-REKAP-NILAI-RT'
     });
   } catch (e) {
     return jsonError('SERVER_ERROR', 'Gagal terhubung ke Google Spreadsheet: ' + e.message);
@@ -1387,6 +1387,7 @@ function handlePostAndGetRouter(action, payload, authToken) {
     case 'getFinalEvaluations': return handleGetFinalEvaluations(payload, authToken);
     case 'getAdminOverview': return handleGetAdminOverview(payload.eventId, authToken);
     case 'getCompletenessReport': return handleGetCompletenessReport(payload.eventId, authToken);
+    case 'getGradeRecap': return handleGetGradeRecap(payload, authToken);
     case 'getExecutiveAnalytics': return handleGetExecutiveAnalytics(payload, authToken);
     case 'getAuditLogs':
       requireRole(authToken, [ROLES.ADMIN, ROLES.COORDINATOR]);
@@ -2842,7 +2843,12 @@ function handleDeleteSessionAssessment(payload, authToken) {
  *     no Quran/Nuroniyyah/Iqra progress fields
  * - Saving Final Evaluation must not fail merely because auto-attendance cannot run.
  */
-function ensureFinalSessionPresentFromEvaluationGS(participant, evaluatorTeacherId, actorUserId) {
+function ensureFinalSessionPresentFromEvaluationGS(
+  participant,
+  evaluatorTeacherId,
+  actorUserId,
+  autoFinalZiyadah
+) {
   try {
     if (!participant) {
       return { changed: false, reason: 'PARTICIPANT_NOT_FOUND' };
@@ -2905,23 +2911,55 @@ function ensureFinalSessionPresentFromEvaluationGS(participant, evaluatorTeacher
       sessionConfigId
     );
 
-    if (existing) {
-      var existingAttendance = upperGS(existing.attendance_status || 'UNASSESSED');
+    var existingAttendance = upperGS(
+      existing && existing.attendance_status
+        ? existing.attendance_status
+        : 'UNASSESSED'
+    );
 
-      // Never override an explicit/manual attendance decision.
-      if (
-        existingAttendance === 'PRESENT' ||
+    var requestedZi = autoFinalZiyadah || null;
+    var requestedLines = requestedZi
+      ? Number(requestedZi.lines_added || 0)
+      : 0;
+
+    var wantsAutoZiyadah = Boolean(
+      requestedZi &&
+      requestedZi.enabled &&
+      isFinite(requestedLines) &&
+      !isNaN(requestedLines) &&
+      requestedLines > 0
+    );
+
+    // Explicit absence always wins over automatic inference.
+    if (
+      existing &&
+      (
         existingAttendance === 'SICK' ||
         existingAttendance === 'PERMISSION' ||
         existingAttendance === 'ABSENT'
-      ) {
-        return {
-          changed: false,
-          reason: 'EXISTING_ATTENDANCE_PRESERVED',
-          attendance_status: existingAttendance,
-          assessment_id: existing.assessment_id || ''
-        };
-      }
+      )
+    ) {
+      return {
+        changed: false,
+        reason: 'EXPLICIT_ABSENCE_PRESERVED',
+        attendance_status: existingAttendance,
+        assessment_id: existing.assessment_id || '',
+        session_config_id: sessionConfigId,
+        session_no: finalSession.session_no
+      };
+    }
+
+    // If the teacher already saved real content in the final session, never
+    // overwrite it from Final Evaluation. This prevents duplicate/hidden edits.
+    if (wantsAutoZiyadah && existing && hasAssessmentContentGS(existing)) {
+      return {
+        changed: false,
+        reason: 'FINAL_SESSION_CONTENT_PRESERVED',
+        attendance_status: existingAttendance,
+        assessment_id: existing.assessment_id || '',
+        session_config_id: sessionConfigId,
+        session_no: finalSession.session_no
+      };
     }
 
     var now = nowIsoGS();
@@ -2944,16 +2982,119 @@ function ensureFinalSessionPresentFromEvaluationGS(participant, evaluatorTeacher
     assessment.student_id = studentId;
     assessment.halaqah_id = halaqahId;
     assessment.session_no = finalSession.session_no;
-    assessment.attendance_status = 'PRESENT';
-    assessment.assessment_status = 'PENDING';
-    assessment.assessment_mode = '';
     assessment.teacher_id = cleanStringGS(evaluatorTeacherId);
     assessment.is_deleted = false;
     assessment.deleted_at = '';
     assessment.deleted_by = '';
     assessment.updated_at = now;
 
-    // Critical: auto-present means attendance only, never fake a setoran.
+    if (wantsAutoZiyadah) {
+      var ziFields = [
+        'surah_start',
+        'ayah_start',
+        'surah_end',
+        'ayah_end'
+      ];
+
+      for (var z = 0; z < ziFields.length; z++) {
+        var ziNumber = Number(requestedZi[ziFields[z]]);
+        if (!isFinite(ziNumber) || isNaN(ziNumber) || ziNumber < 1) {
+          return {
+            changed: false,
+            reason: 'AUTO_ZIYADAH_INVALID_RANGE',
+            error: 'Rentang Ziyadah otomatis sesi akhir tidak valid.'
+          };
+        }
+      }
+
+      if (
+        Number(requestedZi.surah_start) > 114 ||
+        Number(requestedZi.surah_end) > 114
+      ) {
+        return {
+          changed: false,
+          reason: 'AUTO_ZIYADAH_INVALID_SURAH',
+          error: 'Nomor Surah Ziyadah otomatis tidak valid.'
+        };
+      }
+
+      // Turn an empty/attendance-only shell into a real final-session Ziyadah.
+      clearAllProgressFieldsGS(assessment);
+
+      assessment.attendance_status = 'PRESENT';
+      assessment.assessment_status = 'COMPLETED';
+      assessment.assessment_mode = 'ZIYADAH';
+      assessment.surah_start = Number(requestedZi.surah_start);
+      assessment.ayah_start = Number(requestedZi.ayah_start);
+      assessment.surah_end = Number(requestedZi.surah_end);
+      assessment.ayah_end = Number(requestedZi.ayah_end);
+      assessment.lines_added = requestedLines;
+
+      if (!cleanStringGS(assessment.session_note)) {
+        assessment.session_note =
+          'Tambahan Ziyadah terdeteksi otomatis saat Evaluasi Akhir.';
+      }
+
+      var ziSaveStatus = upsertObject(
+        '13_SESSION_ASSESSMENTS',
+        ['event_id', 'participant_id', 'session_config_id'],
+        assessment,
+        'assessment_id'
+      );
+
+      addAuditLog(
+        'AUTO_ZIYADAH_FROM_FINAL_EVALUATION',
+        'SESSION_ASSESSMENT',
+        assessment.assessment_id,
+        existing || null,
+        assessment,
+        'Tambahan baris Ziyadah sesi akhir dihitung dari perubahan batas hafalan pada Evaluasi Akhir.',
+        actorUserId || 'SYSTEM',
+        eventId
+      );
+
+      return {
+        changed: true,
+        ziyadah_added: true,
+        status: ziSaveStatus,
+        assessment_id: assessment.assessment_id,
+        session_config_id: sessionConfigId,
+        session_no: finalSession.session_no,
+        attendance_status: 'PRESENT',
+        assessment_mode: 'ZIYADAH',
+        lines_added: requestedLines,
+        surah_start: assessment.surah_start,
+        ayah_start: assessment.ayah_start,
+        surah_end: assessment.surah_end,
+        ayah_end: assessment.ayah_end
+      };
+    }
+
+    // No new Ziyadah was detected. Keep the previous safe behaviour:
+    // saving Final Evaluation may infer PRESENT only when attendance is empty.
+    if (
+      existing &&
+      (
+        existingAttendance === 'PRESENT' ||
+        existingAttendance === 'SICK' ||
+        existingAttendance === 'PERMISSION' ||
+        existingAttendance === 'ABSENT'
+      )
+    ) {
+      return {
+        changed: false,
+        reason: 'EXISTING_ATTENDANCE_PRESERVED',
+        attendance_status: existingAttendance,
+        assessment_id: existing.assessment_id || '',
+        session_config_id: sessionConfigId,
+        session_no: finalSession.session_no
+      };
+    }
+
+    assessment.attendance_status = 'PRESENT';
+    assessment.assessment_status = 'PENDING';
+    assessment.assessment_mode = '';
+
     clearAllProgressFieldsGS(assessment);
     assessment.assessment_mode = '';
     assessment.assessment_status = 'PENDING';
@@ -2978,6 +3119,7 @@ function ensureFinalSessionPresentFromEvaluationGS(participant, evaluatorTeacher
 
     return {
       changed: true,
+      ziyadah_added: false,
       status: saveStatus,
       assessment_id: assessment.assessment_id,
       session_config_id: sessionConfigId,
@@ -2985,15 +3127,14 @@ function ensureFinalSessionPresentFromEvaluationGS(participant, evaluatorTeacher
       attendance_status: 'PRESENT'
     };
   } catch (error) {
-    // Final Evaluation itself must remain safe even if attendance automation fails.
     Logger.log(
-      'AUTO_PRESENT_FROM_FINAL_EVALUATION failed: ' +
+      'FINAL_SESSION_FROM_FINAL_EVALUATION failed: ' +
       (error && error.message ? error.message : String(error))
     );
 
     return {
       changed: false,
-      reason: 'AUTO_PRESENT_ERROR',
+      reason: 'AUTO_FINAL_SESSION_ERROR',
       error: error && error.message ? error.message : String(error)
     };
   }
@@ -3002,6 +3143,15 @@ function ensureFinalSessionPresentFromEvaluationGS(participant, evaluatorTeacher
 function handleSaveFinalEvaluation(payload, authToken) {
   var actor = requireRole(authToken, [ROLES.TEACHER, ROLES.ADMIN]);
   var evaluation = Object.assign({}, payload.finalEvaluation || {});
+  var autoFinalZiyadah =
+    payload.autoFinalZiyadah ||
+    payload.auto_final_ziyadah ||
+    evaluation.auto_final_ziyadah ||
+    null;
+
+  // This operational instruction belongs to 13_SESSION_ASSESSMENTS and must
+  // never become a column/value inside 14_FINAL_EVALUATIONS.
+  delete evaluation.auto_final_ziyadah;
 
   if (!cleanStringGS(evaluation.participant_id)) {
     return jsonError('VALIDATION_ERROR', 'participant_id wajib diisi.');
@@ -3172,11 +3322,13 @@ function handleSaveFinalEvaluation(payload, authToken) {
   var autoAttendanceResult = ensureFinalSessionPresentFromEvaluationGS(
     participant,
     evaluation.evaluator_teacher_id,
-    actor.user_id
+    actor.user_id,
+    autoFinalZiyadah
   );
 
-  // Helpful for debugging; ignored safely by older frontends.
+  // Helpful for debugging and local-first ID reconciliation.
   evaluation.auto_attendance = autoAttendanceResult;
+  evaluation.auto_final_ziyadah = autoAttendanceResult;
 
   return jsonResponse(evaluation);
 }
@@ -3895,6 +4047,238 @@ function calculateSkillTransitionsGS(participants, evaluationSkillMap) {
     notEvaluatedSkillCount: notEvaluatedSkillCount,
     missingSkillStartCount: missingSkillStartCount
   };
+}
+
+
+
+// ====================================================
+// 22A. GRADE RECAP — READ ONLY FOR TEACHERS
+// ====================================================
+
+/**
+ * Normalized RT 1–6 source for wali-kelas/report-card recap.
+ *
+ * Access policy (intentional):
+ * TEACHER, ADMIN, COORDINATOR, and VIEWER may read the whole recap.
+ * This endpoint is read-only and is NOT restricted to the teacher's halaqah.
+ *
+ * The browser performs Semester 1 / Semester 2 / Custom aggregation from this
+ * one response, avoiding repeated Apps Script calls while teachers toggle RTs.
+ */
+function handleGetGradeRecap(payload, authToken) {
+  requireRole(authToken, [
+    ROLES.TEACHER,
+    ROLES.ADMIN,
+    ROLES.COORDINATOR,
+    ROLES.VIEWER
+  ]);
+
+  var events = readSheetObjects('07_EVENTS')
+    .filter(function(eventObj) {
+      var sequenceNo = Number(eventObj.sequence_no);
+      return isFinite(sequenceNo) && sequenceNo >= 1 && sequenceNo <= 6;
+    })
+    .sort(function(a, b) {
+      return Number(a.sequence_no || 0) - Number(b.sequence_no || 0);
+    });
+
+  var eventMap = {};
+  events.forEach(function(eventObj) {
+    eventMap[cleanStringGS(eventObj.event_id)] = eventObj;
+  });
+
+  var students = readSheetObjects('03_MASTER_STUDENTS');
+  var studentMap = {};
+  students.forEach(function(student) {
+    studentMap[cleanStringGS(student.student_id)] = student;
+  });
+
+  var participants = readSheetObjects('12_EVENT_PARTICIPANTS').filter(function(p) {
+    return Boolean(eventMap[cleanStringGS(p.event_id)]);
+  });
+
+  var participantById = {};
+  var participantByEventStudent = {};
+  participants.forEach(function(p) {
+    var participantId = cleanStringGS(p.participant_id);
+    var eventId = cleanStringGS(p.event_id);
+    var studentId = cleanStringGS(p.student_id);
+
+    if (participantId) participantById[participantId] = p;
+    if (eventId && studentId) {
+      participantByEventStudent[eventId + '::' + studentId] = p;
+    }
+  });
+
+  var rowMap = {};
+
+  function ensureRow(studentId) {
+    studentId = cleanStringGS(studentId);
+    if (!studentId) return null;
+
+    if (!rowMap[studentId]) {
+      var student = studentMap[studentId] || {};
+      rowMap[studentId] = {
+        student_id: studentId,
+        full_name: cleanStringGS(student.full_name) || studentId,
+        class_name: cleanStringGS(student.class_name),
+        event_metrics: [],
+        _class_sequence: -1
+      };
+    }
+
+    return rowMap[studentId];
+  }
+
+  function ensureMetric(row, eventId) {
+    if (!row) return null;
+    eventId = cleanStringGS(eventId);
+    var eventObj = eventMap[eventId];
+    if (!eventObj) return null;
+
+    var found = row.event_metrics.find(function(metric) {
+      return cleanStringGS(metric.event_id) === eventId;
+    });
+
+    if (found) return found;
+
+    var metric = {
+      event_id: eventId,
+      sequence_no: Number(eventObj.sequence_no || 0),
+      participant: false,
+      ziyadah_lines: 0,
+      final_score: null,
+      affective_rating: '',
+      skill_status_end: ''
+    };
+
+    row.event_metrics.push(metric);
+    return metric;
+  }
+
+  // Participant union determines who belongs in the recap.
+  participants.forEach(function(p) {
+    var eventId = cleanStringGS(p.event_id);
+    var studentId = cleanStringGS(p.student_id);
+    var row = ensureRow(studentId);
+    var metric = ensureMetric(row, eventId);
+    if (!row || !metric) return;
+
+    metric.participant = true;
+
+    // Master class is preferred. If it is blank, keep the latest snapshot.
+    if (!cleanStringGS(row.class_name)) {
+      var sequenceNo = Number((eventMap[eventId] || {}).sequence_no || 0);
+      var snapshot = cleanStringGS(p.class_snapshot);
+      if (snapshot && sequenceNo >= Number(row._class_sequence || -1)) {
+        row.class_name = snapshot;
+        row._class_sequence = sequenceNo;
+      }
+    }
+  });
+
+  // Resolve canonical assessment rows first so silent attendance shells or
+  // retried writes cannot double-count/erase Ziyadah progress.
+  var assessments = readSheetObjects('13_SESSION_ASSESSMENTS').filter(function(a) {
+    return !isDeletedRecordGS(a) && Boolean(eventMap[cleanStringGS(a.event_id)]);
+  });
+  assessments = resolveCanonicalAssessmentsGS(assessments);
+
+  var assessmentGroups = {};
+  assessments.forEach(function(a) {
+    var eventId = cleanStringGS(a.event_id);
+    var studentId = cleanStringGS(a.student_id);
+
+    if (!studentId && cleanStringGS(a.participant_id)) {
+      var participant = participantById[cleanStringGS(a.participant_id)];
+      studentId = participant ? cleanStringGS(participant.student_id) : '';
+    }
+
+    if (!eventId || !studentId) return;
+
+    var key = eventId + '::' + studentId;
+    if (!assessmentGroups[key]) assessmentGroups[key] = [];
+    assessmentGroups[key].push(a);
+  });
+
+  Object.keys(assessmentGroups).forEach(function(key) {
+    var splitAt = key.indexOf('::');
+    var eventId = key.substring(0, splitAt);
+    var studentId = key.substring(splitAt + 2);
+    var row = ensureRow(studentId);
+    var metric = ensureMetric(row, eventId);
+    if (!row || !metric) return;
+
+    var summary = summarizeAssessmentsByModeGS(assessmentGroups[key]);
+    metric.ziyadah_lines = Number(summary.ziyadahLines || 0);
+  });
+
+  // Process oldest -> newest so a defensive duplicate, if one ever exists,
+  // leaves the latest active Final Evaluation as the displayed value.
+  var evaluations = readSheetObjects('14_FINAL_EVALUATIONS')
+    .filter(function(e) {
+      return !isDeletedRecordGS(e) && Boolean(eventMap[cleanStringGS(e.event_id)]);
+    })
+    .sort(function(a, b) {
+      return getAssessmentTimestampGS(a) - getAssessmentTimestampGS(b);
+    });
+
+  evaluations.forEach(function(e) {
+    var eventId = cleanStringGS(e.event_id);
+    var studentId = cleanStringGS(e.student_id);
+
+    if (!studentId && cleanStringGS(e.participant_id)) {
+      var participant = participantById[cleanStringGS(e.participant_id)];
+      studentId = participant ? cleanStringGS(participant.student_id) : '';
+    }
+
+    if (!eventId || !studentId) return;
+
+    var row = ensureRow(studentId);
+    var metric = ensureMetric(row, eventId);
+    if (!row || !metric) return;
+
+    var score = Number(e.final_score);
+    metric.final_score = hasValueGS(e.final_score) && isFinite(score) && !isNaN(score)
+      ? score
+      : null;
+    metric.affective_rating = upperGS(e.affective_rating);
+    metric.skill_status_end = sanitizeSkillStatusGS(e.skill_status_end);
+  });
+
+  var rows = Object.keys(rowMap).map(function(studentId) {
+    var row = rowMap[studentId];
+    delete row._class_sequence;
+
+    row.event_metrics.sort(function(a, b) {
+      return Number(a.sequence_no || 0) - Number(b.sequence_no || 0);
+    });
+
+    return row;
+  });
+
+  rows.sort(function(a, b) {
+    var classA = cleanStringGS(a.class_name);
+    var classB = cleanStringGS(b.class_name);
+    if (classA !== classB) return classA.localeCompare(classB, 'id', { numeric: true });
+    return cleanStringGS(a.full_name).localeCompare(cleanStringGS(b.full_name), 'id');
+  });
+
+  return jsonResponse({
+    events: events.map(function(eventObj) {
+      return {
+        event_id: eventObj.event_id,
+        event_name: eventObj.event_name,
+        academic_year: eventObj.academic_year,
+        sequence_no: Number(eventObj.sequence_no || 0),
+        status: eventObj.status,
+        start_date: eventObj.start_date,
+        end_date: eventObj.end_date
+      };
+    }),
+    rows: rows,
+    generated_at: nowIsoGS()
+  });
 }
 
 // ====================================================

@@ -2006,6 +2006,108 @@ export const TeacherWorkspaceProvider: React.FC<{
         updated_at: nowIso
       };
 
+      // Projection no Mahou: Final Evaluation may carry a calculated
+      // Ziyadah delta for the final session. Keep it local-first too, so the
+      // workspace totals immediately match what the teacher just saved.
+      let optimisticAssessments = [...workspace.assessments];
+      const autoZi = payload.auto_final_ziyadah;
+
+      if (
+        autoZi?.enabled &&
+        Number(autoZi.lines_added || 0) > 0 &&
+        autoZi.session_config_id
+      ) {
+        const assessmentIndex = optimisticAssessments.findIndex(
+          assessment =>
+            !assessment.is_deleted &&
+            assessment.session_config_id === autoZi.session_config_id &&
+            (
+              (participantId &&
+                assessment.participant_id === participantId) ||
+              (studentId && assessment.student_id === studentId)
+            )
+        );
+
+        const existingAssessment =
+          assessmentIndex >= 0
+            ? optimisticAssessments[assessmentIndex]
+            : undefined;
+
+        const existingAttendance = String(
+          existingAssessment?.attendance_status || 'UNASSESSED'
+        ).toUpperCase();
+
+        const explicitAbsence =
+          existingAttendance === 'SICK' ||
+          existingAttendance === 'PERMISSION' ||
+          existingAttendance === 'ABSENT';
+
+        // Never overwrite substantive final-session input that the teacher
+        // already saved manually. The FinalEvaluation UI normally suppresses
+        // autoZi in that case; this is a second safety guard.
+        const hasExistingContent = existingAssessment
+          ? hasAssessmentContent(existingAssessment)
+          : false;
+
+        if (!explicitAbsence && !hasExistingContent) {
+          const finalSessionConfig = workspace.sessionConfigs.find(
+            sc => sc.session_config_id === autoZi.session_config_id
+          );
+
+          const autoAssessment: SessionAssessment = {
+            ...(existingAssessment || {}),
+            assessment_id:
+              existingAssessment?.assessment_id ||
+              `ASM-LOCAL-FINAL-${Date.now()}`,
+            event_id: eventId,
+            event_day_id:
+              autoZi.event_day_id ||
+              finalSessionConfig?.event_day_id ||
+              existingAssessment?.event_day_id ||
+              '',
+            session_config_id: autoZi.session_config_id,
+            participant_id: participantId,
+            student_id: studentId,
+            halaqah_id:
+              existingAssessment?.halaqah_id ||
+              workspace.halaqah?.halaqah_id ||
+              '',
+            session_no:
+              Number(autoZi.session_no) ||
+              Number(finalSessionConfig?.session_no) ||
+              1,
+            attendance_status: 'PRESENT',
+            assessment_status: 'COMPLETED',
+            assessment_mode: 'ZIYADAH',
+            surah_start: Number(autoZi.surah_start),
+            ayah_start: Number(autoZi.ayah_start),
+            surah_end: Number(autoZi.surah_end),
+            ayah_end: Number(autoZi.ayah_end),
+            lines_added: Number(autoZi.lines_added),
+            nuroniyyah_dars: undefined,
+            iqra_level: undefined,
+            iqra_page_start: undefined,
+            iqra_page_end: undefined,
+            iqra_pages_added: undefined,
+            teacher_id: currentTeacherId,
+            is_deleted: false,
+            created_at:
+              existingAssessment?.created_at || nowIso,
+            updated_at: nowIso
+          } as SessionAssessment;
+
+          if (assessmentIndex >= 0) {
+            optimisticAssessments[assessmentIndex] = autoAssessment;
+          } else {
+            optimisticAssessments.push(autoAssessment);
+          }
+
+          optimisticAssessments = deduplicateAssessments(
+            optimisticAssessments
+          );
+        }
+      }
+
       const evaluations = [...workspace.finalEvaluations];
       const index = evaluations.findIndex(
         evaluation =>
@@ -2018,10 +2120,11 @@ export const TeacherWorkspaceProvider: React.FC<{
 
       const updatedWorkspace: TeacherWorkspaceBootstrap = {
         ...workspace,
+        assessments: optimisticAssessments,
         finalEvaluations: evaluations,
         students: recomputeStudentProgress(
           workspace.students,
-          workspace.assessments,
+          optimisticAssessments,
           evaluations
         )
       };
@@ -2104,9 +2207,47 @@ export const TeacherWorkspaceProvider: React.FC<{
                 }
               );
 
+              const autoResult = (serverEvaluation as any)
+                ?.auto_final_ziyadah;
+
+              let patchedAssessments = prev.assessments;
+
+              if (
+                autoResult?.assessment_id &&
+                autoResult?.session_config_id
+              ) {
+                patchedAssessments = prev.assessments.map(
+                  assessment => {
+                    const sameFinalSession =
+                      assessment.session_config_id ===
+                        autoResult.session_config_id &&
+                      (
+                        (participantId &&
+                          assessment.participant_id === participantId) ||
+                        (studentId &&
+                          assessment.student_id === studentId)
+                      );
+
+                    return sameFinalSession
+                      ? {
+                          ...assessment,
+                          assessment_id:
+                            autoResult.assessment_id
+                        }
+                      : assessment;
+                  }
+                );
+              }
+
               const next = {
                 ...prev,
-                finalEvaluations: patchedEvaluations
+                assessments: patchedAssessments,
+                finalEvaluations: patchedEvaluations,
+                students: recomputeStudentProgress(
+                  prev.students,
+                  patchedAssessments,
+                  patchedEvaluations
+                )
               };
 
               saveWorkspaceToCache(cacheKey, next);

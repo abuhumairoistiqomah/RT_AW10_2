@@ -5,7 +5,6 @@ import { useTeacherWorkspace } from '../../context/TeacherWorkspaceContext';
 import { TeacherSyncBadge } from './TeacherSyncBadge';
 import { getSurahByNo, getSurahNameFormatted, validateAyah, formatCurrentProgress } from '../../utils/quran';
 import { formatSessionOptionLabel, sortSessionConfigs, isFinalEvaluationSession as checkIsFinalEvaluationSession } from '../../utils/sessionFormatter';
-import { resolveCanonicalAssessment, resolveAuthoritativeMode } from '../../utils/assessmentResolver';
 import { SessionSummaryCard } from '../common/SessionSummaryCard';
 import { Toast } from '../common/Toast';
 import {
@@ -13,6 +12,10 @@ import {
   AlertCircle, Trash2, ArrowRight, Layers, UserCheck, RefreshCw, Clock, Award, Loader2
 } from 'lucide-react';
 import { SurahAutocomplete } from '../common/SurahAutocomplete';
+import {
+  calculateQuranPhysicalLines,
+  warmQuranLineCalculator
+} from '../../utils/quranLineCalculator';
 
 interface SessionAssessmentProps {
   currentUser: User | null;
@@ -69,11 +72,37 @@ export const SessionAssessment: React.FC<SessionAssessmentProps> = ({
   const [endSurah, setEndSurah] = useState<number | undefined>(undefined);
   const [endAyah, setEndAyah] = useState<string>('');
   const [linesAdded, setLinesAdded] = useState<string>('');
+
+  // Automatic Ziyadah physical-line calculator.
+  // It only recalculates after the teacher changes the Qur'an range,
+  // so merely opening an older record does not overwrite saved manual data.
+  const lineCalcRequestRef = useRef<number>(0);
+  const lineManualOverrideRef = useRef<boolean>(false);
+
+  // Form stability guards.
+  // - hydratedSelectionKeyRef prevents background workspace refreshes from
+  //   re-hydrating a form that the teacher is already viewing/editing.
+  // - formDirtyRef records real teacher interaction.
+  // - endSurahAutoLinkedRef lets Surah Akhir follow Surah Awal only until
+  //   the teacher edits Surah Akhir manually.
+  const hydratedSelectionKeyRef = useRef<string>('');
+  const formDirtyRef = useRef<boolean>(false);
+  const endSurahAutoLinkedRef = useRef<boolean>(true);
+
+  const [lineAutoState, setLineAutoState] = useState<
+    'IDLE' | 'LOADING' | 'AUTO' | 'MANUAL' | 'ERROR'
+  >('IDLE');
+  const [lineAutoDetail, setLineAutoDetail] = useState<string>('');
+
   const [nuroniyyahDars, setNuroniyyahDars] = useState<string>('');
   const [iqraLevel, setIqraLevel] = useState<number | undefined>(undefined);
   const [iqraPageStart, setIqraPageStart] = useState<string>('');
   const [iqraPageEnd, setIqraPageEnd] = useState<string>('');
-  const [iqraPagesAdded, setIqraPagesAdded] = useState<string>('');
+  const iqraPagesAdded = useMemo(() => {
+    const start = Number(iqraPageStart);
+    const end = Number(iqraPageEnd);
+    return Number.isFinite(start) && Number.isFinite(end) && start > 0 && end >= start ? end - start + 1 : 0;
+  }, [iqraPageStart, iqraPageEnd]);
   const [notes, setNotes] = useState<string>('');
 
   // Edit Mode Tracker
@@ -89,6 +118,12 @@ export const SessionAssessment: React.FC<SessionAssessmentProps> = ({
   const sessionConfigs = useMemo(() => workspace?.sessionConfigs || [], [workspace?.sessionConfigs]);
   const assessments = useMemo(() => workspace?.assessments || [], [workspace?.assessments]);
   const finalEvaluations = useMemo(() => workspace?.finalEvaluations || [], [workspace?.finalEvaluations]);
+
+  // Quiet warm-up. First device load fetches the public QCF4 verse-line index
+  // once, then a compact copy is cached locally. No GAS request is involved.
+  useEffect(() => {
+    void warmQuranLineCalculator();
+  }, []);
 
   // Load event days when event changes
   useEffect(() => {
@@ -120,13 +155,35 @@ export const SessionAssessment: React.FC<SessionAssessmentProps> = ({
   // Session configs for halaqah (filtered by session_group_id & active)
   const availableSessionConfigs = useMemo(() => {
     const groupId = halaqah?.session_group_id;
-    let list = sessionConfigs.filter(sc => sc.active !== false && String(sc.active) !== 'false');
+
+    let list = sessionConfigs.filter(
+      sc => sc.active !== false && String(sc.active) !== 'false'
+    );
+
     if (groupId && groupId.trim() !== '') {
-      const filteredByGroup = list.filter(sc => sc.session_group_id === groupId);
+      const filteredByGroup = list.filter(
+        sc => sc.session_group_id === groupId
+      );
+
       if (filteredByGroup.length > 0) {
         list = filteredByGroup;
       }
     }
+
+    // eventDays is loaded asynchronously.
+    // Before it is available, sorting by clock time can make a later
+    // session (for example Sesi 4) appear first for a few seconds.
+    // session_no is the stable fallback until day metadata arrives.
+    if (eventDays.length === 0) {
+      return [...list].sort(
+        (a, b) =>
+          Number(a.session_no || 0) - Number(b.session_no || 0) ||
+          String(a.start_time || '').localeCompare(
+            String(b.start_time || '')
+          )
+      );
+    }
+
     return sortSessionConfigs(list, eventDays);
   }, [sessionConfigs, halaqah, eventDays]);
 
@@ -179,9 +236,6 @@ export const SessionAssessment: React.FC<SessionAssessmentProps> = ({
     return checkIsFinalEvaluationSession(selectedSessionConfig, availableSessionConfigs);
   }, [selectedSessionConfig, availableSessionConfigs]);
 
-  const [savingPresensi, setSavingPresensi] = useState<boolean>(false);
-  const hydratedKeyRef = useRef<string>('');
-
   // Draft Key Generator
   const getDraftKey = useCallback(() => {
     const userId = currentUser?.user_id || 'user';
@@ -189,322 +243,610 @@ export const SessionAssessment: React.FC<SessionAssessmentProps> = ({
     const studentId = selectedStudentId || 'student';
     const sessionCfgId = selectedSessionConfigId || 'sess';
     return `draft/${userId}/${eventId}/${studentId}/${sessionCfgId}`;
-  }, [currentUser, workspace?.event?.event_id, selectedStudentId, selectedSessionConfigId]);
+  }, [
+    currentUser,
+    workspace?.event?.event_id,
+    selectedStudentId,
+    selectedSessionConfigId
+  ]);
 
-  // Mode change handler: clears fields of other mode
-  const handleModeChange = (newMode: 'ZIYADAH' | 'NURONIYYAH' | 'IQRA') => {
+  const markFormDirty = useCallback(() => {
+    formDirtyRef.current = true;
+  }, []);
+
+  /**
+   * Resolve a persisted assessment mode safely.
+   *
+   * assessment_mode is authoritative whenever it contains one of the three
+   * canonical values. Legacy fields are inspected ONLY if assessment_mode is
+   * blank. This prevents empty Spreadsheet cells such as iqra_level = ""
+   * from being misread as an Iqra assessment.
+   */
+  const resolvePersistedAssessmentMode = useCallback(
+    (assessment: any): 'ZIYADAH' | 'NURONIYYAH' | 'IQRA' => {
+      const explicit = String(
+        assessment?.assessment_mode || ''
+      )
+        .trim()
+        .toUpperCase();
+
+      if (
+        explicit === 'ZIYADAH' ||
+        explicit === 'NURONIYYAH' ||
+        explicit === 'IQRA'
+      ) {
+        return explicit;
+      }
+
+      const hasPositiveNumber = (value: unknown) => {
+        if (
+          value === '' ||
+          value === null ||
+          value === undefined
+        ) {
+          return false;
+        }
+
+        const num = Number(value);
+        return Number.isFinite(num) && num > 0;
+      };
+
+      const hasText = (value: unknown) =>
+        String(value ?? '').trim().length > 0;
+
+      const hasMeaningfulIqra =
+        hasPositiveNumber(assessment?.iqra_level) ||
+        hasPositiveNumber(assessment?.iqra_page_start) ||
+        hasPositiveNumber(assessment?.iqra_page_end) ||
+        hasPositiveNumber(assessment?.iqra_pages_added);
+
+      if (hasMeaningfulIqra) {
+        return 'IQRA';
+      }
+
+      if (hasText(assessment?.nuroniyyah_dars)) {
+        return 'NURONIYYAH';
+      }
+
+      // Qur'an/Ziyadah is the safe canonical fallback for legacy rows.
+      return 'ZIYADAH';
+    },
+    []
+  );
+
+  /**
+   * Reset unsaved UI state only.
+   *
+   * No cache write.
+   * No pending queue.
+   * No GAS request.
+   *
+   * Therefore changing student/session can never accidentally create
+   * a background sync mutation.
+   */
+  const resetTransientForm = useCallback(() => {
+    lineCalcRequestRef.current += 1;
+    lineManualOverrideRef.current = false;
+
+    hydratedSelectionKeyRef.current = '';
+    formDirtyRef.current = false;
+    endSurahAutoLinkedRef.current = true;
+
+    setExistingAssessmentId(null);
+    setAttendance('UNASSESSED');
+    setAssessmentMode('ZIYADAH');
+
+    setStartSurah(undefined);
+    setStartAyah('');
+    setEndSurah(undefined);
+    setEndAyah('');
+    setLinesAdded('');
+
+    setLineAutoState('IDLE');
+    setLineAutoDetail('');
+
+    setNuroniyyahDars('');
+    setIqraLevel(undefined);
+    setIqraPageStart('');
+    setIqraPageEnd('');
+    setNotes('');
+
+    setSuccessMsg('');
+    setErrorMsg('');
+  }, []);
+
+  const handleStudentSelectionChange = (
+    nextStudentId: string
+  ) => {
+    if (nextStudentId === selectedStudentId) return;
+
+    resetTransientForm();
+    setSelectedStudentId(nextStudentId);
+  };
+
+  const handleSessionSelectionChange = (
+    nextSessionConfigId: string
+  ) => {
+    if (nextSessionConfigId === selectedSessionConfigId) return;
+
+    // Unsaved form values are intentionally discarded.
+    // Only explicit Save actions are allowed to enqueue sync.
+    resetTransientForm();
+    setSelectedSessionConfigId(nextSessionConfigId);
+  };
+
+  type ZiyadahRangePatch = Partial<{
+    startSurah: number | undefined;
+    startAyah: string;
+    endSurah: number | undefined;
+    endAyah: string;
+  }>;
+
+  const recalculateZiyadahLines = useCallback(
+    async (patch: ZiyadahRangePatch = {}) => {
+      const nextStartSurah =
+        Object.prototype.hasOwnProperty.call(patch, 'startSurah')
+          ? patch.startSurah
+          : startSurah;
+      const nextStartAyah =
+        Object.prototype.hasOwnProperty.call(patch, 'startAyah')
+          ? patch.startAyah ?? ''
+          : startAyah;
+      const nextEndSurah =
+        Object.prototype.hasOwnProperty.call(patch, 'endSurah')
+          ? patch.endSurah
+          : endSurah;
+      const nextEndAyah =
+        Object.prototype.hasOwnProperty.call(patch, 'endAyah')
+          ? patch.endAyah ?? ''
+          : endAyah;
+
+      const requestId = ++lineCalcRequestRef.current;
+
+      // The range changed, so any manual override belonged to the old range.
+      lineManualOverrideRef.current = false;
+
+      const startAyahNo = Number(nextStartAyah);
+      const endAyahNo = Number(nextEndAyah);
+
+      if (
+        !nextStartSurah ||
+        !nextEndSurah ||
+        !nextStartAyah ||
+        !nextEndAyah ||
+        !Number.isInteger(startAyahNo) ||
+        !Number.isInteger(endAyahNo) ||
+        startAyahNo < 1 ||
+        endAyahNo < 1
+      ) {
+        setLineAutoState('IDLE');
+        setLineAutoDetail(
+          'Lengkapi Surah dan Ayat awal–akhir untuk menghitung baris otomatis.'
+        );
+        setLinesAdded('');
+        return;
+      }
+
+      const startValidation =
+        validateAyah(nextStartSurah, startAyahNo);
+      const endValidation =
+        validateAyah(nextEndSurah, endAyahNo);
+
+      if (!startValidation.valid || !endValidation.valid) {
+        setLineAutoState('IDLE');
+        setLineAutoDetail(
+          'Rentang ayat belum valid. Jumlah baris tetap dapat diisi manual.'
+        );
+        setLinesAdded('');
+        return;
+      }
+
+      // Across different surahs we intentionally allow both directions.
+      // Example school pattern: An-Naas 1 -> Al-Ikhlas 3 means
+      // 114:1..6, 113:1..5, 112:1..3. Ayat inside each surah still move
+      // forward, so only a reversed ayat range inside the SAME surah is invalid.
+      if (
+        nextStartSurah === nextEndSurah &&
+        startAyahNo > endAyahNo
+      ) {
+        setLineAutoState('ERROR');
+        setLineAutoDetail(
+          'Dalam surah yang sama, ayat akhir harus sama atau lebih besar dari ayat awal.'
+        );
+        setLinesAdded('');
+        return;
+      }
+
+      setLineAutoState('LOADING');
+      setLineAutoDetail(
+        'Menghitung berdasarkan Mushaf Madinah 15 baris…'
+      );
+      setLinesAdded('');
+
+      try {
+        const result = await calculateQuranPhysicalLines({
+          startSurah: nextStartSurah,
+          startAyah: startAyahNo,
+          endSurah: nextEndSurah,
+          endAyah: endAyahNo
+        });
+
+        if (
+          requestId !== lineCalcRequestRef.current ||
+          lineManualOverrideRef.current
+        ) {
+          return;
+        }
+
+        setLinesAdded(String(result.totalLines));
+        setLineAutoState('AUTO');
+
+        const pages = result.breakdown.length;
+        const directionLabel =
+          result.direction === 'BACKWARD_SURAH'
+            ? 'arah surah mundur'
+            : result.direction === 'FORWARD'
+              ? 'arah surah maju'
+              : 'surah yang sama';
+
+        setLineAutoDetail(
+          `Dihitung otomatis: ${result.totalLines} baris • ` +
+          `${result.verseCount} ayat • ${pages} halaman • ${directionLabel}. ` +
+          `Dapat disesuaikan guru.`
+        );
+      } catch (error) {
+        if (requestId !== lineCalcRequestRef.current) {
+          return;
+        }
+
+        setLineAutoState('ERROR');
+        setLineAutoDetail(
+          'Hitung otomatis belum tersedia. Isi jumlah baris secara manual atau coba Hitung Ulang.'
+        );
+
+        console.warn(
+          '[SessionAssessment] Hitung baris Ziyadah gagal:',
+          error
+        );
+      }
+    },
+    [startSurah, startAyah, endSurah, endAyah]
+  );
+
+  const handleManualLinesChange = (value: string) => {
+    markFormDirty();
+    lineCalcRequestRef.current += 1;
+    lineManualOverrideRef.current = true;
+    setLinesAdded(value);
+    setLineAutoState('MANUAL');
+    setLineAutoDetail(
+      'Jumlah baris disesuaikan manual oleh guru.'
+    );
+  };
+
+  const handleRecalculateLines = () => {
+    markFormDirty();
+    lineManualOverrideRef.current = false;
+    void recalculateZiyadahLines();
+  };
+
+  // Mode change handler: each mode owns its own progress fields.
+  const handleModeChange = (
+    newMode: 'ZIYADAH' | 'NURONIYYAH' | 'IQRA'
+  ) => {
     if (newMode === assessmentMode) return;
+
+    markFormDirty();
     setAssessmentMode(newMode);
+
     if (newMode === 'ZIYADAH') {
+      endSurahAutoLinkedRef.current = true;
       setNuroniyyahDars('');
       setIqraLevel(undefined);
       setIqraPageStart('');
       setIqraPageEnd('');
-      setIqraPagesAdded('');
-    } else if (newMode === 'NURONIYYAH') {
-      setStartSurah(undefined);
-      setStartAyah('');
-      setEndSurah(undefined);
-      setEndAyah('');
+      lineCalcRequestRef.current += 1;
+      lineManualOverrideRef.current = false;
+      setLineAutoState('IDLE');
+      setLineAutoDetail(
+        'Lengkapi Surah dan Ayat awal–akhir untuk menghitung baris otomatis.'
+      );
+      setLinesAdded('');
+      return;
+    }
+
+    setStartSurah(undefined);
+    setStartAyah('');
+    setEndSurah(undefined);
+    setEndAyah('');
+    lineCalcRequestRef.current += 1;
+    lineManualOverrideRef.current = false;
+    setLineAutoState('IDLE');
+    setLineAutoDetail('');
+
+    if (newMode === 'NURONIYYAH') {
       setIqraLevel(undefined);
       setIqraPageStart('');
       setIqraPageEnd('');
-      setIqraPagesAdded('');
-    } else if (newMode === 'IQRA') {
-      setStartSurah(undefined);
-      setStartAyah('');
-      setEndSurah(undefined);
-      setEndAyah('');
+      setLinesAdded('');
+    } else {
       setNuroniyyahDars('');
       setLinesAdded('');
     }
   };
 
-  // Attendance and setoran are independent.
-  // Auto-suggested start fields do not count as setoran by themselves.
-  const hasSetoranInput = useCallback((): boolean => {
-    if (assessmentMode === 'ZIYADAH') {
-      // endAyah and/or linesAdded indicate the teacher is actually entering setoran.
-      // startSurah/startAyah/endSurah may be auto-suggested from previous progress.
-      return endAyah !== '' || linesAdded !== '';
-    }
-
-    if (assessmentMode === 'NURONIYYAH') {
-      // Ad-Dars can be auto-filled, so linesAdded is the actual trigger.
-      return linesAdded !== '';
-    }
-
-    // Iqra level/start page may be auto-suggested. End page or pages added means input started.
-    return iqraPageEnd !== '' || iqraPagesAdded !== '';
-  }, [assessmentMode, endAyah, linesAdded, iqraPageEnd, iqraPagesAdded]);
-
-  // Populate Form when Student or Session Changes (Navigation)
+  // Populate form when student or session changes.
+  //
+  // IMPORTANT:
+  // This component is now EXPLICIT-SAVE ONLY.
+  // Merely changing attendance/mode/range does not persist a draft and does
+  // not create a pending sync write.
   useEffect(() => {
-    if (!selectedStudentId || !selectedSessionConfig) return;
-
-    const currentKey = `${selectedStudentId}::${selectedSessionConfig.session_config_id}`;
-    // If already hydrated for this student & session, don't reset form on background revalidation
-    if (hydratedKeyRef.current === currentKey) {
+    if (
+      !selectedStudentId ||
+      !selectedSessionConfig ||
+      isLoading
+    ) {
       return;
     }
-    hydratedKeyRef.current = currentKey;
+
+    const selectionKey =
+      `${selectedStudentId}::${selectedSessionConfig.session_config_id}`;
+
+    // Hydrate a student+session only once. Background revalidation may update
+    // workspace arrays, but it must never replace a form already on screen.
+    if (
+      hydratedSelectionKeyRef.current === selectionKey ||
+      formDirtyRef.current
+    ) {
+      return;
+    }
 
     const renderStart = performance.now();
+
     setSuccessMsg('');
     setErrorMsg('');
 
-    // Check if canonical assessment exists for this student & session
-    const existing = resolveCanonicalAssessment(assessments, {
-      eventId: workspace?.event?.event_id,
-      participantId: selectedStudent?.participant_id,
-      studentId: selectedStudentId,
-      sessionConfigId: selectedSessionConfig.session_config_id,
-      sessionNo: selectedSessionConfig.session_no
-    });
+    const existing = assessments.find(
+      a =>
+        !a.is_deleted &&
+        a.student_id === selectedStudentId &&
+        (
+          a.session_config_id ===
+            selectedSessionConfig.session_config_id ||
+          a.session_no === selectedSessionConfig.session_no
+        )
+    );
 
     if (existing) {
-      setExistingAssessmentId(existing.assessment_id);
-      setAttendance(existing.attendance_status || 'PRESENT');
+      // Lock hydration immediately before calling setters. This avoids a
+      // workspace refresh racing another render of the same selection.
+      hydratedSelectionKeyRef.current = selectionKey;
+      formDirtyRef.current = false;
+      endSurahAutoLinkedRef.current = false;
 
-      const existingMode = resolveAuthoritativeMode(existing);
+      setExistingAssessmentId(existing.assessment_id);
+      setAttendance(
+        existing.attendance_status || 'PRESENT'
+      );
+
+      const existingMode =
+        resolvePersistedAssessmentMode(existing);
+
       setAssessmentMode(existingMode);
 
-      if (existingMode === 'IQRA') {
-        setIqraLevel(existing.iqra_level !== undefined && existing.iqra_level !== null && existing.iqra_level !== ('' as any) ? Number(existing.iqra_level) : undefined);
-        setIqraPageStart(existing.iqra_page_start !== undefined && existing.iqra_page_start !== null ? String(existing.iqra_page_start) : '');
-        setIqraPageEnd(existing.iqra_page_end !== undefined && existing.iqra_page_end !== null ? String(existing.iqra_page_end) : '');
-        setIqraPagesAdded(existing.iqra_pages_added !== undefined && existing.iqra_pages_added !== null ? String(existing.iqra_pages_added) : '');
+      if (existingMode === 'NURONIYYAH') {
+        lineCalcRequestRef.current += 1;
+        lineManualOverrideRef.current = false;
+        setLineAutoState('IDLE');
+        setLineAutoDetail('');
+
+        setNuroniyyahDars(
+          existing.nuroniyyah_dars || ''
+        );
+        setLinesAdded(
+          existing.lines_added != null
+            ? String(existing.lines_added)
+            : ''
+        );
+
+        setStartSurah(undefined);
+        setStartAyah('');
+        setEndSurah(undefined);
+        setEndAyah('');
+
+        setIqraLevel(undefined);
+        setIqraPageStart('');
+        setIqraPageEnd('');
+      } else if (existingMode === 'IQRA') {
+        lineCalcRequestRef.current += 1;
+        lineManualOverrideRef.current = false;
+        setLineAutoState('IDLE');
+        setLineAutoDetail('');
+
+        setNuroniyyahDars('');
         setLinesAdded('');
-        setNuroniyyahDars('');
+
         setStartSurah(undefined);
         setStartAyah('');
         setEndSurah(undefined);
         setEndAyah('');
-      } else if (existingMode === 'NURONIYYAH') {
-        setNuroniyyahDars(existing.nuroniyyah_dars || '');
-        setLinesAdded(existing.lines_added !== undefined && existing.lines_added !== null && existing.lines_added !== ('' as any) ? String(existing.lines_added) : '');
-        setStartSurah(undefined);
-        setStartAyah('');
-        setEndSurah(undefined);
-        setEndAyah('');
-        setIqraLevel(undefined);
-        setIqraPageStart('');
-        setIqraPageEnd('');
-        setIqraPagesAdded('');
+
+        setIqraLevel(
+          existing.iqra_level != null
+            ? Number(existing.iqra_level)
+            : undefined
+        );
+        setIqraPageStart(
+          existing.iqra_page_start != null
+            ? String(existing.iqra_page_start)
+            : ''
+        );
+        setIqraPageEnd(
+          existing.iqra_page_end != null
+            ? String(existing.iqra_page_end)
+            : ''
+        );
       } else {
-        // ZIYADAH
-        setStartSurah(existing.surah_start !== undefined && existing.surah_start !== null && existing.surah_start !== ('' as any) ? Number(existing.surah_start) : undefined);
-        setStartAyah(existing.ayah_start !== undefined && existing.ayah_start !== null && existing.ayah_start !== ('' as any) ? String(existing.ayah_start) : '');
-        setEndSurah(existing.surah_end !== undefined && existing.surah_end !== null && existing.surah_end !== ('' as any) ? Number(existing.surah_end) : undefined);
-        setEndAyah(existing.ayah_end !== undefined && existing.ayah_end !== null && existing.ayah_end !== ('' as any) ? String(existing.ayah_end) : '');
-        setLinesAdded(existing.lines_added !== undefined && existing.lines_added !== null && existing.lines_added !== ('' as any) ? String(existing.lines_added) : '');
+        setStartSurah(existing.surah_start);
+        setStartAyah(
+          existing.ayah_start
+            ? String(existing.ayah_start)
+            : ''
+        );
+        setEndSurah(existing.surah_end);
+        setEndAyah(
+          existing.ayah_end
+            ? String(existing.ayah_end)
+            : ''
+        );
+
+        // Existing saved values are authoritative until the teacher
+        // deliberately changes the range or presses Hitung Ulang.
+        lineCalcRequestRef.current += 1;
+        lineManualOverrideRef.current = true;
+        setLineAutoState('MANUAL');
+        setLineAutoDetail(
+          'Nilai baris tersimpan. Ubah rentang ayat atau tekan Hitung Ulang untuk menghitung otomatis.'
+        );
+
+        setLinesAdded(
+          existing.lines_added != null
+            ? String(existing.lines_added)
+            : ''
+        );
+
         setNuroniyyahDars('');
         setIqraLevel(undefined);
         setIqraPageStart('');
         setIqraPageEnd('');
-        setIqraPagesAdded('');
       }
+
       setNotes(existing.session_note || '');
-      console.log(`[PERF] Loaded canonical assessment form in ${(performance.now() - renderStart).toFixed(2)}ms`);
+
+      console.log(
+        `[PERF] Loaded assessment form in ${(performance.now() - renderStart).toFixed(2)}ms`
+      );
       return;
     }
 
-    // No existing assessment -> clean state
+    // No persisted assessment: ZIYADAH is always the primary RT form.
+    // Skill status still controls targets/analytics, NOT which input tab opens.
+    hydratedSelectionKeyRef.current = selectionKey;
+    formDirtyRef.current = false;
+    endSurahAutoLinkedRef.current = true;
+
     setExistingAssessmentId(null);
+    setAttendance('UNASSESSED');
+    setNotes('');
+    setAssessmentMode('ZIYADAH');
 
-    // Check if local draft exists
-    const draftKey = getDraftKey();
-    ApiService.getDraftLocal(draftKey).then(draft => {
-      if (draft) {
-        setAttendance(draft.attendance || 'UNASSESSED');
-        const draftMode = draft.assessmentMode || (selectedStudent?.skill_status_start === 'NON_BBL' ? 'NURONIYYAH' : 'ZIYADAH');
-        setAssessmentMode(draftMode);
-        if (draftMode === 'IQRA') {
-          setIqraLevel(draft.iqraLevel);
-          setIqraPageStart(draft.iqraPageStart || '');
-          setIqraPageEnd(draft.iqraPageEnd || '');
-          setIqraPagesAdded(draft.iqraPagesAdded || '');
-          setLinesAdded('');
-          setNuroniyyahDars('');
-          setStartSurah(undefined);
-          setStartAyah('');
-          setEndSurah(undefined);
-          setEndAyah('');
-        } else if (draftMode === 'NURONIYYAH') {
-          setNuroniyyahDars(draft.nuroniyyahDars || '');
-          setLinesAdded(draft.linesAdded || '');
-          setStartSurah(undefined);
-          setStartAyah('');
-          setEndSurah(undefined);
-          setEndAyah('');
-          setIqraLevel(undefined);
-          setIqraPageStart('');
-          setIqraPageEnd('');
-          setIqraPagesAdded('');
-        } else {
-          setStartSurah(draft.startSurah);
-          setStartAyah(draft.startAyah || '');
-          setEndSurah(draft.endSurah);
-          setEndAyah(draft.endAyah || '');
-          setLinesAdded(draft.linesAdded || '');
-          setNuroniyyahDars('');
-          setIqraLevel(undefined);
-          setIqraPageStart('');
-          setIqraPageEnd('');
-          setIqraPagesAdded('');
-        }
-        setNotes(draft.notes || '');
-        return;
-      }
+    // Remove stale drafts created by older builds. This is local cleanup only.
+    void ApiService.clearDraftLocal(
+      getDraftKey()
+    ).catch(() => undefined);
 
-      // No draft & no existing assessment: Reset form with smart start suggestion
-      setAttendance('UNASSESSED');
-      setNotes('');
+    setNuroniyyahDars('');
+    setIqraLevel(undefined);
+    setIqraPageStart('');
+    setIqraPageEnd('');
 
-      // Smart start suggestion from previous session assessment or baseline
-      const prevSessionNo = selectedSessionConfig.session_no - 1;
-      const prevAssessment = resolveCanonicalAssessment(assessments, {
-        eventId: workspace?.event?.event_id,
-        participantId: selectedStudent?.participant_id,
-        studentId: selectedStudentId,
-        sessionNo: prevSessionNo
-      });
+    // Smart continuation suggestion uses the latest earlier real Ziyadah
+    // assessment. If none exists, fall back to the participant baseline.
+    const previousZiyadah = assessments
+      .filter(
+        a =>
+          !a.is_deleted &&
+          a.student_id === selectedStudentId &&
+          a.attendance_status === 'PRESENT' &&
+          String(a.assessment_mode || '').toUpperCase() ===
+            'ZIYADAH' &&
+          Number(a.session_no || 0) <
+            Number(selectedSessionConfig.session_no || 0) &&
+          Number(a.surah_end || 0) > 0 &&
+          Number(a.ayah_end || 0) > 0
+      )
+      .sort(
+        (a, b) =>
+          Number(b.session_no || 0) -
+          Number(a.session_no || 0)
+      )[0];
 
-      // New assessment default: check previous assessment mode first, otherwise NON_BBL -> 'NURONIYYAH', else 'ZIYADAH'
-      const defaultMode: 'ZIYADAH' | 'NURONIYYAH' | 'IQRA' = prevAssessment
-        ? resolveAuthoritativeMode(prevAssessment)
-        : (selectedStudent?.skill_status_start === 'NON_BBL' ? 'NURONIYYAH' : 'ZIYADAH');
-      setAssessmentMode(defaultMode);
+    if (
+      previousZiyadah?.surah_end &&
+      previousZiyadah?.ayah_end
+    ) {
+      setStartSurah(previousZiyadah.surah_end);
+      setStartAyah(
+        String(Number(previousZiyadah.ayah_end) + 1)
+      );
+      setEndSurah(previousZiyadah.surah_end);
+      setEndAyah('');
+    } else if (
+      selectedStudent?.baseline_surah
+    ) {
+      setStartSurah(
+        selectedStudent.baseline_surah
+      );
+      setStartAyah(
+        selectedStudent.baseline_ayah
+          ? String(selectedStudent.baseline_ayah)
+          : '1'
+      );
+      setEndSurah(
+        selectedStudent.baseline_surah
+      );
+      setEndAyah('');
+    } else {
+      setStartSurah(undefined);
+      setStartAyah('');
+      setEndSurah(undefined);
+      setEndAyah('');
+    }
 
-      if (defaultMode === 'IQRA') {
-        setStartSurah(undefined);
-        setStartAyah('');
-        setEndSurah(undefined);
-        setEndAyah('');
-        setLinesAdded('');
-        setNuroniyyahDars('');
-        setIqraLevel(prevAssessment?.iqra_level ? Number(prevAssessment.iqra_level) : 1);
-        setIqraPageStart(prevAssessment?.iqra_page_end ? String(prevAssessment.iqra_page_end) : '');
-        setIqraPageEnd('');
-        setIqraPagesAdded('');
-      } else if (defaultMode === 'NURONIYYAH') {
-        setStartSurah(undefined);
-        setStartAyah('');
-        setEndSurah(undefined);
-        setEndAyah('');
-        setLinesAdded('');
-        setIqraLevel(undefined);
-        setIqraPageStart('');
-        setIqraPageEnd('');
-        setIqraPagesAdded('');
+    lineCalcRequestRef.current += 1;
+    lineManualOverrideRef.current = false;
+    setLineAutoState('IDLE');
+    setLineAutoDetail(
+      'Lengkapi Surah dan Ayat awal–akhir untuk menghitung baris otomatis.'
+    );
+    setLinesAdded('');
 
-        if (prevAssessment && (prevAssessment.assessment_mode === 'NURONIYYAH' || prevAssessment.nuroniyyah_dars)) {
-          setNuroniyyahDars(prevAssessment.nuroniyyah_dars || '');
-        } else {
-          setNuroniyyahDars('Ad-Dars 1');
-        }
-      } else {
-        setNuroniyyahDars('');
-        setIqraLevel(undefined);
-        setIqraPageStart('');
-        setIqraPageEnd('');
-        setIqraPagesAdded('');
+    console.log(
+      `[PERF] Prepared new Ziyadah form in ${(performance.now() - renderStart).toFixed(2)}ms`
+    );
+  }, [
+    selectedStudentId,
+    selectedSessionConfig,
+    assessments,
+    selectedStudent,
+    getDraftKey,
+    isLoading,
+    resolvePersistedAssessmentMode
+  ]);
 
-        if (prevAssessment && prevAssessment.surah_end && prevAssessment.ayah_end) {
-          const lastSurahObj = getSurahByNo(prevAssessment.surah_end);
-          if (lastSurahObj) {
-            if (prevAssessment.ayah_end < lastSurahObj.total_ayah) {
-              setStartSurah(prevAssessment.surah_end);
-              setStartAyah(String(prevAssessment.ayah_end + 1));
-              setEndSurah(prevAssessment.surah_end);
-              setEndAyah('');
-            } else if (prevAssessment.surah_end < 114) {
-              setStartSurah(prevAssessment.surah_end + 1);
-              setStartAyah('1');
-              setEndSurah(prevAssessment.surah_end + 1);
-              setEndAyah('');
-            } else {
-              setStartSurah(undefined);
-              setStartAyah('');
-              setEndSurah(undefined);
-              setEndAyah('');
-            }
-          }
-        } else if (selectedStudent?.baseline_surah) {
-          setStartSurah(selectedStudent.baseline_surah);
-          setStartAyah(selectedStudent.baseline_ayah ? String(selectedStudent.baseline_ayah) : '1');
-          setEndSurah(selectedStudent.baseline_surah);
-          setEndAyah('');
-        } else {
-          setStartSurah(undefined);
-          setStartAyah('');
-          setEndSurah(undefined);
-          setEndAyah('');
-        }
-        setLinesAdded('');
-      }
-      console.log(`[PERF] Prepared new assessment form in ${(performance.now() - renderStart).toFixed(2)}ms`);
-    });
-  }, [selectedStudentId, selectedSessionConfig, assessments, selectedStudent, getDraftKey, workspace?.event?.event_id]);
-
-  // Auto-save local draft when fields change (if not in existing assessment edit mode)
-  useEffect(() => {
-    if (!selectedStudentId || !selectedSessionConfig || existingAssessmentId) return;
-
-    const draftKey = getDraftKey();
-    const draftData = {
-      attendance,
-      assessmentMode,
-      nuroniyyahDars: assessmentMode === 'NURONIYYAH' ? nuroniyyahDars : '',
-      iqraLevel: assessmentMode === 'IQRA' ? iqraLevel : undefined,
-      iqraPageStart: assessmentMode === 'IQRA' ? iqraPageStart : '',
-      iqraPageEnd: assessmentMode === 'IQRA' ? iqraPageEnd : '',
-      iqraPagesAdded: assessmentMode === 'IQRA' ? iqraPagesAdded : '',
-      startSurah: assessmentMode === 'ZIYADAH' ? startSurah : undefined,
-      startAyah: assessmentMode === 'ZIYADAH' ? startAyah : '',
-      endSurah: assessmentMode === 'ZIYADAH' ? endSurah : undefined,
-      endAyah: assessmentMode === 'ZIYADAH' ? endAyah : '',
-      linesAdded: assessmentMode !== 'IQRA' ? linesAdded : '',
-      notes
-    };
-    ApiService.saveDraftLocal(draftKey, draftData);
-  }, [attendance, assessmentMode, startSurah, startAyah, endSurah, endAyah, linesAdded, nuroniyyahDars, iqraLevel, iqraPageStart, iqraPageEnd, iqraPagesAdded, notes, selectedStudentId, selectedSessionConfig, existingAssessmentId, getDraftKey]);
+  // There is intentionally NO auto-save draft effect here.
+  // Until an explicit Save action is pressed, form changes exist only
+  // in React state and cannot appear in TeacherSyncBadge.
 
   // Student progress statistics calculation
   const studentStats = useMemo(() => {
-    if (!selectedStudentId) return { totalLines: 0, totalZiyadahLines: 0, totalNuroniyyahLines: 0, totalIqraPages: 0, sessionCount: 0, latestSetoran: null };
+    if (!selectedStudentId) return { totalLines: 0, sessionCount: 0, latestSetoran: null };
 
-    // IMPORTANT: attendance-only PRESENT rows are not setoran/progress records.
     const studentAssessments = assessments.filter(a =>
       !a.is_deleted &&
       a.student_id === selectedStudentId &&
-      a.attendance_status === 'PRESENT' &&
-      String(a.assessment_status || '').toUpperCase() === 'COMPLETED'
+      a.attendance_status === 'PRESENT'
     );
 
-    let totalZiyadah = 0;
-    let totalNuroniyyah = 0;
-    let totalIqra = 0;
-
-    studentAssessments.forEach(a => {
-      const mode = a.assessment_mode || (a.iqra_level != null ? 'IQRA' : a.nuroniyyah_dars ? 'NURONIYYAH' : 'ZIYADAH');
-      if (mode === 'IQRA') {
-        totalIqra += Number(a.iqra_pages_added) || 0;
-      } else if (mode === 'NURONIYYAH') {
-        totalNuroniyyah += Number(a.lines_added) || 0;
-      } else {
-        totalZiyadah += Number(a.lines_added) || 0;
-      }
-    });
+    const totalLines = studentAssessments
+      .reduce((sum, a) => sum + (a.lines_added || 0), 0);
 
     const sorted = studentAssessments.slice().sort((a, b) => b.session_no - a.session_no);
     const latest = sorted[0] || null;
 
     return {
-      totalLines: totalZiyadah,
-      totalZiyadahLines: totalZiyadah,
-      totalNuroniyyahLines: totalNuroniyyah,
-      totalIqraPages: totalIqra,
+      totalLines,
       sessionCount: studentAssessments.length,
       latestSetoran: latest
     };
@@ -522,14 +864,12 @@ export const SessionAssessment: React.FC<SessionAssessmentProps> = ({
       return 'Pilih status kehadiran siswa terlebih dahulu.';
     }
 
-    // If final evaluation session, Ziyadah / Nuroniyyah / Iqra fields are not required
+    // If final evaluation session, learning progress fields are not required
     if (isFinalEvaluationSession) {
       return null;
     }
 
-    // NEW RULE: PRESENT can be saved without setoran.
-    // Only validate detail fields when a complete setoran is going to be submitted.
-    if (attendance === 'PRESENT' && hasSetoranInput()) {
+    if (attendance === 'PRESENT') {
       if (assessmentMode === 'ZIYADAH') {
         if (!startSurah) {
           return 'Surah awal setoran wajib dipilih.';
@@ -563,17 +903,14 @@ export const SessionAssessment: React.FC<SessionAssessmentProps> = ({
           return 'Jumlah penambahan baris Nuroniyyah wajib diisi (minimal 0).';
         }
       } else if (assessmentMode === 'IQRA') {
-        if (!iqraLevel || Number(iqraLevel) < 1 || Number(iqraLevel) > 6) {
-          return 'Jilid Iqra\' (1–6) wajib dipilih.';
+        if (iqraLevel == null || iqraLevel < 1 || iqraLevel > 6) {
+          return "Jilid Iqro' wajib dipilih (1–6).";
         }
         if (!iqraPageStart || Number(iqraPageStart) < 1) {
-          return 'Halaman awal Iqra\' harus angka positif.';
+          return "Halaman awal Iqro' wajib diisi dengan angka positif.";
         }
-        if (!iqraPageEnd || Number(iqraPageEnd) < 1) {
-          return 'Halaman akhir Iqra\' harus angka positif.';
-        }
-        if (iqraPagesAdded === '' || Number(iqraPagesAdded) < 0) {
-          return 'Jumlah penambahan halaman Iqra\' wajib diisi (minimal 0).';
+        if (!iqraPageEnd || Number(iqraPageEnd) < Number(iqraPageStart)) {
+          return "Halaman akhir Iqro' harus sama atau lebih besar dari halaman awal.";
         }
       }
     }
@@ -602,10 +939,9 @@ export const SessionAssessment: React.FC<SessionAssessmentProps> = ({
       const teacherIdToUse = currentUser?.teacher_id || currentUser?.user_id || '';
 
       const isPresent = attendance === 'PRESENT';
-      const hasSetoran = !isFinalEvaluationSession && isPresent && hasSetoranInput();
-      const isZiyadah = hasSetoran && assessmentMode === 'ZIYADAH';
-      const isNuroniyyah = hasSetoran && assessmentMode === 'NURONIYYAH';
-      const isIqra = hasSetoran && assessmentMode === 'IQRA';
+      const isZiyadah = !isFinalEvaluationSession && isPresent && assessmentMode === 'ZIYADAH';
+      const isNuroniyyah = !isFinalEvaluationSession && isPresent && assessmentMode === 'NURONIYYAH';
+      const isIqra = !isFinalEvaluationSession && isPresent && assessmentMode === 'IQRA';
 
       const payload = {
         student_id: selectedStudentId,
@@ -613,18 +949,17 @@ export const SessionAssessment: React.FC<SessionAssessmentProps> = ({
         session_config_id: selectedSessionConfig?.session_config_id,
         session_no: selectedSessionConfig?.session_no,
         attendance: attendance,
-        // PRESENT without a complete setoran intentionally sends no assessment mode/content.
-        assessment_mode: hasSetoran ? assessmentMode : undefined,
+        assessment_mode: isFinalEvaluationSession ? undefined : (isPresent ? assessmentMode : undefined),
         start_surah: isZiyadah ? Number(startSurah) : undefined,
         start_ayah: isZiyadah ? Number(startAyah) : undefined,
         end_surah: isZiyadah ? Number(endSurah) : undefined,
         end_ayah: isZiyadah ? Number(endAyah) : undefined,
         lines_added: (isZiyadah || isNuroniyyah) && linesAdded !== '' ? Number(linesAdded) : undefined,
         nuroniyyah_dars: isNuroniyyah ? nuroniyyahDars : undefined,
-        iqra_level: isIqra ? Number(iqraLevel) : undefined,
+        iqra_level: isIqra ? iqraLevel : undefined,
         iqra_page_start: isIqra ? Number(iqraPageStart) : undefined,
         iqra_page_end: isIqra ? Number(iqraPageEnd) : undefined,
-        iqra_pages_added: isIqra ? Number(iqraPagesAdded) : undefined,
+        iqra_pages_added: isIqra ? iqraPagesAdded : undefined,
         notes: notes,
         teacher_id: teacherIdToUse
       };
@@ -641,67 +976,52 @@ export const SessionAssessment: React.FC<SessionAssessmentProps> = ({
 
       const studentName = selectedStudent?.full_name || 'siswa';
       const sessionNo = selectedSessionConfig?.session_no;
-      const savedKind = hasSetoran ? 'penilaian' : 'presensi';
 
       // Handle nextAction & set messages
       if (nextAction === 'NEXT_STUDENT') {
         const currentIdx = students.findIndex(s => s.student_id === selectedStudentId);
         if (currentIdx >= 0 && currentIdx < students.length - 1) {
           const nextStudent = students[currentIdx + 1];
-          setSelectedStudentId(nextStudent.student_id);
-          setSuccessMsg(`✓ Data ${savedKind} ${studentName} berhasil disimpan. Beralih ke: ${nextStudent.full_name}`);
+          handleStudentSelectionChange(nextStudent.student_id);
+          setSuccessMsg(`✓ Data penilaian ${studentName} berhasil disimpan. Beralih ke: ${nextStudent.full_name}`);
           setToast({
             type: 'success',
             message: '✓ Data berhasil disimpan.',
-            detail: hasSetoran
-              ? `Penilaian sesi #${sessionNo} untuk ${studentName} tersimpan. Menampilkan formulir: ${nextStudent.full_name}`
-              : `Presensi sesi #${sessionNo} untuk ${studentName} tersimpan tanpa setoran. Menampilkan formulir: ${nextStudent.full_name}`
+            detail: `Penilaian sesi #${sessionNo} untuk ${studentName} tersimpan. Menampilkan formulir: ${nextStudent.full_name}`
           });
         } else {
-          setSuccessMsg(`✓ Data ${savedKind} sesi #${sessionNo} untuk ${studentName} berhasil disimpan! (Siswa terakhir dalam halaqah ini)`);
+          setSuccessMsg(`✓ Data penilaian sesi #${sessionNo} untuk ${studentName} berhasil disimpan! (Siswa terakhir dalam halaqah ini)`);
           setToast({
             type: 'success',
             message: '✓ Data berhasil disimpan.',
-            detail: hasSetoran
-              ? `Penilaian sesi #${sessionNo} untuk ${studentName} tersimpan (Semua siswa dalam halaqah telah diinput).`
-              : `Presensi sesi #${sessionNo} untuk ${studentName} tersimpan tanpa setoran.`
+            detail: `Penilaian sesi #${sessionNo} untuk ${studentName} tersimpan (Semua siswa dalam halaqah telah diinput).`
           });
         }
       } else if (nextAction === 'NEXT_SESSION') {
         const currentConfigIdx = availableSessionConfigs.findIndex(sc => sc.session_config_id === selectedSessionConfigId);
         if (currentConfigIdx >= 0 && currentConfigIdx < availableSessionConfigs.length - 1) {
           const nextConfig = availableSessionConfigs[currentConfigIdx + 1];
-          setSelectedSessionConfigId(nextConfig.session_config_id);
-          setSuccessMsg(`✓ Data ${savedKind} ${studentName} berhasil disimpan. Beralih ke: Sesi #${nextConfig.session_no}`);
+          handleSessionSelectionChange(nextConfig.session_config_id);
+          setSuccessMsg(`✓ Data penilaian ${studentName} berhasil disimpan. Beralih ke: Sesi #${nextConfig.session_no}`);
           setToast({
             type: 'success',
             message: '✓ Data berhasil disimpan.',
-            detail: hasSetoran
-              ? `Penilaian sesi #${sessionNo} untuk ${studentName} tersimpan. Menampilkan formulir Sesi #${nextConfig.session_no}.`
-              : `Presensi sesi #${sessionNo} untuk ${studentName} tersimpan tanpa setoran. Menampilkan formulir Sesi #${nextConfig.session_no}.`
+            detail: `Penilaian sesi #${sessionNo} untuk ${studentName} tersimpan. Menampilkan formulir Sesi #${nextConfig.session_no}.`
           });
         } else {
-          setSuccessMsg(`✓ Data ${savedKind} sesi #${sessionNo} untuk ${studentName} berhasil disimpan! (Sesi terakhir dalam kegiatan)`);
+          setSuccessMsg(`✓ Data penilaian sesi #${sessionNo} untuk ${studentName} berhasil disimpan! (Sesi terakhir dalam kegiatan)`);
           setToast({
             type: 'success',
             message: '✓ Data berhasil disimpan.',
-            detail: hasSetoran
-              ? `Penilaian sesi #${sessionNo} untuk ${studentName} berhasil disimpan.`
-              : `Presensi sesi #${sessionNo} untuk ${studentName} berhasil disimpan tanpa setoran.`
+            detail: `Penilaian sesi #${sessionNo} untuk ${studentName} berhasil disimpan.`
           });
         }
       } else {
-        setSuccessMsg(
-          hasSetoran
-            ? `✓ Penilaian sesi #${sessionNo} untuk ${studentName} berhasil disimpan!`
-            : `✓ Presensi sesi #${sessionNo} untuk ${studentName} berhasil disimpan tanpa setoran.`
-        );
+        setSuccessMsg(`✓ Penilaian sesi #${sessionNo} untuk ${studentName} berhasil disimpan!`);
         setToast({
           type: 'success',
           message: '✓ Data berhasil disimpan.',
-          detail: hasSetoran
-            ? `Penilaian sesi #${sessionNo} untuk ${studentName} berhasil disimpan dan disinkronkan.`
-            : `Presensi sesi #${sessionNo} untuk ${studentName} berhasil disimpan. Setoran dapat diisi kemudian.`
+          detail: `Penilaian sesi #${sessionNo} untuk ${studentName} berhasil disimpan dan disinkronkan.`
         });
       }
 
@@ -744,11 +1064,15 @@ export const SessionAssessment: React.FC<SessionAssessmentProps> = ({
 
       setSuccessMsg('Data penilaian sesi berhasil dihapus.');
 
-      // Reset form
+      // Reset form. Ziyadah is always the primary RT input.
+      hydratedSelectionKeyRef.current =
+        `${selectedStudentId}::${selectedSessionConfig?.session_config_id || ''}`;
+      formDirtyRef.current = false;
+      endSurahAutoLinkedRef.current = true;
+
       setExistingAssessmentId(null);
       setAttendance('UNASSESSED');
-      const defaultMode = selectedStudent?.skill_status_start === 'NON_BBL' ? 'NURONIYYAH' : 'ZIYADAH';
-      setAssessmentMode(defaultMode);
+      setAssessmentMode('ZIYADAH');
       setStartSurah(undefined);
       setStartAyah('');
       setEndSurah(undefined);
@@ -758,7 +1082,6 @@ export const SessionAssessment: React.FC<SessionAssessmentProps> = ({
       setIqraLevel(undefined);
       setIqraPageStart('');
       setIqraPageEnd('');
-      setIqraPagesAdded('');
       setNotes('');
     } catch (err: any) {
       setErrorMsg('Gagal menghapus penilaian: ' + (err.message || ''));
@@ -767,58 +1090,32 @@ export const SessionAssessment: React.FC<SessionAssessmentProps> = ({
     }
   };
 
-  // Open Final Evaluation shortcut handler (saves attendance first if needed)
-  const handleOpenFinalEvaluation = async () => {
+  // Open Final Evaluation shortcut handler.
+  //
+  // IMPORTANT: NAVIGATION IS NOT A SAVE ACTION.
+  // Clicking "Isi / Lihat Evaluasi Akhir" must never write attendance,
+  // notes, cache, pending queue, GAS, or Spreadsheet.
+  //
+  // If the teacher only wants to inspect another page and leave, the current
+  // unsaved session form simply disappears. Final Evaluation itself may later
+  // auto-mark the final session PRESENT when the evaluation is actually saved
+  // (backend rule), but merely opening the page does nothing.
+  const handleOpenFinalEvaluation = () => {
     setErrorMsg('');
     setSuccessMsg('');
-    if (!selectedStudentId || !selectedSessionConfig) return;
 
-    // Coordinators are read-only
-    if (currentUser?.role === 'COORDINATOR') {
-      if (onNavigateToEvaluation) {
-        onNavigateToEvaluation(selectedStudentId, selectedSessionConfig.session_config_id);
-      }
+    if (
+      !selectedStudentId ||
+      !selectedSessionConfig ||
+      !onNavigateToEvaluation
+    ) {
       return;
     }
 
-    setSavingPresensi(true);
-    try {
-      const teacherIdToUse = currentUser?.teacher_id || currentUser?.user_id || '';
-      const payload = {
-        student_id: selectedStudentId,
-        participant_id: selectedStudent?.participant_id,
-        session_config_id: selectedSessionConfig.session_config_id,
-        session_no: selectedSessionConfig.session_no,
-        attendance: attendance,
-        assessment_mode: undefined,
-        start_surah: undefined,
-        start_ayah: undefined,
-        end_surah: undefined,
-        end_ayah: undefined,
-        lines_added: 0,
-        iqra_level: undefined,
-        iqra_page_start: undefined,
-        iqra_page_end: undefined,
-        notes: notes,
-        teacher_id: teacherIdToUse
-      };
-
-      // Optimistic update
-      saveAssessmentOptimistic(payload);
-
-      // Clear local draft for this session
-      const draftKey = getDraftKey();
-      await ApiService.clearDraftLocal(draftKey);
-
-      // Navigate to Final Evaluation preserving student selection
-      if (onNavigateToEvaluation) {
-        onNavigateToEvaluation(selectedStudentId, selectedSessionConfig.session_config_id);
-      }
-    } catch (err: any) {
-      setErrorMsg('Gagal menyimpan presensi sesi: ' + (err.message || 'Terjadi kesalahan saat menyimpan presensi'));
-    } finally {
-      setSavingPresensi(false);
-    }
+    onNavigateToEvaluation(
+      selectedStudentId,
+      selectedSessionConfig.session_config_id
+    );
   };
 
   // 1. Admin/Coordinator without a selected teacher
@@ -1052,7 +1349,11 @@ export const SessionAssessment: React.FC<SessionAssessmentProps> = ({
       </div>
 
       {/* Main Form */}
-      <div className="bg-white p-6 md:p-8 rounded border border-slate-200 shadow-sm space-y-6">
+      <div
+        className="bg-white p-6 md:p-8 rounded border border-slate-200 shadow-sm space-y-6"
+        onChangeCapture={markFormDirty}
+        onClickCapture={markFormDirty}
+      >
         
         {/* Student & Session Selection Controls */}
         <div className="grid grid-cols-1 md:grid-cols-2 gap-4 pb-6 border-b border-slate-100">
@@ -1062,7 +1363,11 @@ export const SessionAssessment: React.FC<SessionAssessmentProps> = ({
             </label>
             <select
               value={selectedStudentId}
-              onChange={(e) => setSelectedStudentId(e.target.value)}
+              onChange={(e) =>
+                handleStudentSelectionChange(
+                  e.target.value
+                )
+              }
               className="w-full px-3.5 py-2.5 bg-slate-50 border border-slate-300 rounded text-xs md:text-sm font-semibold text-slate-900 focus:outline-none focus:ring-2 focus:ring-blue-500 focus:bg-white"
             >
               {students.length === 0 ? (
@@ -1096,8 +1401,15 @@ export const SessionAssessment: React.FC<SessionAssessmentProps> = ({
             </div>
             <select
               value={selectedSessionConfigId}
-              onChange={(e) => setSelectedSessionConfigId(e.target.value)}
-              disabled={isLoading || availableSessionConfigs.length === 0}
+              onChange={(e) =>
+                handleSessionSelectionChange(
+                  e.target.value
+                )
+              }
+              disabled={
+                isLoading ||
+                availableSessionConfigs.length === 0
+              }
               className="w-full px-3.5 py-2.5 bg-slate-50 border border-slate-300 rounded text-xs md:text-sm font-semibold text-slate-900 focus:outline-none focus:ring-2 focus:ring-blue-500 focus:bg-white disabled:opacity-50"
             >
               {availableSessionConfigs.length === 0 ? (
@@ -1110,6 +1422,11 @@ export const SessionAssessment: React.FC<SessionAssessmentProps> = ({
                 ))
               )}
             </select>
+
+            <p className="mt-1 text-[10px] text-slate-500">
+              Perubahan baru tersimpan setelah tombol Simpan ditekan.
+              Pindah sesi akan membuang perubahan yang belum disimpan.
+            </p>
 
             {/* Compact Session Summary Context */}
             {selectedSessionConfig && (
@@ -1151,16 +1468,6 @@ export const SessionAssessment: React.FC<SessionAssessmentProps> = ({
               </button>
             ))}
           </div>
-
-          {!isFinalEvaluationSession && attendance === 'PRESENT' && (
-            <div className="mt-2.5 p-3 bg-sky-50 border border-sky-200 rounded-lg text-[11px] text-sky-800 flex items-start gap-2">
-              <CheckCircle2 className="w-4 h-4 text-sky-600 shrink-0 mt-0.5" />
-              <span>
-                <strong>Kehadiran dapat disimpan tanpa setoran.</strong> Jika siswa belum sempat mendapat giliran,
-                cukup pilih <strong>Hadir</strong> lalu simpan. Detail setoran dapat diisi kemudian.
-              </span>
-            </div>
-          )}
         </div>
 
         {/* SPECIAL VIEW: FINAL EVALUATION SESSION */}
@@ -1187,7 +1494,7 @@ export const SessionAssessment: React.FC<SessionAssessmentProps> = ({
                         SESI EVALUASI AKHIR
                       </h4>
                       <p className="text-[11px] text-purple-700 font-medium">
-                        ✓ Siswa hadir. Silakan lanjutkan ke pengisian evaluasi akhir.
+                        Status Hadir dipilih di form. Belum tersimpan sampai tombol Simpan ditekan.
                       </p>
                     </div>
                   </div>
@@ -1241,14 +1548,12 @@ export const SessionAssessment: React.FC<SessionAssessmentProps> = ({
                       <button
                         type="button"
                         onClick={handleOpenFinalEvaluation}
-                        disabled={savingPresensi || isLoading}
+                        disabled={isLoading}
                         className="px-4 py-2.5 bg-purple-700 hover:bg-purple-800 active:bg-purple-900 text-white font-bold text-xs rounded-lg transition inline-flex items-center space-x-2 shadow-sm disabled:opacity-50 min-h-[40px]"
                       >
                         <Award className="w-4 h-4 text-purple-200" />
                         <span>
-                          {savingPresensi
-                            ? 'Menyimpan presensi...'
-                            : studentFinalEval
+                          {studentFinalEval
                             ? 'Lihat / Edit Evaluasi'
                             : 'Isi Evaluasi Akhir'}
                         </span>
@@ -1256,6 +1561,13 @@ export const SessionAssessment: React.FC<SessionAssessmentProps> = ({
                       </button>
                     )}
                   </div>
+                )}
+
+                {currentUser?.role !== 'COORDINATOR' && onNavigateToEvaluation && (
+                  <p className="text-[10px] leading-snug text-purple-700 bg-white/70 border border-purple-100 rounded-md px-2.5 py-1.5">
+                    Membuka Evaluasi Akhir tidak menyimpan perubahan form sesi ini.
+                    Jika ingin menyimpan presensi atau catatan, gunakan tombol Simpan.
+                  </p>
                 )}
 
                 <div>
@@ -1311,11 +1623,11 @@ export const SessionAssessment: React.FC<SessionAssessmentProps> = ({
             <label className="block text-xs font-bold uppercase tracking-wider text-slate-600 mb-2">
               Mode Pembelajaran
             </label>
-            <div className="grid grid-cols-3 gap-2 max-w-md">
+            <div className="grid grid-cols-1 sm:grid-cols-3 gap-2 max-w-lg">
               <button
                 type="button"
                 onClick={() => handleModeChange('ZIYADAH')}
-                className={`py-2.5 px-3 text-xs font-bold rounded transition border text-center ${
+                className={`py-2.5 px-4 text-xs font-bold rounded transition border text-center ${
                   assessmentMode === 'ZIYADAH'
                     ? 'bg-blue-600 text-white border-blue-600 shadow-sm'
                     : 'bg-slate-100 text-slate-700 border-slate-300 hover:bg-slate-200'
@@ -1326,7 +1638,7 @@ export const SessionAssessment: React.FC<SessionAssessmentProps> = ({
               <button
                 type="button"
                 onClick={() => handleModeChange('NURONIYYAH')}
-                className={`py-2.5 px-3 text-xs font-bold rounded transition border text-center ${
+                className={`py-2.5 px-4 text-xs font-bold rounded transition border text-center ${
                   assessmentMode === 'NURONIYYAH'
                     ? 'bg-blue-600 text-white border-blue-600 shadow-sm'
                     : 'bg-slate-100 text-slate-700 border-slate-300 hover:bg-slate-200'
@@ -1337,30 +1649,24 @@ export const SessionAssessment: React.FC<SessionAssessmentProps> = ({
               <button
                 type="button"
                 onClick={() => handleModeChange('IQRA')}
-                className={`py-2.5 px-3 text-xs font-bold rounded transition border text-center ${
+                className={`py-2.5 px-4 text-xs font-bold rounded transition border text-center ${
                   assessmentMode === 'IQRA'
                     ? 'bg-blue-600 text-white border-blue-600 shadow-sm'
                     : 'bg-slate-100 text-slate-700 border-slate-300 hover:bg-slate-200'
                 }`}
               >
-                Iqra&apos;
+                Iqro&apos;
               </button>
             </div>
           </div>
         )}
 
-        {/* Setoran Hafalan / Pembelajaran Nuroniyyah / Iqra Fields (ONLY for HADIR and NOT Final Evaluation) */}
+        {/* Detail pembelajaran sesuai mode (ONLY for HADIR and NOT Final Evaluation) */}
         {!isFinalEvaluationSession && attendance === 'PRESENT' && (
           <div className="space-y-5 pt-2 border-t border-slate-100 animate-in fade-in">
             <h4 className="font-bold text-xs uppercase text-slate-700 tracking-wider flex items-center space-x-1.5">
               <Layers className="w-4 h-4 text-blue-600" />
-              <span>
-                {assessmentMode === 'ZIYADAH'
-                  ? 'Detail Setoran Hafalan Al-Qur\'an'
-                  : assessmentMode === 'NURONIYYAH'
-                  ? 'Detail Pembelajaran Nuroniyyah'
-                  : 'Detail Pembelajaran Iqra\''}
-              </span>
+              <span>{assessmentMode === 'ZIYADAH' ? 'Detail Setoran Hafalan Al-Qur\'an' : assessmentMode === 'NURONIYYAH' ? 'Detail Pembelajaran Nuroniyyah' : "Detail Pembelajaran Iqro'"}</span>
             </h4>
             
             {/* ZIYADAH MODE */}
@@ -1373,7 +1679,31 @@ export const SessionAssessment: React.FC<SessionAssessmentProps> = ({
                     <SurahAutocomplete
                       label="Surah Awal Setoran"
                       value={startSurah}
-                      onChange={(val) => setStartSurah(val || undefined)}
+                      onChange={(val) => {
+                        markFormDirty();
+
+                        const next = val || undefined;
+                        setStartSurah(next);
+
+                        const shouldMirrorEnd =
+                          endSurahAutoLinkedRef.current ||
+                          !endSurah;
+
+                        if (shouldMirrorEnd) {
+                          endSurahAutoLinkedRef.current = true;
+                          setEndSurah(next);
+
+                          void recalculateZiyadahLines({
+                            startSurah: next,
+                            endSurah: next
+                          });
+                          return;
+                        }
+
+                        void recalculateZiyadahLines({
+                          startSurah: next
+                        });
+                      }}
                     />
                     <div>
                       <label className="block text-[11px] font-semibold text-slate-600 mb-1">
@@ -1383,7 +1713,13 @@ export const SessionAssessment: React.FC<SessionAssessmentProps> = ({
                         type="number"
                         min={1}
                         value={startAyah}
-                        onChange={(e) => setStartAyah(e.target.value)}
+                        onChange={(e) => {
+                          const next = e.target.value;
+                          setStartAyah(next);
+                          void recalculateZiyadahLines({
+                            startAyah: next
+                          });
+                        }}
                         placeholder="mis: 1"
                         className="w-full px-3 py-2 bg-white border border-slate-300 rounded text-xs font-semibold text-slate-900 focus:outline-none focus:ring-2 focus:ring-blue-500"
                       />
@@ -1395,8 +1731,24 @@ export const SessionAssessment: React.FC<SessionAssessmentProps> = ({
                     <SurahAutocomplete
                       label="Surah Akhir Setoran"
                       value={endSurah}
-                      onChange={(val) => setEndSurah(val || undefined)}
+                      onChange={(val) => {
+                        markFormDirty();
+
+                        const next = val || undefined;
+
+                        // Once the teacher edits Surah Akhir explicitly, stop
+                        // mirroring changes from Surah Awal for this form.
+                        endSurahAutoLinkedRef.current = false;
+                        setEndSurah(next);
+
+                        void recalculateZiyadahLines({
+                          endSurah: next
+                        });
+                      }}
                     />
+                    <p className="-mt-1 text-[10px] text-slate-500">
+                      Mengikuti Surah Awal otomatis sampai Surah Akhir diedit.
+                    </p>
                     <div>
                       <label className="block text-[11px] font-semibold text-slate-600 mb-1">
                         Ayat Akhir
@@ -1405,7 +1757,13 @@ export const SessionAssessment: React.FC<SessionAssessmentProps> = ({
                         type="number"
                         min={1}
                         value={endAyah}
-                        onChange={(e) => setEndAyah(e.target.value)}
+                        onChange={(e) => {
+                          const next = e.target.value;
+                          setEndAyah(next);
+                          void recalculateZiyadahLines({
+                            endAyah: next
+                          });
+                        }}
                         placeholder="mis: 15"
                         className="w-full px-3 py-2 bg-white border border-slate-300 rounded text-xs font-semibold text-slate-900 focus:outline-none focus:ring-2 focus:ring-blue-500"
                       />
@@ -1414,23 +1772,78 @@ export const SessionAssessment: React.FC<SessionAssessmentProps> = ({
 
                 </div>
 
-                {/* Total Lines Added */}
-                <div className="flex flex-col sm:flex-row items-start sm:items-center justify-between p-4 bg-blue-50/60 border border-blue-200 rounded-lg gap-3">
-                  <div>
-                    <span className="text-xs font-bold text-blue-900 block">Penambahan Baris Setoran Baru</span>
-                    <p className="text-[11px] text-blue-700">Jumlah baris Al-Qur&apos;an tuntas disetorkan pada sesi ini</p>
+                {/* Total Lines Added - auto Mushaf line calculator with manual override */}
+                <div className="p-4 bg-blue-50/60 border border-blue-200 rounded-lg">
+                  <div className="flex flex-col sm:flex-row items-start sm:items-center justify-between gap-3">
+                    <div className="min-w-0">
+                      <span className="text-xs font-bold text-blue-900 block">
+                        Penambahan Baris Setoran Baru
+                      </span>
+                      <p className="text-[11px] text-blue-700">
+                        Otomatis dari rentang ayat • Mushaf Madinah 15 baris
+                      </p>
+                    </div>
+
+                    <div className="flex items-center space-x-2 shrink-0">
+                      <input
+                        type="number"
+                        min={0}
+                        value={linesAdded}
+                        onChange={(e) =>
+                          handleManualLinesChange(e.target.value)
+                        }
+                        placeholder={
+                          lineAutoState === 'LOADING'
+                            ? '...'
+                            : '0'
+                        }
+                        className="w-24 px-3 py-1.5 bg-white border border-blue-300 font-bold text-sm text-blue-900 text-center rounded focus:outline-none focus:ring-2 focus:ring-blue-500"
+                      />
+                      <span className="text-xs font-bold text-blue-900">
+                        Baris
+                      </span>
+                    </div>
                   </div>
-                  <div className="flex items-center space-x-2 shrink-0">
-                    <input
-                      type="number"
-                      min={0}
-                      value={linesAdded}
-                      onChange={(e) => setLinesAdded(e.target.value)}
-                      placeholder="0"
-                      className="w-24 px-3 py-1.5 bg-white border border-blue-300 font-bold text-sm text-blue-900 text-center rounded focus:outline-none focus:ring-2 focus:ring-blue-500"
-                    />
-                    <span className="text-xs font-bold text-blue-900">Baris</span>
+
+                  <div className="mt-2 flex flex-wrap items-center gap-2">
+                    <span
+                      className={`text-[10px] sm:text-[11px] leading-snug ${
+                        lineAutoState === 'AUTO'
+                          ? 'text-emerald-700 font-semibold'
+                          : lineAutoState === 'ERROR'
+                            ? 'text-rose-700'
+                            : lineAutoState === 'MANUAL'
+                              ? 'text-amber-700'
+                              : 'text-blue-700'
+                      }`}
+                    >
+                      {lineAutoState === 'LOADING'
+                        ? 'Menghitung baris otomatis…'
+                        : lineAutoState === 'AUTO'
+                          ? `✓ ${lineAutoDetail}`
+                          : lineAutoState === 'MANUAL'
+                            ? `✎ ${lineAutoDetail}`
+                            : lineAutoDetail ||
+                              'Lengkapi Surah dan Ayat awal–akhir untuk menghitung baris otomatis.'}
+                    </span>
+
+                    {(lineAutoState === 'MANUAL' ||
+                      lineAutoState === 'ERROR') && (
+                      <button
+                        type="button"
+                        onClick={handleRecalculateLines}
+                        className="inline-flex items-center gap-1 rounded border border-blue-200 bg-white px-2 py-1 text-[10px] font-bold text-blue-700 hover:bg-blue-50 transition"
+                      >
+                        <RefreshCw className="w-3 h-3" />
+                        Hitung Ulang
+                      </button>
+                    )}
                   </div>
+
+                  <p className="mt-1.5 text-[10px] text-slate-500">
+                    Panduan: setiap baris fisik yang tersentuh dihitung 1 baris.
+                    Hasil otomatis tetap dapat disesuaikan guru bila berbeda dengan mushaf yang digunakan.
+                  </p>
                 </div>
               </>
             )}
@@ -1491,77 +1904,65 @@ export const SessionAssessment: React.FC<SessionAssessmentProps> = ({
               </div>
             )}
 
-            {/* IQRA MODE */}
+            {/* IQRO MODE */}
             {assessmentMode === 'IQRA' && (
               <div className="space-y-4 p-4 bg-slate-50 border border-slate-200 rounded-lg">
-                {/* Iqra Jilid (1-6) Selector */}
                 <div>
                   <label className="block text-[11px] font-semibold text-slate-600 mb-1.5">
-                    Jilid Iqra&apos; (1–6)
+                    Jilid Iqro&apos;
                   </label>
-                  <div className="grid grid-cols-6 gap-2 max-w-sm">
-                    {[1, 2, 3, 4, 5, 6].map((lvl) => (
+                  <div className="grid grid-cols-3 sm:grid-cols-6 gap-1.5">
+                    {Array.from({ length: 6 }, (_, i) => i + 1).map((level) => (
                       <button
                         type="button"
-                        key={lvl}
-                        onClick={() => setIqraLevel(lvl)}
-                        className={`py-2 px-2 text-xs font-bold rounded transition border text-center ${
-                          iqraLevel === lvl
+                        key={level}
+                        onClick={() => setIqraLevel(level)}
+                        className={`py-2 px-2 text-[11px] font-bold rounded transition border text-center ${
+                          iqraLevel === level
                             ? 'bg-blue-600 text-white border-blue-600 shadow-sm'
                             : 'bg-white text-slate-700 border-slate-300 hover:bg-slate-100'
                         }`}
                       >
-                        Jilid {lvl}
+                        Jilid {level}
                       </button>
                     ))}
                   </div>
                 </div>
 
-                {/* Iqra Start & End Pages */}
-                <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
+                <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
                   <div>
-                    <label className="block text-[11px] font-semibold text-slate-600 mb-1">
-                      Halaman Awal
-                    </label>
+                    <label className="block text-[11px] font-semibold text-slate-600 mb-1">Halaman Awal</label>
                     <input
                       type="number"
                       min={1}
                       value={iqraPageStart}
                       onChange={(e) => setIqraPageStart(e.target.value)}
-                      placeholder="mis: 1"
+                      placeholder="mis: 12"
                       className="w-full px-3 py-2 bg-white border border-slate-300 rounded text-xs font-semibold text-slate-900 focus:outline-none focus:ring-2 focus:ring-blue-500"
                     />
                   </div>
                   <div>
-                    <label className="block text-[11px] font-semibold text-slate-600 mb-1">
-                      Halaman Akhir
-                    </label>
+                    <label className="block text-[11px] font-semibold text-slate-600 mb-1">Halaman Akhir</label>
                     <input
                       type="number"
                       min={1}
                       value={iqraPageEnd}
                       onChange={(e) => setIqraPageEnd(e.target.value)}
-                      placeholder="mis: 5"
+                      placeholder="mis: 15"
                       className="w-full px-3 py-2 bg-white border border-slate-300 rounded text-xs font-semibold text-slate-900 focus:outline-none focus:ring-2 focus:ring-blue-500"
                     />
                   </div>
                 </div>
 
-                {/* Total Pages Added for Iqra */}
                 <div className="flex flex-col sm:flex-row items-start sm:items-center justify-between p-4 bg-blue-50/60 border border-blue-200 rounded-lg gap-3">
                   <div>
-                    <span className="text-xs font-bold text-blue-900 block">Penambahan Halaman Belajar Baru</span>
-                    <p className="text-[11px] text-blue-700">Jumlah halaman Iqra&apos; tuntas dipelajari pada sesi ini</p>
+                    <span className="text-xs font-bold text-blue-900 block">Penambahan Halaman Iqro&apos;</span>
+                    <p className="text-[11px] text-blue-700">Dihitung otomatis dari rentang halaman awal sampai akhir</p>
                   </div>
                   <div className="flex items-center space-x-2 shrink-0">
-                    <input
-                      type="number"
-                      min={0}
-                      value={iqraPagesAdded}
-                      onChange={(e) => setIqraPagesAdded(e.target.value)}
-                      placeholder="0"
-                      className="w-24 px-3 py-1.5 bg-white border border-blue-300 font-bold text-sm text-blue-900 text-center rounded focus:outline-none focus:ring-2 focus:ring-blue-500"
-                    />
+                    <span className="inline-flex min-w-16 justify-center px-3 py-1.5 bg-white border border-blue-300 font-bold text-sm text-blue-900 rounded">
+                      +{iqraPagesAdded}
+                    </span>
                     <span className="text-xs font-bold text-blue-900">Halaman</span>
                   </div>
                 </div>

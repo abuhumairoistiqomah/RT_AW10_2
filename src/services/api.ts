@@ -20,6 +20,40 @@ import { getSurahByNo } from '../utils/quran';
 import { generateRandomAccessCode } from '../utils/accessCode';
 import { formatParticipantTarget, getEffectiveTargets } from '../utils/targetUtils';
 
+export interface GradeRecapEvent {
+  event_id: string;
+  event_name: string;
+  academic_year: string;
+  sequence_no: number;
+  status: string;
+  start_date?: string;
+  end_date?: string;
+}
+
+export interface GradeRecapStudentEventMetric {
+  event_id: string;
+  sequence_no: number;
+  participant: boolean;
+  ziyadah_lines: number;
+  final_score: number | null;
+  affective_rating: string;
+  skill_status_end: string;
+}
+
+export interface GradeRecapSourceRow {
+  student_id: string;
+  full_name: string;
+  class_name: string;
+  event_metrics: GradeRecapStudentEventMetric[];
+}
+
+export interface GradeRecapSource {
+  events: GradeRecapEvent[];
+  rows: GradeRecapSourceRow[];
+  generated_at: string;
+}
+
+
 // Read Environment Variables & Runtime Database Connection
 const DEFAULT_API_URL =
   'https://script.google.com/macros/s/AKfycbz-KXpzp1fknAHcxRHFLbzo4bLQUH61gR8NA5Orjxs_kGE2MhafyuvGZzw4LmCP43CG0A/exec';
@@ -175,6 +209,7 @@ function getRequestTimeoutMs(action: string): number {
     case 'getStudentPlacementBootstrap':
     case 'getSessionAssessments':
     case 'getFinalEvaluations':
+    case 'getGradeRecap':
     case 'getEventParticipants':
       return HEAVY_READ_TIMEOUT_MS;
     case 'saveSessionAssessment':
@@ -2830,7 +2865,15 @@ export class ApiService {
         finalEvaluation.final_evaluation_id = payload.final_evaluation_id;
       }
 
-      return apiPost<FinalEvaluation>('saveFinalEvaluation', { finalEvaluation });
+      const autoFinalZiyadah =
+        payload.auto_final_ziyadah ||
+        payload.autoFinalZiyadah ||
+        undefined;
+
+      return apiPost<FinalEvaluation>('saveFinalEvaluation', {
+        finalEvaluation,
+        autoFinalZiyadah
+      });
     }
 
     const currentEvt = payload.event_id
@@ -3070,6 +3113,118 @@ export class ApiService {
         }))
       },
       halaqahReports
+    };
+  }
+
+  /**
+   * Read-only source for wali-kelas/report-card recap.
+   * One backend request returns normalized per-event metrics for all RT 1–6;
+   * semester/custom checkbox aggregation is then instant in the browser.
+   */
+  static async getGradeRecap(): Promise<GradeRecapSource> {
+    if (!isMockMode) {
+      return apiPost<GradeRecapSource>('getGradeRecap', {});
+    }
+
+    const events = INITIAL_EVENTS
+      .filter(event => Number(event.sequence_no || 0) >= 1 && Number(event.sequence_no || 0) <= 6)
+      .sort((a, b) => Number(a.sequence_no || 0) - Number(b.sequence_no || 0));
+
+    const eventMap = new Map(events.map(event => [event.event_id, event]));
+    const students = new Map(INITIAL_STUDENTS.map(student => [student.student_id, student]));
+    const participantsByKey = new Map<string, EventParticipant>();
+
+    INITIAL_PARTICIPANTS.forEach(participant => {
+      if (!eventMap.has(participant.event_id)) return;
+      participantsByKey.set(`${participant.event_id}::${participant.student_id}`, participant);
+    });
+
+    const rowMap = new Map<string, GradeRecapSourceRow>();
+
+    const ensureRow = (studentId: string) => {
+      if (!rowMap.has(studentId)) {
+        const student = students.get(studentId);
+        rowMap.set(studentId, {
+          student_id: studentId,
+          full_name: student?.full_name || studentId,
+          class_name: student?.class_name || '',
+          event_metrics: []
+        });
+      }
+      return rowMap.get(studentId)!;
+    };
+
+    INITIAL_PARTICIPANTS.forEach(participant => {
+      const event = eventMap.get(participant.event_id);
+      if (!event) return;
+      const row = ensureRow(participant.student_id);
+      row.event_metrics.push({
+        event_id: event.event_id,
+        sequence_no: Number(event.sequence_no || 0),
+        participant: true,
+        ziyadah_lines: 0,
+        final_score: null,
+        affective_rating: '',
+        skill_status_end: ''
+      });
+    });
+
+    const metricFor = (studentId: string, eventId: string) => {
+      const row = ensureRow(studentId);
+      let metric = row.event_metrics.find(item => item.event_id === eventId);
+      if (!metric) {
+        const event = eventMap.get(eventId);
+        if (!event) return null;
+        metric = {
+          event_id: eventId,
+          sequence_no: Number(event.sequence_no || 0),
+          participant: participantsByKey.has(`${eventId}::${studentId}`),
+          ziyadah_lines: 0,
+          final_score: null,
+          affective_rating: '',
+          skill_status_end: ''
+        };
+        row.event_metrics.push(metric);
+      }
+      return metric;
+    };
+
+    INITIAL_ASSESSMENTS.forEach(assessment => {
+      if (!eventMap.has(assessment.event_id) || assessment.is_deleted) return;
+      if (assessment.attendance_status !== 'PRESENT') return;
+      if (assessment.assessment_mode !== 'ZIYADAH') return;
+
+      const metric = metricFor(assessment.student_id, assessment.event_id);
+      if (!metric) return;
+      const lines = Number(assessment.lines_added || 0);
+      if (Number.isFinite(lines)) metric.ziyadah_lines += lines;
+    });
+
+    INITIAL_FINAL_EVALUATIONS.forEach(evaluation => {
+      if (!eventMap.has(evaluation.event_id)) return;
+      const metric = metricFor(evaluation.student_id, evaluation.event_id);
+      if (!metric) return;
+      const score = Number(evaluation.final_score);
+      metric.final_score = Number.isFinite(score) ? score : null;
+      metric.affective_rating = String(evaluation.affective_rating || '').trim().toUpperCase();
+      metric.skill_status_end = String(evaluation.skill_status_end || '').trim().toUpperCase();
+    });
+
+    return {
+      events: events.map(event => ({
+        event_id: event.event_id,
+        event_name: event.event_name,
+        academic_year: event.academic_year,
+        sequence_no: Number(event.sequence_no || 0),
+        status: event.status,
+        start_date: event.start_date,
+        end_date: event.end_date
+      })),
+      rows: Array.from(rowMap.values()).map(row => ({
+        ...row,
+        event_metrics: row.event_metrics.sort((a, b) => a.sequence_no - b.sequence_no)
+      })),
+      generated_at: getCurrentIso()
     };
   }
 
