@@ -93,6 +93,16 @@ export const FinalEvaluation: React.FC<FinalEvaluationProps> = ({
   const formDirtyRef = useRef(false);
   const [formDirty, setFormDirty] = useState(false);
 
+  // Auto-completion target state.
+  // Only new Final Evaluation records may be auto-selected. Once the teacher
+  // touches the completion buttons, automation is disabled for that student's
+  // current editing session.
+  const completionManualOverrideRef = useRef(false);
+  const completionAutoAppliedRef = useRef(false);
+  const scoreAutoAppliedRef = useRef(false);
+  const [completionSource, setCompletionSource] =
+    useState<'AUTO' | 'MANUAL' | null>(null);
+
   const markDirty = () => {
     formDirtyRef.current = true;
     setFormDirty(true);
@@ -223,6 +233,8 @@ export const FinalEvaluation: React.FC<FinalEvaluationProps> = ({
     if (!selectedStudentId) {
       return {
         totalLines: 0,
+        totalZiyadahLines: 0,
+        hasZiyadahAssessment: false,
         coverageText: '0 / 0 Sesi',
         latestSetoran: null as any
       };
@@ -236,13 +248,41 @@ export const FinalEvaluation: React.FC<FinalEvaluationProps> = ({
       a => a.attendance_status === 'PRESENT'
     );
 
-    const totalLines = presentAsms.reduce(
+    // IMPORTANT: target completion is based ONLY on ZIYADAH.
+    // Nuroniyyah lines and Iqra pages must never be mixed into this total.
+    // A small legacy fallback treats Quran-range records with an empty mode as
+    // Ziyadah, but never records carrying Nuroniyyah/Iqra fields.
+    const ziyadahAsms = presentAsms.filter(a => {
+      const mode = String(a.assessment_mode || '').toUpperCase();
+
+      if (mode === 'ZIYADAH') return true;
+      if (mode === 'NURONIYYAH' || mode === 'IQRA') return false;
+
+      const hasIqra = Boolean(
+        a.iqra_level != null ||
+        a.iqra_page_start != null ||
+        a.iqra_page_end != null ||
+        a.iqra_pages_added != null
+      );
+
+      const hasNuroniyyah = Boolean(a.nuroniyyah_dars);
+      const hasQuranRange = Boolean(
+        a.surah_start != null ||
+        a.ayah_start != null ||
+        a.surah_end != null ||
+        a.ayah_end != null
+      );
+
+      return hasQuranRange && !hasIqra && !hasNuroniyyah;
+    });
+
+    const totalZiyadahLines = ziyadahAsms.reduce(
       (sum, a) => sum + (Number(a.lines_added) || 0),
       0
     );
 
     const latest =
-      presentAsms
+      ziyadahAsms
         .slice()
         .sort(
           (a, b) =>
@@ -262,11 +302,41 @@ export const FinalEvaluation: React.FC<FinalEvaluationProps> = ({
       : sessionConfigs;
 
     return {
-      totalLines,
+      // Kept as an alias for the existing card/UI label. It now correctly
+      // represents Ziyadah lines only.
+      totalLines: totalZiyadahLines,
+      totalZiyadahLines,
+      hasZiyadahAssessment: ziyadahAsms.length > 0,
       coverageText: `${studentAsms.length} dari ${applicableConfigs.length} Sesi Evaluasi`,
       latestSetoran: latest
     };
   }, [assessments, selectedStudentId, halaqah, sessionConfigs]);
+
+  const effectiveZiyadahTarget = useMemo(() => {
+    const positiveNumber = (value: any): number | null => {
+      if (value === undefined || value === null || value === '') return null;
+      const n = Number(value);
+      return Number.isFinite(n) && n > 0 ? n : null;
+    };
+
+    // Backend workspace already exposes this field when available, so it is
+    // the safest source of truth. The remaining fields are compatibility
+    // fallbacks for older snapshots/cache.
+    const effective = positiveNumber(
+      selectedStudent?.effective_target_ziyadah_lines
+    );
+    if (effective !== null) return effective;
+
+    if (String(selectedStudent?.target_source || '').toUpperCase() === 'MANUAL') {
+      const manual = positiveNumber(selectedStudent?.target_lines);
+      if (manual !== null) return manual;
+    }
+
+    const halaqahTarget = positiveNumber(halaqah?.target_ziyadah_lines);
+    if (halaqahTarget !== null) return halaqahTarget;
+
+    return positiveNumber(selectedStudent?.target_lines);
+  }, [selectedStudent, halaqah]);
 
   const findExistingEvaluation = (studentId: string) => {
     const student = students.find(
@@ -282,6 +352,13 @@ export const FinalEvaluation: React.FC<FinalEvaluationProps> = ({
   };
 
   const hydrateFromEvaluation = (existing: any) => {
+    // Existing evaluation must preserve its saved completion value.
+    // Auto-target is only for creating a new Final Evaluation record.
+    completionManualOverrideRef.current = true;
+    completionAutoAppliedRef.current = false;
+    scoreAutoAppliedRef.current = false;
+    setCompletionSource(null);
+
     setExistingEvaluationId(
       existing.final_evaluation_id || null
     );
@@ -342,6 +419,13 @@ export const FinalEvaluation: React.FC<FinalEvaluationProps> = ({
   };
 
   const hydrateDefaultsForStudent = (student: any) => {
+    // New record: allow automatic target completion until the teacher manually
+    // touches Tuntas/Belum Tuntas.
+    completionManualOverrideRef.current = false;
+    completionAutoAppliedRef.current = false;
+    scoreAutoAppliedRef.current = false;
+    setCompletionSource(null);
+
     setExistingEvaluationId(null);
 
     setEvalSurahStart(
@@ -419,6 +503,124 @@ export const FinalEvaluation: React.FC<FinalEvaluationProps> = ({
     // a temporary server response is empty/stale.
   }, [selectedStudentId, evaluations, selectedStudent]);
 
+  const hasExistingEvaluation = useMemo(() => {
+    if (!selectedStudentId) return false;
+    return Boolean(findExistingEvaluation(selectedStudentId));
+  }, [selectedStudentId, evaluations, students]);
+
+  // Used by both automatic completion and automatic score guidance.
+  // This remains a NEW-evaluation automation, matching the existing rule:
+  // saved Final Evaluation records are not silently rewritten when reopened.
+  const autoTargetReached = useMemo(() => {
+    if (!selectedStudentId || !selectedStudent) return false;
+    if (hasExistingEvaluation || existingEvaluationId) return false;
+
+    const skillReference = String(
+      skillStatusEnd || selectedStudent.skill_status_start || ''
+    ).toUpperCase();
+
+    const eligibleSkill =
+      skillReference === 'BBL' || skillReference === 'BBLS';
+
+    return Boolean(
+      eligibleSkill &&
+      effectiveZiyadahTarget !== null &&
+      studentMetrics.hasZiyadahAssessment &&
+      studentMetrics.totalZiyadahLines >= effectiveZiyadahTarget
+    );
+  }, [
+    selectedStudentId,
+    selectedStudent,
+    hasExistingEvaluation,
+    existingEvaluationId,
+    skillStatusEnd,
+    effectiveZiyadahTarget,
+    studentMetrics.hasZiyadahAssessment,
+    studentMetrics.totalZiyadahLines
+  ]);
+
+  // AUTO TARGET COMPLETION — NEW EVALUATIONS ONLY.
+  //
+  // Rules:
+  // - Skill reference must be BBL/BBLS. Until skill akhir is chosen, the
+  //   student's starting skill is used as the initial suggestion.
+  // - There must be at least one real ZIYADAH assessment. Missing progress is
+  //   never silently converted into zero.
+  // - Effective Ziyadah target must exist.
+  // - capaian >= target => COMPLETE, otherwise INCOMPLETE.
+  // - The moment the teacher manually touches the completion buttons, this
+  //   automation stops for the current student/editing session.
+  // - Existing/saved Final Evaluation records are never auto-overwritten.
+  useEffect(() => {
+    if (!selectedStudentId || !selectedStudent) return;
+    if (hasExistingEvaluation || existingEvaluationId) return;
+    if (completionManualOverrideRef.current) return;
+
+    const skillReference = String(
+      skillStatusEnd || selectedStudent.skill_status_start || ''
+    ).toUpperCase();
+
+    const eligibleSkill =
+      skillReference === 'BBL' || skillReference === 'BBLS';
+
+    const canCompare =
+      eligibleSkill &&
+      effectiveZiyadahTarget !== null &&
+      studentMetrics.hasZiyadahAssessment;
+
+    if (!canCompare) {
+      // If an automatic suggestion had been applied previously and the teacher
+      // changes the skill to NON-BBL (or target/progress becomes unavailable),
+      // clear only the AUTO suggestion. Never clear a manual choice.
+      if (completionAutoAppliedRef.current) {
+        completionAutoAppliedRef.current = false;
+        setCompletionSource(null);
+        setCompletionStatus(undefined);
+      }
+      return;
+    }
+
+    const autoStatus: CompletionStatus =
+      studentMetrics.totalZiyadahLines >= effectiveZiyadahTarget
+        ? 'COMPLETE'
+        : 'INCOMPLETE';
+
+    completionAutoAppliedRef.current = true;
+    setCompletionSource('AUTO');
+
+    if (completionStatus !== autoStatus) {
+      setCompletionStatus(autoStatus);
+    }
+
+    // If the student reaches the Ziyadah target on a NEW evaluation,
+    // the suggested minimum final score is automatically 95.
+    // The teacher may increase it, but should not lower it below 95.
+    if (autoStatus === 'COMPLETE') {
+      if (finalScore === '') {
+        scoreAutoAppliedRef.current = true;
+        setFinalScore('95');
+      }
+    } else if (
+      scoreAutoAppliedRef.current &&
+      finalScore === '95'
+    ) {
+      // If the automatic comparison changes back to INCOMPLETE before
+      // the record is saved, remove only the score that was auto-filled.
+      scoreAutoAppliedRef.current = false;
+      setFinalScore('');
+    }
+  }, [
+    selectedStudentId,
+    selectedStudent,
+    hasExistingEvaluation,
+    existingEvaluationId,
+    skillStatusEnd,
+    effectiveZiyadahTarget,
+    studentMetrics.hasZiyadahAssessment,
+    studentMetrics.totalZiyadahLines,
+    completionStatus
+  ]);
+
   const hasCompleteQuranRange = (): boolean => {
     return Boolean(
       evalSurahStart != null &&
@@ -482,6 +684,10 @@ export const FinalEvaluation: React.FC<FinalEvaluationProps> = ({
         score > 100
       ) {
         return 'Nilai akhir harus berupa angka antara 0 hingga 100.';
+      }
+
+      if (autoTargetReached && score < 95) {
+        return 'Karena target Ziyadah tercapai, nilai akhir paling rendah adalah 95. Guru dapat memberikan nilai yang lebih tinggi.';
       }
     }
 
@@ -1236,6 +1442,9 @@ export const FinalEvaluation: React.FC<FinalEvaluationProps> = ({
                   type="button"
                   key={st.id}
                   onClick={() => {
+                    completionManualOverrideRef.current = true;
+                    completionAutoAppliedRef.current = false;
+                    setCompletionSource('MANUAL');
                     setCompletionStatus(st.id as CompletionStatus);
                     markDirty();
                   }}
@@ -1252,6 +1461,32 @@ export const FinalEvaluation: React.FC<FinalEvaluationProps> = ({
                 </button>
               ))}
             </div>
+
+            {!hasExistingEvaluation &&
+              effectiveZiyadahTarget !== null &&
+              studentMetrics.hasZiyadahAssessment &&
+              (String(skillStatusEnd || selectedStudent?.skill_status_start || '').toUpperCase() === 'BBL' ||
+                String(skillStatusEnd || selectedStudent?.skill_status_start || '').toUpperCase() === 'BBLS') && (
+                <div
+                  className={`mt-2.5 rounded border px-3 py-2 text-[10px] leading-relaxed ${
+                    completionSource === 'MANUAL'
+                      ? 'bg-slate-50 border-slate-200 text-slate-600'
+                      : 'bg-blue-50 border-blue-200 text-blue-800'
+                  }`}
+                >
+                  <span className="font-bold">
+                    {completionSource === 'MANUAL'
+                      ? 'Pilihan guru:'
+                      : 'Tuntas otomatis:'}
+                  </span>{' '}
+                  Ziyadah {studentMetrics.totalZiyadahLines} / {effectiveZiyadahTarget} Baris.{' '}
+                  {completionSource === 'MANUAL'
+                    ? 'Pilihan manual tidak akan ditimpa otomatis selama formulir ini sedang diedit.'
+                    : studentMetrics.totalZiyadahLines >= effectiveZiyadahTarget
+                      ? 'Capaian sudah memenuhi target kegiatan. Guru tetap dapat mengubah pilihan.'
+                      : 'Capaian belum memenuhi target kegiatan. Guru tetap dapat mengubah pilihan.'}
+                </div>
+              )}
           </div>
 
           <div>
@@ -1301,19 +1536,46 @@ export const FinalEvaluation: React.FC<FinalEvaluationProps> = ({
 
         <div className="grid grid-cols-1 md:grid-cols-2 gap-4 p-4 bg-slate-50 border border-slate-200 rounded-lg">
           <div>
-            <label className="block text-xs font-bold uppercase tracking-wider text-slate-600 mb-1">
-              Nilai Akhir Evaluasi (0 - 100)
-            </label>
+            <div className="flex flex-wrap items-center justify-between gap-1 mb-1">
+              <label className="block text-xs font-bold uppercase tracking-wider text-slate-600">
+                Nilai Akhir Evaluasi (0 - 100)
+              </label>
+
+              {autoTargetReached && (
+                <span className="inline-flex items-center rounded-full border border-emerald-200 bg-emerald-50 px-2 py-0.5 text-[10px] font-bold text-emerald-700">
+                  Target tercapai • Nilai minimum 95
+                </span>
+              )}
+            </div>
+
+            <p className="mb-1.5 text-[10px] leading-snug text-slate-500">
+              Panduan: apabila ananda mencapai target, nilai otomatis paling rendah 95. Guru dapat memberikan nilai yang lebih tinggi.
+            </p>
+
             <input
               type="number"
-              min={0}
+              min={autoTargetReached ? 95 : 0}
               max={100}
               value={finalScore}
               onChange={e => {
+                scoreAutoAppliedRef.current = false;
                 setFinalScore(e.target.value);
                 markDirty();
               }}
-              placeholder="mis: 85 (opsional)"
+              onBlur={() => {
+                if (!autoTargetReached) return;
+
+                const score = Number(finalScore);
+                if (
+                  finalScore === '' ||
+                  !Number.isFinite(score) ||
+                  score < 95
+                ) {
+                  setFinalScore('95');
+                  markDirty();
+                }
+              }}
+              placeholder={autoTargetReached ? 'minimal 95' : 'mis: 85 (opsional)'}
               className="w-full px-3.5 py-2 bg-white border border-slate-300 rounded text-xs font-semibold text-slate-900 focus:outline-none focus:ring-2 focus:ring-blue-500"
             />
           </div>

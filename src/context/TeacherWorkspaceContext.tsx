@@ -75,6 +75,10 @@ interface TeacherWorkspaceContextType {
   ) => Promise<{ success: boolean; error?: string }>;
 
   retryPendingWrites: () => Promise<void>;
+
+  discardPendingWrite: (
+    pendingId: string
+  ) => Promise<{ success: boolean; error?: string }>;
 }
 
 const TeacherWorkspaceContext =
@@ -1282,6 +1286,110 @@ export const TeacherWorkspaceProvider: React.FC<{
     setStatusFromQueue
   ]);
 
+  /**
+   * Discard exactly one failed/pending local mutation.
+   *
+   * "Abaikan" means:
+   * - remove this mutation from the durable local queue,
+   * - never retry it automatically,
+   * - cancel a local Final Evaluation delete tombstone when applicable,
+   * - then re-read the authoritative server snapshot so optimistic cache
+   *   from the discarded mutation does not keep haunting the UI.
+   *
+   * This is intentionally a safety valve for accidental edits / validation
+   * failures. It does NOT issue a compensating write to the server.
+   */
+  const discardPendingWrite = useCallback(
+    async (
+      pendingId: string
+    ): Promise<{ success: boolean; error?: string }> => {
+      if (!pendingId) {
+        return { success: false, error: 'Pending ID tidak tersedia.' };
+      }
+
+      const cacheKey = isTeacher
+        ? currentUser?.teacher_id || ''
+        : selectedTeacherId || '__ADMIN_ALL__';
+
+      if (!cacheKey) {
+        return { success: false, error: 'Cache guru belum siap.' };
+      }
+
+      const queue = loadPendingWrites(cacheKey);
+      const target = queue.find(item => item.id === pendingId);
+
+      // Idempotent: if it is already gone, treat the request as successful.
+      if (!target) {
+        setPendingWrites(queue);
+        setStatusFromQueue(queue, false);
+        return { success: true };
+      }
+
+      // If the ignored mutation was a Final Evaluation DELETE, remove its
+      // local tombstone too; otherwise the old server evaluation would remain
+      // hidden even though the delete itself has just been cancelled.
+      if (isDeleteFinalEvaluationWrite(target)) {
+        removeFinalEvaluationTombstone(cacheKey, {
+          eventId:
+            target.payload?.eventId ||
+            target.payload?.event_id ||
+            target.event_id ||
+            '',
+          participantId:
+            target.payload?.participantId ||
+            target.payload?.participant_id ||
+            target.participant_id ||
+            '',
+          studentId:
+            target.payload?.studentId ||
+            target.payload?.student_id ||
+            target.student_id ||
+            '',
+          finalEvaluationId:
+            target.payload?.finalEvaluationId ||
+            target.payload?.final_evaluation_id ||
+            ''
+        });
+      }
+
+      const nextQueue = queue.filter(item => item.id !== pendingId);
+
+      // Durable queue removal first: once Abaikan is pressed this mutation
+      // must never silently come back and sync later.
+      savePendingWrites(cacheKey, nextQueue);
+      setPendingWrites(nextQueue);
+      setStatusFromQueue(nextQueue, false);
+
+      // Revalidate from the authoritative server to roll back optimistic
+      // cache state belonging to the discarded mutation.
+      try {
+        await preloadWorkspace(
+          true,
+          activeHalaqahId || undefined,
+          effectiveTeacherId || undefined
+        );
+      } catch (error) {
+        // The discard itself remains valid if the network is offline.
+        // A later normal refresh will restore the server snapshot.
+        console.warn(
+          '[TeacherWorkspace] Pending write discarded locally; server refresh tertunda:',
+          error
+        );
+      }
+
+      return { success: true };
+    },
+    [
+      isTeacher,
+      currentUser?.teacher_id,
+      selectedTeacherId,
+      activeHalaqahId,
+      effectiveTeacherId,
+      preloadWorkspace,
+      setStatusFromQueue
+    ]
+  );
+
   useEffect(() => {
     const recover = () => {
       void retryPendingWrites();
@@ -2327,7 +2435,8 @@ export const TeacherWorkspaceProvider: React.FC<{
         saveFinalEvaluationOptimistic,
         deleteFinalEvaluationOptimistic,
         applyBulkAttendanceOptimistic,
-        retryPendingWrites
+        retryPendingWrites,
+        discardPendingWrite
       }}
     >
       {children}

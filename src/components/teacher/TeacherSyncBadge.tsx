@@ -11,10 +11,12 @@ export const TeacherSyncBadge: React.FC = () => {
     isRevalidating,
     pendingWrites,
     refreshWorkspace,
-    retryPendingWrites
+    retryPendingWrites,
+    discardPendingWrite
   } = useTeacherWorkspace();
 
   const [manualSyncing, setManualSyncing] = useState(false);
+  const [discardingId, setDiscardingId] = useState<string>('');
 
   const students = useMemo(
     () => (Array.isArray(workspace?.students) ? workspace.students : []),
@@ -117,10 +119,36 @@ export const TeacherSyncBadge: React.FC = () => {
     if (!errorText) return null;
 
     return {
+      item: candidate,
       subjectLabel: getPendingSubjectLabel(candidate),
       errorText
     };
   }, [pendingWrites, students]);
+
+  const handleDiscardPending = async () => {
+    const pendingId = String(firstPendingProblem?.item?.id || '');
+    if (!pendingId || discardingId) return;
+
+    setDiscardingId(pendingId);
+
+    try {
+      const result = await discardPendingWrite(pendingId);
+
+      if (!result.success) {
+        console.warn(
+          '[TeacherSyncBadge] Gagal mengabaikan pending write:',
+          result.error
+        );
+      }
+    } catch (error) {
+      console.warn(
+        '[TeacherSyncBadge] Gagal mengabaikan pending write:',
+        error
+      );
+    } finally {
+      setDiscardingId('');
+    }
+  };
 
   const isBusy = manualSyncing || syncStatus === 'SYNCING';
 
@@ -186,12 +214,26 @@ export const TeacherSyncBadge: React.FC = () => {
 
       {pendingWrites.length > 0 && firstPendingProblem && (
         <div
-          className="max-w-[620px] text-[10px] sm:text-[11px] leading-snug text-amber-800 bg-amber-50 border border-amber-200 rounded-md px-2.5 py-1.5 break-words"
+          className="max-w-[720px] text-[10px] sm:text-[11px] leading-snug text-amber-800 bg-amber-50 border border-amber-200 rounded-md px-2.5 py-1.5 break-words"
           title={`${firstPendingProblem.subjectLabel}: ${firstPendingProblem.errorText}`}
         >
-          <span className="font-bold">Sync tertunda:</span>{' '}
-          <span className="font-semibold">{firstPendingProblem.subjectLabel}</span>{' '}
-          — {firstPendingProblem.errorText}
+          <div className="flex items-start gap-2">
+            <div className="min-w-0 flex-1">
+              <span className="font-bold">Sync tertunda:</span>{' '}
+              <span className="font-semibold">{firstPendingProblem.subjectLabel}</span>{' '}
+              — {firstPendingProblem.errorText}
+            </div>
+
+            <button
+              type="button"
+              onClick={handleDiscardPending}
+              disabled={Boolean(discardingId)}
+              className="shrink-0 rounded border border-amber-300 bg-white px-2 py-0.5 text-[10px] font-bold text-amber-800 hover:bg-amber-100 transition disabled:opacity-50 disabled:cursor-not-allowed"
+              title="Buang perubahan lokal ini dan jangan coba sinkronkan lagi"
+            >
+              {discardingId ? 'Mengabaikan...' : 'Abaikan'}
+            </button>
+          </div>
         </div>
       )}
     </div>
