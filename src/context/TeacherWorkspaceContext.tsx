@@ -83,6 +83,262 @@ const TeacherWorkspaceContext =
 const STORAGE_PREFIX = 'rt_teacher_ws_';
 const PENDING_PREFIX = 'rt_teacher_pending_';
 const FINAL_EVAL_SENTINEL = '__FINAL_EVALUATION__';
+const FINAL_EVAL_TOMBSTONE_PREFIX = 'rt_teacher_final_eval_tombstones_';
+const FINAL_EVAL_TOMBSTONE_MAX_AGE_MS = 30 * 24 * 60 * 60 * 1000;
+
+interface FinalEvaluationTombstone {
+  id: string;
+  eventId: string;
+  participantId: string;
+  studentId: string;
+  finalEvaluationId?: string;
+  deletedAt: number;
+}
+
+function getFinalEvaluationTombstoneKey(teacherId: string): string {
+  return `${FINAL_EVAL_TOMBSTONE_PREFIX}${teacherId}`;
+}
+
+function loadFinalEvaluationTombstones(
+  teacherId: string
+): FinalEvaluationTombstone[] {
+  if (!teacherId) return [];
+
+  try {
+    const raw = localStorage.getItem(getFinalEvaluationTombstoneKey(teacherId));
+    if (!raw) return [];
+
+    const parsed = JSON.parse(raw);
+    if (!Array.isArray(parsed)) return [];
+
+    const now = Date.now();
+    return parsed.filter((item: FinalEvaluationTombstone) => {
+      const deletedAt = Number(item?.deletedAt || 0);
+      return deletedAt > 0 && now - deletedAt <= FINAL_EVAL_TOMBSTONE_MAX_AGE_MS;
+    });
+  } catch (error) {
+    console.warn('Failed reading Final Evaluation tombstones:', error);
+    return [];
+  }
+}
+
+function saveFinalEvaluationTombstones(
+  teacherId: string,
+  tombstones: FinalEvaluationTombstone[]
+): void {
+  if (!teacherId) return;
+
+  try {
+    const key = getFinalEvaluationTombstoneKey(teacherId);
+    if (tombstones.length > 0) {
+      localStorage.setItem(key, JSON.stringify(tombstones));
+    } else {
+      localStorage.removeItem(key);
+    }
+  } catch (error) {
+    console.warn('Failed saving Final Evaluation tombstones:', error);
+  }
+}
+
+function finalEvaluationMatchesIdentity(
+  evaluation: Partial<FinalEvaluation> | null | undefined,
+  identity: {
+    eventId?: string;
+    participantId?: string;
+    studentId?: string;
+    finalEvaluationId?: string;
+  }
+): boolean {
+  if (!evaluation) return false;
+
+  const eventMatches =
+    !identity.eventId ||
+    !evaluation.event_id ||
+    evaluation.event_id === identity.eventId;
+
+  if (!eventMatches) return false;
+
+  if (
+    identity.finalEvaluationId &&
+    evaluation.final_evaluation_id === identity.finalEvaluationId
+  ) {
+    return true;
+  }
+
+  if (
+    identity.participantId &&
+    evaluation.participant_id === identity.participantId
+  ) {
+    return true;
+  }
+
+  if (identity.studentId && evaluation.student_id === identity.studentId) {
+    return true;
+  }
+
+  return false;
+}
+
+function getFinalEvaluationServerMutationTime(
+  evaluation: FinalEvaluation
+): number {
+  const raw = evaluation.updated_at || evaluation.created_at || '';
+  const value = raw ? new Date(raw).getTime() : 0;
+  return Number.isFinite(value) ? value : 0;
+}
+
+function tombstoneMatchesEvaluation(
+  tombstone: FinalEvaluationTombstone,
+  evaluation: FinalEvaluation
+): boolean {
+  return finalEvaluationMatchesIdentity(evaluation, {
+    eventId: tombstone.eventId,
+    participantId: tombstone.participantId,
+    studentId: tombstone.studentId,
+    finalEvaluationId: tombstone.finalEvaluationId
+  });
+}
+
+function applyFinalEvaluationTombstones(
+  evaluations: FinalEvaluation[],
+  tombstones: FinalEvaluationTombstone[]
+): FinalEvaluation[] {
+  if (!Array.isArray(evaluations) || evaluations.length === 0) return [];
+  if (!Array.isArray(tombstones) || tombstones.length === 0) return evaluations;
+
+  return evaluations.filter(evaluation => {
+    const matchingTombstone = tombstones.find(tombstone =>
+      tombstoneMatchesEvaluation(tombstone, evaluation)
+    );
+
+    if (!matchingTombstone) return true;
+
+    // Latest mutation wins. A genuinely newer server-side SAVE/RESTORE may
+    // supersede an older local DELETE tombstone.
+    return (
+      getFinalEvaluationServerMutationTime(evaluation) >
+      matchingTombstone.deletedAt
+    );
+  });
+}
+
+function removeFinalEvaluationTombstone(
+  teacherId: string,
+  identity: {
+    eventId?: string;
+    participantId?: string;
+    studentId?: string;
+    finalEvaluationId?: string;
+  }
+): void {
+  const next = loadFinalEvaluationTombstones(teacherId).filter(tombstone => {
+    const eventMatches =
+      !identity.eventId ||
+      !tombstone.eventId ||
+      tombstone.eventId === identity.eventId;
+
+    if (!eventMatches) return true;
+
+    const sameId =
+      Boolean(identity.finalEvaluationId) &&
+      tombstone.finalEvaluationId === identity.finalEvaluationId;
+    const sameParticipant =
+      Boolean(identity.participantId) &&
+      tombstone.participantId === identity.participantId;
+    const sameStudent =
+      Boolean(identity.studentId) &&
+      tombstone.studentId === identity.studentId;
+
+    return !(sameId || sameParticipant || sameStudent);
+  });
+
+  saveFinalEvaluationTombstones(teacherId, next);
+}
+
+function upsertFinalEvaluationTombstone(
+  teacherId: string,
+  tombstone: FinalEvaluationTombstone
+): void {
+  const current = loadFinalEvaluationTombstones(teacherId).filter(existing => {
+    const sameEvent =
+      !tombstone.eventId ||
+      !existing.eventId ||
+      existing.eventId === tombstone.eventId;
+    const sameParticipant =
+      sameEvent &&
+      Boolean(tombstone.participantId) &&
+      existing.participantId === tombstone.participantId;
+    const sameStudent =
+      sameEvent &&
+      Boolean(tombstone.studentId) &&
+      existing.studentId === tombstone.studentId;
+
+    return !(sameParticipant || sameStudent || existing.id === tombstone.id);
+  });
+
+  current.push(tombstone);
+  saveFinalEvaluationTombstones(teacherId, current);
+}
+
+function purgeDeletedFinalEvaluationFromCachedWorkspaces(
+  teacherId: string,
+  tombstone: FinalEvaluationTombstone
+): void {
+  if (!teacherId) return;
+
+  try {
+    const prefix = `${STORAGE_PREFIX}${teacherId}_`;
+
+    for (let i = 0; i < localStorage.length; i++) {
+      const key = localStorage.key(i);
+      if (!key || !key.startsWith(prefix)) continue;
+
+      const raw = localStorage.getItem(key);
+      if (!raw) continue;
+
+      const cached = JSON.parse(raw);
+      if (!cached || typeof cached !== 'object') continue;
+
+      const evaluations = Array.isArray(cached.finalEvaluations)
+        ? cached.finalEvaluations
+        : [];
+
+      const filtered = evaluations.filter(
+        (evaluation: FinalEvaluation) =>
+          !tombstoneMatchesEvaluation(tombstone, evaluation)
+      );
+
+      const students = Array.isArray(cached.students)
+        ? cached.students.map((student: TeacherStudentSummary) => {
+            const sameParticipant =
+              Boolean(tombstone.participantId) &&
+              student.participant_id === tombstone.participantId;
+            const sameStudent =
+              Boolean(tombstone.studentId) &&
+              student.student_id === tombstone.studentId;
+
+            return sameParticipant || sameStudent
+              ? { ...student, completionStatus: 'NOT_EVALUATED' as any }
+              : student;
+          })
+        : cached.students;
+
+      localStorage.setItem(
+        key,
+        JSON.stringify({
+          ...cached,
+          finalEvaluations: filtered,
+          students
+        })
+      );
+    }
+  } catch (error) {
+    console.warn(
+      'Failed purging deleted Final Evaluation from workspace caches:',
+      error
+    );
+  }
+}
 
 function getWorkspaceCacheKey(
   teacherId: string,
@@ -167,7 +423,13 @@ function loadCachedWorkspace(
         Array.isArray(parsed?.availableHalaqahs) &&
         parsed.availableHalaqahs.length > 0
       ) {
-        return parsed;
+        return {
+          ...parsed,
+          finalEvaluations: applyFinalEvaluationTombstones(
+            Array.isArray(parsed.finalEvaluations) ? parsed.finalEvaluations : [],
+            loadFinalEvaluationTombstones(teacherId)
+          )
+        };
       }
     }
 
@@ -185,7 +447,13 @@ function loadCachedWorkspace(
         Array.isArray(parsed?.availableHalaqahs) &&
         parsed.availableHalaqahs.length > 0
       ) {
-        return parsed;
+        return {
+          ...parsed,
+          finalEvaluations: applyFinalEvaluationTombstones(
+            Array.isArray(parsed.finalEvaluations) ? parsed.finalEvaluations : [],
+            loadFinalEvaluationTombstones(teacherId)
+          )
+        };
       }
     }
 
@@ -214,9 +482,17 @@ function saveWorkspaceToCache(
   try {
     const eventId = workspace.event?.event_id || 'curr';
     const halaqahId = workspace.halaqah?.halaqah_id || 'def';
+    const safeWorkspace = {
+      ...workspace,
+      finalEvaluations: applyFinalEvaluationTombstones(
+        Array.isArray(workspace.finalEvaluations) ? workspace.finalEvaluations : [],
+        loadFinalEvaluationTombstones(teacherId)
+      )
+    };
+
     localStorage.setItem(
       getWorkspaceCacheKey(teacherId, eventId, halaqahId),
-      JSON.stringify(workspace)
+      JSON.stringify(safeWorkspace)
     );
   } catch (error) {
     console.error('Error saving teacher workspace to cache:', error);
@@ -450,11 +726,21 @@ export const TeacherWorkspaceProvider: React.FC<{
     (
       serverEvaluations: FinalEvaluation[],
       queue: PendingAssessmentWrite[],
-      eventId: string
+      eventId: string,
+      cacheKey: string
     ): FinalEvaluation[] => {
-      const merged = [...(serverEvaluations || [])];
+      const merged = applyFinalEvaluationTombstones(
+        [...(serverEvaluations || [])],
+        loadFinalEvaluationTombstones(cacheKey)
+      );
 
-      queue.forEach(item => {
+      queue
+        .slice()
+        .sort(
+          (a, b) =>
+            Number(a.localTimestamp || 0) - Number(b.localTimestamp || 0)
+        )
+        .forEach(item => {
         if (!isAnyFinalEvaluationWrite(item)) return;
 
         const payload = item.payload || {};
@@ -731,6 +1017,22 @@ export const TeacherWorkspaceProvider: React.FC<{
 
         const queue = loadPendingWrites(cacheKey);
 
+        // Latest-mutation reconciliation. A newer server SAVE/RESTORE may
+        // supersede an older local delete tombstone; older/stale responses may not.
+        const currentTombstones = loadFinalEvaluationTombstones(cacheKey);
+        const survivingTombstones = currentTombstones.filter(tombstone => {
+          const newerServerEvaluation = (serverData.finalEvaluations || []).find(
+            evaluation =>
+              tombstoneMatchesEvaluation(tombstone, evaluation) &&
+              getFinalEvaluationServerMutationTime(evaluation) > tombstone.deletedAt
+          );
+          return !newerServerEvaluation;
+        });
+
+        if (survivingTombstones.length !== currentTombstones.length) {
+          saveFinalEvaluationTombstones(cacheKey, survivingTombstones);
+        }
+
         const mergedAssessments = mergePendingAssessments(
           serverData,
           queue,
@@ -740,7 +1042,8 @@ export const TeacherWorkspaceProvider: React.FC<{
         const mergedFinalEvaluations = mergePendingFinalEvaluations(
           serverData.finalEvaluations || [],
           queue,
-          serverData.event?.event_id || ''
+          serverData.event?.event_id || '',
+          cacheKey
         );
 
         const updatedStudents = recomputeStudentProgress(
@@ -1545,6 +1848,14 @@ export const TeacherWorkspaceProvider: React.FC<{
       const studentId = payload.student_id || '';
       const nowIso = new Date().toISOString();
 
+      // SAVE after DELETE is a newer mutation and intentionally restores the
+      // evaluation, so remove any older local tombstone first.
+      removeFinalEvaluationTombstone(cacheKey, {
+        eventId,
+        participantId,
+        studentId
+      });
+
       const existing = workspace.finalEvaluations.find(
         evaluation =>
           (participantId && evaluation.participant_id === participantId) ||
@@ -1771,6 +2082,22 @@ export const TeacherWorkspaceProvider: React.FC<{
         ? currentUser.teacher_id || ''
         : selectedTeacherId || '__ADMIN_ALL__';
 
+      const tombstone: FinalEvaluationTombstone = {
+        id: `final-tombstone-${Date.now()}-${Math.random()
+          .toString(36)
+          .slice(2, 7)}`,
+        eventId,
+        participantId: resolvedParticipantId,
+        studentId: resolvedStudentId,
+        finalEvaluationId: existing.final_evaluation_id || '',
+        deletedAt: Date.now()
+      };
+
+      // DELETE is not "remove the newest overlay". It becomes the latest
+      // entity mutation and must keep older server/cache versions buried.
+      upsertFinalEvaluationTombstone(cacheKey, tombstone);
+      purgeDeletedFinalEvaluationFromCachedWorkspaces(cacheKey, tombstone);
+
       const remainingEvaluations = workspace.finalEvaluations.filter(
         evaluation => {
           const sameParticipant =
@@ -1814,7 +2141,7 @@ export const TeacherWorkspaceProvider: React.FC<{
           studentId: resolvedStudentId,
           eventId
         },
-        localTimestamp: Date.now(),
+        localTimestamp: tombstone.deletedAt,
         status: 'SYNCING',
         retryCount: 0
       };
@@ -1858,6 +2185,8 @@ export const TeacherWorkspaceProvider: React.FC<{
         currentUser.user_id
       )
         .then(() => {
+          // Keep tombstone after server success. It protects against stale
+          // responses/caches. A later SAVE for this entity clears it.
           const queue = loadPendingWrites(cacheKey).filter(
             pending => pending.id !== queueId
           );
