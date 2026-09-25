@@ -9,6 +9,7 @@ import {
   BookOpenCheck,
   Check,
   ChevronDown,
+  ClipboardCopy,
   Filter,
   GraduationCap,
   Loader2,
@@ -117,6 +118,9 @@ export const RekapNilaiRT: React.FC = () => {
   const [nameQuery, setNameQuery] = useState('');
   const [classFilter, setClassFilter] = useState('ALL');
   const [genderFilter, setGenderFilter] = useState<GenderFilter>('ALL');
+  const [copyFeedback, setCopyFeedback] = useState<
+    '' | 'NILAI' | 'PREDIKAT' | 'ERROR'
+  >('');
 
   const initializedSelectionRef = useRef(false);
 
@@ -398,6 +402,123 @@ export const RekapNilaiRT: React.FC = () => {
     [filteredRows]
   );
 
+  const writeSpreadsheetColumn = async (
+    values: string[]
+  ): Promise<void> => {
+    const plainText = values.join('\n');
+
+    // Google Sheets handles an HTML table very reliably, including blank
+    // cells between populated rows. Use it when the browser supports
+    // ClipboardItem, with plain text as a fallback format.
+    if (
+      typeof navigator !== 'undefined' &&
+      navigator.clipboard &&
+      typeof (window as any).ClipboardItem !== 'undefined' &&
+      typeof navigator.clipboard.write === 'function'
+    ) {
+      const escapeHtml = (value: string) =>
+        value
+          .replace(/&/g, '&amp;')
+          .replace(/</g, '&lt;')
+          .replace(/>/g, '&gt;')
+          .replace(/"/g, '&quot;')
+          .replace(/'/g, '&#039;');
+
+      const html = `
+        <table>
+          <tbody>
+            ${values
+              .map(
+                value =>
+                  `<tr><td>${escapeHtml(value)}</td></tr>`
+              )
+              .join('')}
+          </tbody>
+        </table>
+      `;
+
+      const ClipboardItemCtor = (window as any).ClipboardItem;
+      const item = new ClipboardItemCtor({
+        'text/plain': new Blob(
+          [plainText],
+          { type: 'text/plain' }
+        ),
+        'text/html': new Blob(
+          [html],
+          { type: 'text/html' }
+        )
+      });
+
+      await navigator.clipboard.write([item]);
+      return;
+    }
+
+    if (
+      typeof navigator !== 'undefined' &&
+      navigator.clipboard &&
+      typeof navigator.clipboard.writeText === 'function'
+    ) {
+      await navigator.clipboard.writeText(plainText);
+      return;
+    }
+
+    // Legacy fallback for older/in-app browsers.
+    const textarea = document.createElement('textarea');
+    textarea.value = plainText;
+    textarea.setAttribute('readonly', '');
+    textarea.style.position = 'fixed';
+    textarea.style.opacity = '0';
+    textarea.style.pointerEvents = 'none';
+
+    document.body.appendChild(textarea);
+    textarea.select();
+
+    const ok = document.execCommand('copy');
+    document.body.removeChild(textarea);
+
+    if (!ok) {
+      throw new Error('Clipboard tidak tersedia.');
+    }
+  };
+
+  const copyReportColumn = async (
+    type: 'NILAI' | 'PREDIKAT'
+  ) => {
+    if (filteredRows.length === 0) return;
+
+    const values =
+      type === 'NILAI'
+        ? filteredRows.map(row =>
+            row.cognitive_average === null
+              ? ''
+              : formatScore(row.cognitive_average)
+          )
+        : filteredRows.map(row =>
+            row.report_grade || ''
+          );
+
+    try {
+      await writeSpreadsheetColumn(values);
+
+      setCopyFeedback(type);
+
+      window.setTimeout(() => {
+        setCopyFeedback('');
+      }, 2200);
+    } catch (error) {
+      console.warn(
+        '[RekapNilaiRT] Clipboard gagal:',
+        error
+      );
+
+      setCopyFeedback('ERROR');
+
+      window.setTimeout(() => {
+        setCopyFeedback('');
+      }, 3000);
+    }
+  };
+
   return (
     <div className="max-w-[1500px] mx-auto space-y-5 pb-12">
       <section className="bg-white border border-slate-200 rounded-xl shadow-sm p-5 sm:p-6">
@@ -627,6 +748,61 @@ export const RekapNilaiRT: React.FC = () => {
             </span>
           </div>
         </div>
+      </section>
+
+      <section className="bg-white border border-slate-200 rounded-xl shadow-sm px-3.5 py-3 sm:px-4">
+        <div className="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-2.5">
+          <div className="min-w-0">
+            <div className="text-xs font-extrabold text-slate-800">
+              Salin ke Spreadsheet Raport
+            </div>
+            <p className="mt-0.5 text-[10px] sm:text-[11px] text-slate-500 leading-relaxed">
+              Urutan mengikuti siswa yang sedang tampil. Nilai yang belum tersedia tetap mempertahankan satu baris kosong agar data tidak bergeser.
+            </p>
+          </div>
+
+          <div className="flex flex-wrap items-center gap-2 shrink-0">
+            <button
+              type="button"
+              onClick={() => void copyReportColumn('NILAI')}
+              disabled={filteredRows.length === 0}
+              className="inline-flex min-h-[38px] items-center gap-1.5 rounded-lg border border-blue-200 bg-blue-50 px-3 py-2 text-[11px] font-extrabold text-blue-700 hover:bg-blue-100 transition disabled:opacity-40 disabled:cursor-not-allowed"
+              title="Salin nilai kognitif satu kolom dari atas ke bawah"
+            >
+              {copyFeedback === 'NILAI' ? (
+                <Check className="w-3.5 h-3.5" />
+              ) : (
+                <ClipboardCopy className="w-3.5 h-3.5" />
+              )}
+              {copyFeedback === 'NILAI'
+                ? `${filteredRows.length} nilai disalin`
+                : 'Salin Nilai'}
+            </button>
+
+            <button
+              type="button"
+              onClick={() => void copyReportColumn('PREDIKAT')}
+              disabled={filteredRows.length === 0}
+              className="inline-flex min-h-[38px] items-center gap-1.5 rounded-lg border border-emerald-200 bg-emerald-50 px-3 py-2 text-[11px] font-extrabold text-emerald-700 hover:bg-emerald-100 transition disabled:opacity-40 disabled:cursor-not-allowed"
+              title="Salin predikat A/B satu kolom dari atas ke bawah"
+            >
+              {copyFeedback === 'PREDIKAT' ? (
+                <Check className="w-3.5 h-3.5" />
+              ) : (
+                <ClipboardCopy className="w-3.5 h-3.5" />
+              )}
+              {copyFeedback === 'PREDIKAT'
+                ? `${filteredRows.length} predikat disalin`
+                : 'Salin Predikat'}
+            </button>
+          </div>
+        </div>
+
+        {copyFeedback === 'ERROR' && (
+          <div className="mt-2 rounded-md border border-rose-200 bg-rose-50 px-2.5 py-1.5 text-[10px] font-semibold text-rose-700">
+            Clipboard tidak dapat diakses browser. Coba izinkan akses clipboard atau gunakan browser utama.
+          </div>
+        )}
       </section>
 
       <section className="bg-white border border-slate-200 rounded-xl shadow-sm overflow-hidden">
